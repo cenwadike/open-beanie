@@ -19,3 +19,4 @@ foundry.lock
 remappings.txt
 
 lib/
+.DS_Store

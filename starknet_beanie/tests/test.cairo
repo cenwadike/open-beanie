@@ -1,7 +1,8 @@
 // Privacy-pool test flow:
 //
 // - Shield-in test: mint funds into a merchant anonymizer and call it as the privacy pool.
-//   Verify fee split, approved net amount, and stealth note derivation from merchant pubkey + ephemeral key.
+//   Verify fee split into a merchant note + treasury note, full-balance approval, and
+//   stealth note derivation from merchant/treasury pubkeys + a shared ephemeral key.
 // - Access-control test: call the same function from a non-pool address.
 //   Verify the contract rejects unauthorized execution.
 // - Bridge-out test: mint funds into the bridge anonymizer and call it as the privacy pool.
@@ -11,9 +12,12 @@
 //
 // Core invariant: fixed config is pinned at deploy time.
 // Runtime trigger belongs to the privacy pool.
-// The ephemeral pubkey is the only runtime input needed for note derivation.
+// The ephemeral pubkey is the only runtime input needed for note derivation, and it's
+// reused across both the merchant and treasury note hashes — domain separation comes
+// from the two distinct static keys, not from the ephemeral.
 //
-// Mock token and mock messenger are simple fixtures to check real balance, approval, and burn behavior.
+// Mock token and mock messenger are simple fixtures to check real balance, approval, and burn
+// behavior.
 //
 
 use core::array::ArrayTrait;
@@ -184,14 +188,11 @@ fn deploy_shield_in(
     privacy_contract: ContractAddress,
     token: ContractAddress,
     merchant_pubkey: felt252,
-    wallet_a: ContractAddress,
-    wallet_b: ContractAddress,
+    treasury_pubkey: felt252,
 ) -> ContractAddress {
     let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
 
-    let calldata = array![
-        privacy_contract.into(), token.into(), merchant_pubkey, wallet_a.into(), wallet_b.into(),
-    ];
+    let calldata = array![privacy_contract.into(), token.into(), merchant_pubkey, treasury_pubkey];
     let (shield_addr, _) = shield_class.deploy(@calldata).unwrap_syscall();
     shield_addr
 }
@@ -218,8 +219,7 @@ fn deploy_factory(
     token: ContractAddress,
     destination_domain: u32,
     mint_recipient: u256,
-    wallet_a: ContractAddress,
-    wallet_b: ContractAddress,
+    treasury_pubkey: felt252,
     salt: felt252,
     shield_in_class: ContractClass,
     bridge_out_class: ContractClass,
@@ -227,21 +227,21 @@ fn deploy_factory(
     let factory_class = declare("MerchantFactory").unwrap_syscall().contract_class();
     let calldata = array![
         privacy_contract.into(), cctp_messenger.into(), token.into(), destination_domain.into(),
-        mint_recipient.low.into(), mint_recipient.high.into(), wallet_a.into(), wallet_b.into(),
-        salt, shield_in_class.class_hash.into(), bridge_out_class.class_hash.into(),
+        mint_recipient.low.into(), mint_recipient.high.into(), treasury_pubkey, salt,
+        shield_in_class.class_hash.into(), bridge_out_class.class_hash.into(),
     ];
     let (factory_addr, _) = factory_class.deploy(@calldata).unwrap_syscall();
     factory_addr
 }
+
 #[test]
 fn shield_in_happy_path_updates_balances_and_returns_note() {
     let token = deploy_mock_token();
-    let wallet_a: ContractAddress = 0x100.try_into().unwrap();
-    let wallet_b: ContractAddress = 0x200.try_into().unwrap();
     let privacy_pool: ContractAddress = 0x300.try_into().unwrap();
     let merchant_pubkey: felt252 = 0x777;
+    let treasury_pubkey: felt252 = 0x778;
     let anonymous_contract = deploy_shield_in(
-        privacy_pool, token, merchant_pubkey, wallet_a, wallet_b,
+        privacy_pool, token, merchant_pubkey, treasury_pubkey,
     );
 
     let amount: u256 = 1_000_u256;
@@ -254,34 +254,40 @@ fn shield_in_happy_path_updates_balances_and_returns_note() {
     let result = dispatcher.privacy_invoke(0xabc);
     stop_cheat_caller_address(anonymous_contract);
 
-    assert!(result.len() == 1, "RESULT_LEN");
-    let note = *result.at(0);
-    assert!(note.token == token, "NOTE_TOKEN");
+    // Two notes now: the merchant's net amount, and the treasury's fee — both shielded,
+    // neither transferred as a plain ERC20 transfer.
+    assert!(result.len() == 2, "RESULT_LEN");
+    let merchant_note = *result.at(0);
+    let treasury_note = *result.at(1);
+    assert!(merchant_note.token == token, "MERCHANT_NOTE_TOKEN");
+    assert!(treasury_note.token == token, "TREASURY_NOTE_TOKEN");
 
     // Fee = 1000 * 50 / 10000 = 5; Net = 995
-    assert!(note.amount == 995_u128, "NOTE_AMOUNT");
+    assert!(merchant_note.amount == 995_u128, "MERCHANT_NOTE_AMOUNT");
+    assert!(treasury_note.amount == 5_u128, "TREASURY_NOTE_AMOUNT");
 
-    // Wallet A = 60% of 5 = 3; Wallet B = 40% of 5 = 2
-    assert!(token_dispatcher.balance_of(wallet_a) == 3_u256, "WALLET_A_BALANCE");
-    assert!(token_dispatcher.balance_of(wallet_b) == 2_u256, "WALLET_B_BALANCE");
-    assert!(token_dispatcher.allowance(anonymous_contract, privacy_pool) == 995_u256, "ALLOWANCE");
+    // Same ephemeral key, different static keys -> distinct note IDs
+    assert!(merchant_note.note_id != treasury_note.note_id, "NOTE_ID_COLLISION");
+
+    // Full gross balance approved to the pool in one call, since both notes are pulled
+    // from this contract's balance rather than one being transferred out beforehand.
+    assert!(
+        token_dispatcher.allowance(anonymous_contract, privacy_pool) == 1_000_u256, "ALLOWANCE",
+    );
 
     assert!(dispatcher.get_privacy_contract() == privacy_pool, "STORAGE_PRIVACY");
     assert!(dispatcher.get_token() == token, "STORAGE_TOKEN");
     assert!(dispatcher.get_merchant_pubkey() == merchant_pubkey, "STORAGE_PUBKEY");
-    assert!(dispatcher.get_wallet_a() == wallet_a, "STORAGE_WALLET_A");
-    assert!(dispatcher.get_wallet_b() == wallet_b, "STORAGE_WALLET_B");
+    assert!(dispatcher.get_treasury_pubkey() == treasury_pubkey, "STORAGE_TREASURY");
 }
 
 #[test]
 #[should_panic(expected: ('CALLER_NOT_PRIVACY_POOL',))]
 fn shield_in_rejects_non_pool_caller() {
     let token = deploy_mock_token();
-    let wallet_a: ContractAddress = 0x100.try_into().unwrap();
-    let wallet_b: ContractAddress = 0x200.try_into().unwrap();
     let privacy_pool: ContractAddress = 0x300.try_into().unwrap();
     let bad_caller: ContractAddress = 0x999.try_into().unwrap();
-    let anonymous_contract = deploy_shield_in(privacy_pool, token, 0x777, wallet_a, wallet_b);
+    let anonymous_contract = deploy_shield_in(privacy_pool, token, 0x777, 0x778);
 
     start_cheat_caller_address(anonymous_contract, bad_caller);
     IShieldInAnonymizerDispatcher { contract_address: anonymous_contract }.privacy_invoke(0xabc);
@@ -345,8 +351,7 @@ fn merchant_factory_registers_pair_and_persists_storage() {
     let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
     let token: ContractAddress = 0x4.try_into().unwrap();
     let merchant_pubkey: felt252 = 0xabc;
-    let wallet_a: ContractAddress = 0x5.try_into().unwrap();
-    let wallet_b: ContractAddress = 0x6.try_into().unwrap();
+    let treasury_pubkey: felt252 = 0x999;
     let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
     let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
     let factory_addr = deploy_factory(
@@ -355,8 +360,7 @@ fn merchant_factory_registers_pair_and_persists_storage() {
         token,
         42_u32,
         0x77_u256,
-        wallet_a,
-        wallet_b,
+        treasury_pubkey,
         0xfeed,
         shield_class.clone(),
         bridge_class.clone(),
@@ -380,8 +384,7 @@ fn merchant_factory_rejects_duplicate_merchant() {
     let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
     let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
     let token: ContractAddress = 0x4.try_into().unwrap();
-    let wallet_a: ContractAddress = 0x5.try_into().unwrap();
-    let wallet_b: ContractAddress = 0x6.try_into().unwrap();
+    let treasury_pubkey: felt252 = 0x999;
     let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
     let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
     let factory_addr = deploy_factory(
@@ -390,8 +393,7 @@ fn merchant_factory_rejects_duplicate_merchant() {
         token,
         42_u32,
         0x77_u256,
-        wallet_a,
-        wallet_b,
+        treasury_pubkey,
         0xfeed,
         shield_class.clone(),
         bridge_class.clone(),

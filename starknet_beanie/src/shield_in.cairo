@@ -1,13 +1,17 @@
 // ShieldInAnonymizer — Deployed PER MERCHANT.
 //
-// Provides strk20 privacy guarantees via
-// non-interactive stealth address derivation (ECDH-style).
+// Provides strk20 privacy guarantees via non-interactive stealth address derivation (ECDH-style).
 //
 // The merchant's static public key (`merchant_pubkey`) is pinned in storage at deploy.
+// The protocol fee is shielded into its own note under a single shared `treasury_pubkey`
+// — never sent as a plain ERC20 transfer — so no chain-analysis heuristic can read a fee
+// amount off an event log and invert it back into the deposit size.
+//
 // During `privacy_invoke`, the caller provides an `ephemeral_pubkey`. The contract
-// deterministically hashes these keys together to derive a unique, single-use `note_id`.
-// Even if an attacker triggers this with their own ephemeral key, the derived note ID
-// is cryptographically bound to the merchant's key—preventing fund redirection.
+// deterministically hashes it against both the merchant's and the treasury's static keys
+// to derive two unique, single-use note IDs. Even if an attacker triggers this with their
+// own ephemeral key, both derived note IDs stay cryptographically bound to the keys they
+// were pinned against — preventing fund redirection.
 
 use privacy::objects::OpenNoteDeposit;
 use starknet::ContractAddress;
@@ -18,8 +22,7 @@ pub trait IShieldInAnonymizer<T> {
     fn get_token(self: @T) -> ContractAddress;
     fn get_privacy_contract(self: @T) -> ContractAddress;
     fn get_merchant_pubkey(self: @T) -> felt252;
-    fn get_wallet_a(self: @T) -> ContractAddress;
-    fn get_wallet_b(self: @T) -> ContractAddress;
+    fn get_treasury_pubkey(self: @T) -> felt252;
 }
 
 #[starknet::contract]
@@ -39,8 +42,7 @@ pub mod ShieldInAnonymizer {
         privacy_contract: ContractAddress, // Pool address pinned at deploy
         token: ContractAddress, // Token pinned at deploy
         merchant_pubkey: felt252, // Merchant's static spending key pinned at deploy
-        wallet_a: ContractAddress,
-        wallet_b: ContractAddress,
+        treasury_pubkey: felt252 // Single shared treasury spending key, pinned at deploy
     }
 
     #[event]
@@ -54,15 +56,15 @@ pub mod ShieldInAnonymizer {
         pub gross: u256,
         pub net: u256,
         pub fee: u256,
-        pub to_a: u256,
-        pub to_b: u256,
-        pub stealth_note_id: felt252,
+        pub merchant_note_id: felt252,
+        pub treasury_note_id: felt252,
         pub ephemeral_pubkey: felt252,
     }
 
     pub mod Errors {
         pub const CALLER_NOT_PRIVACY_POOL: felt252 = 'CALLER_NOT_PRIVACY_POOL';
         pub const INVALID_EPHEMERAL_KEY: felt252 = 'INVALID_EPHEMERAL_KEY';
+        pub const PUBKEY_COLLISION: felt252 = 'PUBKEY_COLLISION';
     }
 
     #[constructor]
@@ -71,14 +73,13 @@ pub mod ShieldInAnonymizer {
         privacy_contract: ContractAddress,
         token: ContractAddress,
         merchant_pubkey: felt252,
-        wallet_a: ContractAddress,
-        wallet_b: ContractAddress,
+        treasury_pubkey: felt252,
     ) {
+        assert(merchant_pubkey != treasury_pubkey, Errors::PUBKEY_COLLISION);
         self.privacy_contract.write(privacy_contract);
         self.token.write(token);
         self.merchant_pubkey.write(merchant_pubkey);
-        self.wallet_a.write(wallet_a);
-        self.wallet_b.write(wallet_b);
+        self.treasury_pubkey.write(treasury_pubkey);
     }
 
     #[abi(embed_v0)]
@@ -93,35 +94,45 @@ pub mod ShieldInAnonymizer {
             assert(ephemeral_pubkey != 0, Errors::INVALID_EPHEMERAL_KEY);
 
             let token = self.token.read();
-
             let erc20 = IERC20Dispatcher { contract_address: token };
             let gross: u256 = erc20.balance_of(get_contract_address());
             if gross == 0 {
                 return [].span();
             }
 
-            // Derives a unique stealth note target locked to the merchant's spending key
-            let static_key = self.merchant_pubkey.read();
-            let stealth_note_id = poseidon_hash_span(array![static_key, ephemeral_pubkey].span());
+            // Two stealth notes, same derivation, different static keys — merchant gets
+            // the net amount, treasury gets the fee. Neither is a public transfer.
+            let merchant_key = self.merchant_pubkey.read();
+            let treasury_key = self.treasury_pubkey.read();
+            let merchant_note_id = poseidon_hash_span(
+                array![merchant_key, ephemeral_pubkey].span(),
+            );
+            let treasury_note_id = poseidon_hash_span(
+                array![treasury_key, ephemeral_pubkey].span(),
+            );
 
             let fee = (gross * FEE_BPS) / BPS_DENOM;
             let net = gross - fee;
-            let to_a = (fee * 60) / 100;
-            let to_b = fee - to_a;
 
-            if to_a > 0 {
-                erc20.transfer(self.wallet_a.read(), to_a);
-            }
-            if to_b > 0 {
-                erc20.transfer(self.wallet_b.read(), to_b);
-            }
+            // Entire balance is shielded, not partially transferred — the pool pulls both
+            // notes' worth from this contract in the same call.
+            erc20.approve(get_caller_address(), gross);
 
-            let amount: u128 = net.try_into().expect('BALANCE_OVERFLOW');
-            erc20.approve(get_caller_address(), amount.into());
+            self
+                .emit(
+                    Shielded {
+                        gross, net, fee, merchant_note_id, treasury_note_id, ephemeral_pubkey,
+                    },
+                );
 
-            self.emit(Shielded { gross, net, fee, to_a, to_b, stealth_note_id, ephemeral_pubkey });
+            let net_amount: u128 = net.try_into().expect('BALANCE_OVERFLOW');
+            let fee_amount: u128 = fee.try_into().expect('BALANCE_OVERFLOW');
 
-            [OpenNoteDeposit { note_id: stealth_note_id, token, amount }].span()
+            [
+                OpenNoteDeposit { note_id: merchant_note_id, token, amount: net_amount },
+                OpenNoteDeposit { note_id: treasury_note_id, token, amount: fee_amount },
+            ]
+                .span()
         }
 
         fn get_token(self: @ContractState) -> ContractAddress {
@@ -136,12 +147,8 @@ pub mod ShieldInAnonymizer {
             self.merchant_pubkey.read()
         }
 
-        fn get_wallet_a(self: @ContractState) -> ContractAddress {
-            self.wallet_a.read()
-        }
-
-        fn get_wallet_b(self: @ContractState) -> ContractAddress {
-            self.wallet_b.read()
+        fn get_treasury_pubkey(self: @ContractState) -> felt252 {
+            self.treasury_pubkey.read()
         }
     }
 }

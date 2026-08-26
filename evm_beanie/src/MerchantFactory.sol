@@ -6,8 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 interface IChainXReceiver {
     function initialize(
         address _token,
-        address _walletA,
-        address _walletB,
+        address _treasury,
         address _tokenMessenger,
         uint32 _cctpDestinationDomain, // matches ChainXReceiver exactly
         bytes32 _cctpMintRecipient,
@@ -20,8 +19,7 @@ contract MerchantFactory {
 
     address public immutable receiverImplementation;
     address public token;
-    address public walletA;
-    address public walletB;
+    address public treasury;
     address public tokenMessenger;
 
     mapping(address => uint256) public merchantNonces;
@@ -36,8 +34,7 @@ contract MerchantFactory {
     constructor(
         address _receiverImplementation,
         address _token,
-        address _walletA,
-        address _walletB,
+        address _treasury,
         address _tokenMessenger,
         uint32 _starknetDestinationDomain,
         uint32 _baseDestinationDomain,
@@ -56,8 +53,7 @@ contract MerchantFactory {
         );
         receiverImplementation = _receiverImplementation;
         token = _token;
-        walletA = _walletA;
-        walletB = _walletB;
+        treasury = _treasury;
         tokenMessenger = _tokenMessenger;
 
         validDomains["STARKNET"] = true;
@@ -85,13 +81,11 @@ contract MerchantFactory {
 
         address clone = Clones.cloneDeterministic(receiverImplementation, salt);
 
-        // look up the numeric CCTP domain for the requested chain
         uint32 domain = destinationDomain[cctpMintChain];
 
         IChainXReceiver(clone).initialize(
             token,
-            walletA,
-            walletB,
+            treasury,
             tokenMessenger,
             domain,
             cctpMintRecipient,

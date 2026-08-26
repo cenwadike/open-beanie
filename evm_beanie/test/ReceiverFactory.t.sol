@@ -116,8 +116,7 @@ contract ReceiverFactoryTest is Test {
     ChainXReceiver implementation;
     MerchantFactory factory;
 
-    address walletA = address(0x100);
-    address walletB = address(0x200);
+    address treasury = address(0x100);
     uint32 _starknetDestinationDomain = 21;
     uint32 _solanaDestinationDomain = 5;
     uint32 _baseDestinationDomain = 3;
@@ -132,8 +131,7 @@ contract ReceiverFactoryTest is Test {
         factory = new MerchantFactory(
             address(implementation),
             address(token),
-            walletA,
-            walletB,
+            treasury,
             address(messenger),
             _starknetDestinationDomain,
             _baseDestinationDomain,
@@ -157,8 +155,7 @@ contract ReceiverFactoryTest is Test {
         MerchantFactory f2 = new MerchantFactory(
             address(implementation),
             address(token),
-            walletA,
-            walletB,
+            treasury,
             address(messenger),
             _starknetDestinationDomain,
             _baseDestinationDomain,
@@ -173,22 +170,27 @@ contract ReceiverFactoryTest is Test {
         );
 
         // mint tokens into clone2
-        token.mint(clone2, 1000);
+        token.mint(clone2, 10000);
 
-        // call sweep on clone2
-        (uint256 net, uint256 toA, uint256 toB, uint256 fee) = ChainXReceiver(
-            clone2
-        ).sweep();
+        // call sweep on clone2 — msg.sender here is this test contract,
+        // which is the "caller" that gets the 10%-of-fee incentive
+        (
+            uint256 net,
+            uint256 toCaller,
+            uint256 toTreasury,
+            uint256 fee
+        ) = ChainXReceiver(clone2).sweep();
 
-        // fee = 1000 * 50 / 10000 = 5; net = 995
-        assertEq(fee, 5);
-        assertEq(net, 995);
-        assertEq(toA, 3);
-        assertEq(toB, 2);
+        // fee = 10000 * 50 / 10000 = 50; net = 9950
+        // feeToCaller = 50 * 1000 / 10000 = 5; feeToTreasury = 45
+        assertEq(fee, 50);
+        assertEq(net, 9950);
+        assertEq(toCaller, 5);
+        assertEq(toTreasury, 45);
 
-        // wallets received fee splits
-        assertEq(token.balanceOf(walletA), 3);
-        assertEq(token.balanceOf(walletB), 2);
+        // caller (this test contract) and treasury both received their share
+        assertEq(token.balanceOf(address(this)), toCaller);
+        assertEq(token.balanceOf(treasury), toTreasury);
 
         // messenger recorded the burn
         assertEq(messenger.lastAmount(), net);
@@ -196,7 +198,6 @@ contract ReceiverFactoryTest is Test {
 
         // clone approved messenger for net
         uint256 lastApprovedAllowance = messenger.lastApprovedAllowance();
-        assertEq(lastApprovedAllowance, net);
         assertEq(lastApprovedAllowance, net);
 
         // idempotent: calling sweep again with zero balance returns zeros
@@ -215,8 +216,7 @@ contract ReceiverFactoryTest is Test {
         MerchantFactory f3 = new MerchantFactory(
             address(implementation),
             address(token),
-            walletA,
-            walletB,
+            treasury,
             address(messenger),
             _starknetDestinationDomain,
             _baseDestinationDomain,
@@ -229,14 +229,22 @@ contract ReceiverFactoryTest is Test {
 
         token.mint(clone, 1_000);
 
-        (uint256 net, uint256 toA, uint256 toB, uint256 fee) = ChainXReceiver(
-            clone
-        ).sweep();
+        (
+            uint256 net,
+            uint256 toCaller,
+            uint256 toTreasury,
+            uint256 fee
+        ) = ChainXReceiver(clone).sweep();
 
+        // fee = 1000 * 50 / 10000 = 5; net = 995
+        // feeToCaller = 5 * 1000 / 10000 = 0 (rounds down at this size); feeToTreasury = 5
         assertEq(fee, 5);
         assertEq(net, 995);
-        assertEq(toA, 3);
-        assertEq(toB, 2);
+        assertEq(toCaller, 0);
+        assertEq(toTreasury, 5);
+
+        assertEq(token.balanceOf(address(this)), toCaller);
+        assertEq(token.balanceOf(treasury), toTreasury);
 
         // merchant should receive net directly, no CCTP call
         assertEq(token.balanceOf(merchant), net);
@@ -256,8 +264,7 @@ contract ReceiverFactoryTest is Test {
         ChainXReceiver r = new ChainXReceiver();
         r.initialize(
             address(token),
-            walletA,
-            walletB,
+            treasury,
             address(messenger),
             _starknetDestinationDomain,
             defaultMintRecipient,
@@ -266,8 +273,7 @@ contract ReceiverFactoryTest is Test {
         vm.expectRevert();
         r.initialize(
             address(token),
-            walletA,
-            walletB,
+            treasury,
             address(messenger),
             _starknetDestinationDomain,
             defaultMintRecipient,

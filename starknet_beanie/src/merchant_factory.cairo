@@ -1,7 +1,8 @@
 // MerchantFactory — Deploys ONE anonymizer pair PER MERCHANT.
 //
 // Registers the merchant's static spending key (`merchant_pubkey`) into storage
-// during `ShieldInAnonymizer` deployment.
+// during `ShieldInAnonymizer` deployment, alongside a single shared `treasury_pubkey`
+// that every merchant's fee note shields to.
 
 use starknet::ContractAddress;
 
@@ -36,8 +37,7 @@ pub mod MerchantFactory {
         token: ContractAddress,
         destination_domain: u32,
         mint_recipient: u256,
-        wallet_a: ContractAddress,
-        wallet_b: ContractAddress,
+        treasury_pubkey: felt252,
         salt: felt252,
         merchant_nonces: Map<felt252, felt252>,
         shield_in_class_hash: ClassHash,
@@ -58,8 +58,7 @@ pub mod MerchantFactory {
         token: ContractAddress,
         destination_domain: u32,
         mint_recipient: u256,
-        wallet_a: ContractAddress,
-        wallet_b: ContractAddress,
+        treasury_pubkey: felt252,
         salt: felt252,
         shield_in_class_hash: ClassHash,
         bridge_out_class_hash: ClassHash,
@@ -69,8 +68,7 @@ pub mod MerchantFactory {
         self.token.write(token);
         self.destination_domain.write(destination_domain);
         self.mint_recipient.write(mint_recipient);
-        self.wallet_a.write(wallet_a);
-        self.wallet_b.write(wallet_b);
+        self.treasury_pubkey.write(treasury_pubkey);
         self.salt.write(salt);
         self.shield_in_class_hash.write(shield_in_class_hash);
         self.bridge_out_class_hash.write(bridge_out_class_hash);
@@ -94,15 +92,13 @@ pub mod MerchantFactory {
 
             let privacy_contract = self.privacy_contract.read();
             let token = self.token.read();
-            let wallet_a = self.wallet_a.read();
-            let wallet_b = self.wallet_b.read();
+            let treasury_pubkey = self.treasury_pubkey.read();
             let cctp_messenger = self.cctp_messenger.read();
             let destination_domain = self.destination_domain.read();
             let mint_recipient = self.mint_recipient.read();
 
             let shield_in_calldata = array![
-                privacy_contract.into(), token.into(), merchant_pubkey, wallet_a.into(),
-                wallet_b.into(),
+                privacy_contract.into(), token.into(), merchant_pubkey, treasury_pubkey,
             ];
             let (shield_in_addr, _) = deploy_syscall(
                 self.shield_in_class_hash.read(), salt, shield_in_calldata.span(), false,
