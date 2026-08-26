@@ -10,14 +10,10 @@
 // is cryptographically bound to the merchant's key—preventing fund redirection.
 
 use privacy::objects::OpenNoteDeposit;
-use starknet::ContractAddress;
 
 #[starknet::interface]
 pub trait IShieldInAnonymizer<T> {
-    /// Takes a caller-supplied ephemeral key to compute a one-time stealth note ID.
-    fn privacy_invoke(
-        ref self: T, token: ContractAddress, ephemeral_pubkey: felt252,
-    ) -> Span<OpenNoteDeposit>;
+    fn privacy_invoke(ref self: T, ephemeral_pubkey: felt252) -> Span<OpenNoteDeposit>;
 }
 
 #[starknet::contract]
@@ -35,6 +31,7 @@ pub mod ShieldInAnonymizer {
     #[storage]
     struct Storage {
         privacy_contract: ContractAddress, // Pool address pinned at deploy
+        token: ContractAddress, // Token pinned at deploy
         merchant_pubkey: felt252, // Merchant's static spending key pinned at deploy
         wallet_a: ContractAddress,
         wallet_b: ContractAddress,
@@ -66,11 +63,13 @@ pub mod ShieldInAnonymizer {
     fn constructor(
         ref self: ContractState,
         privacy_contract: ContractAddress,
+        token: ContractAddress,
         merchant_pubkey: felt252,
         wallet_a: ContractAddress,
         wallet_b: ContractAddress,
     ) {
         self.privacy_contract.write(privacy_contract);
+        self.token.write(token);
         self.merchant_pubkey.write(merchant_pubkey);
         self.wallet_a.write(wallet_a);
         self.wallet_b.write(wallet_b);
@@ -79,13 +78,15 @@ pub mod ShieldInAnonymizer {
     #[abi(embed_v0)]
     pub impl ShieldInAnonymizerImpl of IShieldInAnonymizer<ContractState> {
         fn privacy_invoke(
-            ref self: ContractState, token: ContractAddress, ephemeral_pubkey: felt252,
+            ref self: ContractState, ephemeral_pubkey: felt252,
         ) -> Span<OpenNoteDeposit> {
             assert(
                 get_caller_address() == self.privacy_contract.read(),
                 Errors::CALLER_NOT_PRIVACY_POOL,
             );
             assert(ephemeral_pubkey != 0, Errors::INVALID_EPHEMERAL_KEY);
+
+            let token = self.token.read();
 
             let erc20 = IERC20Dispatcher { contract_address: token };
             let gross: u256 = erc20.balance_of(get_contract_address());

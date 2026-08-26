@@ -18,6 +18,7 @@ pub trait IMerchantFactory<T> {
         merchant_id: felt252,
         privacy_contract: ContractAddress,
         cctp_messenger: ContractAddress,
+        token: ContractAddress,
         merchant_pubkey: felt252,
         destination_domain: u32,
         mint_recipient: u256,
@@ -70,6 +71,7 @@ pub mod MerchantFactory {
             merchant_id: felt252,
             privacy_contract: ContractAddress,
             cctp_messenger: ContractAddress,
+            token: ContractAddress,
             merchant_pubkey: felt252,
             destination_domain: u32,
             mint_recipient: u256,
@@ -82,19 +84,20 @@ pub mod MerchantFactory {
                 Errors::ALREADY_REGISTERED,
             );
 
-            // Deploy ShieldInAnonymizer with merchant_pubkey bound to storage
+            // Deploy ShieldInAnonymizer with merchant-pinned config.
             let shield_in_calldata = array![
-                privacy_contract.into(), merchant_pubkey, wallet_a.into(), wallet_b.into(),
+                privacy_contract.into(), token.into(), merchant_pubkey, wallet_a.into(),
+                wallet_b.into(),
             ];
             let (shield_in_addr, _) = deploy_syscall(
                 self.shield_in_class_hash.read(), merchant_id, shield_in_calldata.span(), false,
             )
                 .expect(Errors::DEPLOY_FAILED);
 
-            // Deploy BridgeOutAnonymizer with pinned egress parameters
+            // Deploy BridgeOutAnonymizer with pinned token and egress parameters.
             let bridge_out_calldata = array![
-                cctp_messenger.into(), privacy_contract.into(), destination_domain.into(),
-                mint_recipient.low.into(), mint_recipient.high.into(),
+                cctp_messenger.into(), privacy_contract.into(), token.into(),
+                destination_domain.into(), mint_recipient.low.into(), mint_recipient.high.into(),
             ];
             let (bridge_out_addr, _) = deploy_syscall(
                 self.bridge_out_class_hash.read(), merchant_id, bridge_out_calldata.span(), false,
