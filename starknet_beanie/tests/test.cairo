@@ -195,11 +195,22 @@ fn deploy_bridge_out(
 }
 
 fn deploy_factory(
-    governor: ContractAddress, shield_in_class: ContractClass, bridge_out_class: ContractClass,
+    privacy_contract: ContractAddress,
+    cctp_messenger: ContractAddress,
+    token: ContractAddress,
+    destination_domain: u32,
+    mint_recipient: u256,
+    wallet_a: ContractAddress,
+    wallet_b: ContractAddress,
+    salt: felt252,
+    shield_in_class: ContractClass,
+    bridge_out_class: ContractClass,
 ) -> ContractAddress {
     let factory_class = declare("MerchantFactory").unwrap_syscall().contract_class();
     let calldata = array![
-        governor.into(), shield_in_class.class_hash.into(), bridge_out_class.class_hash.into(),
+        privacy_contract.into(), cctp_messenger.into(), token.into(), destination_domain.into(),
+        mint_recipient.low.into(), mint_recipient.high.into(), wallet_a.into(), wallet_b.into(),
+        salt, shield_in_class.class_hash.into(), bridge_out_class.class_hash.into(),
     ];
     let (factory_addr, _) = factory_class.deploy(@calldata).unwrap_syscall();
     factory_addr
@@ -312,37 +323,35 @@ fn bridge_out_rejects_non_pool_caller() {
 
 #[test]
 fn merchant_factory_registers_pair_and_persists_storage() {
-    let governor: ContractAddress = 0x1.try_into().unwrap();
-    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
-    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
-    let factory_addr = deploy_factory(governor, shield_class.clone(), bridge_class.clone());
     let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
     let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
     let token: ContractAddress = 0x4.try_into().unwrap();
     let merchant_pubkey: felt252 = 0xabc;
     let wallet_a: ContractAddress = 0x5.try_into().unwrap();
     let wallet_b: ContractAddress = 0x6.try_into().unwrap();
+    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
+    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
+    let factory_addr = deploy_factory(
+        privacy_pool,
+        cctp_messenger,
+        token,
+        42_u32,
+        0x77_u256,
+        wallet_a,
+        wallet_b,
+        0xfeed,
+        shield_class.clone(),
+        bridge_class.clone(),
+    );
 
-    start_cheat_caller_address(factory_addr, governor);
     let pair = IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(
-            7,
-            privacy_pool,
-            cctp_messenger,
-            token,
-            merchant_pubkey,
-            42_u32,
-            0x77_u256,
-            wallet_a,
-            wallet_b,
-        );
-    stop_cheat_caller_address(factory_addr);
+        .register_merchant(merchant_pubkey);
 
     assert(pair.shield_in != 0, 'SHIELD_DEPLOYED');
     assert(pair.bridge_out != 0, 'BRIDGE_DEPLOYED');
 
     let factory_dispatcher = IMerchantFactoryDispatcher { contract_address: factory_addr };
-    let stored_pair = factory_dispatcher.get_merchant_pair(7);
+    let stored_pair = factory_dispatcher.get_merchant_pair(merchant_pubkey);
     assert(stored_pair.shield_in == pair.shield_in, 'PAIR_SHIELD');
     assert(stored_pair.bridge_out == pair.bridge_out, 'PAIR_BRIDGE');
 }
@@ -350,24 +359,26 @@ fn merchant_factory_registers_pair_and_persists_storage() {
 #[test]
 #[should_panic(expected: ('ALREADY_REGISTERED',))]
 fn merchant_factory_rejects_duplicate_merchant() {
-    let governor: ContractAddress = 0x1.try_into().unwrap();
-    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
-    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
-    let factory_addr = deploy_factory(governor, shield_class.clone(), bridge_class.clone());
     let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
     let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
     let token: ContractAddress = 0x4.try_into().unwrap();
     let wallet_a: ContractAddress = 0x5.try_into().unwrap();
     let wallet_b: ContractAddress = 0x6.try_into().unwrap();
+    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
+    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
+    let factory_addr = deploy_factory(
+        privacy_pool,
+        cctp_messenger,
+        token,
+        42_u32,
+        0x77_u256,
+        wallet_a,
+        wallet_b,
+        0xfeed,
+        shield_class.clone(),
+        bridge_class.clone(),
+    );
 
-    start_cheat_caller_address(factory_addr, governor);
-    IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(
-            9, privacy_pool, cctp_messenger, token, 0xabc, 42_u32, 0x77_u256, wallet_a, wallet_b,
-        );
-    IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(
-            9, privacy_pool, cctp_messenger, token, 0xdef, 43_u32, 0x88_u256, wallet_a, wallet_b,
-        );
-    stop_cheat_caller_address(factory_addr);
+    IMerchantFactoryDispatcher { contract_address: factory_addr }.register_merchant(0xabc);
+    IMerchantFactoryDispatcher { contract_address: factory_addr }.register_merchant(0xabc);
 }
