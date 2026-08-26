@@ -1,0 +1,6 @@
+{
+  "transactions": ["0x07c0...", "0x04b2...", "0x0919..."],
+  "contracts": ["0x0abc...", "0x0def..."],
+  "demo_video": "https://youtu.be/...",
+  "demo_url": "https://your-demo.example"
+}
