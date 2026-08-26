@@ -25,6 +25,7 @@ pub trait IMerchantFactory<T> {
         wallet_a: ContractAddress,
         wallet_b: ContractAddress,
     ) -> MerchantPair;
+    fn get_merchant_pair(self: @T, merchant_id: felt252) -> MerchantPair;
 }
 
 #[starknet::contract]
@@ -107,6 +108,10 @@ pub mod MerchantFactory {
             let pair = MerchantPair { shield_in: shield_in_addr, bridge_out: bridge_out_addr };
             self.merchant_pairs.write(merchant_id, pair);
             pair
+        }
+
+        fn get_merchant_pair(self: @ContractState, merchant_id: felt252) -> MerchantPair {
+            self.merchant_pairs.read(merchant_id)
         }
     }
 }

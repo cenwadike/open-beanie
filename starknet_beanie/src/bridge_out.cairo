@@ -27,6 +27,11 @@ pub trait ITokenMessengerMinterV2<T> {
 #[starknet::interface]
 pub trait IBridgeOutAnonymizer<T> {
     fn privacy_invoke(ref self: T) -> Span<OpenNoteDeposit>;
+    fn get_cctp_messenger(self: @T) -> ContractAddress;
+    fn get_privacy_contract(self: @T) -> ContractAddress;
+    fn get_token(self: @T) -> ContractAddress;
+    fn get_destination_domain(self: @T) -> u32;
+    fn get_mint_recipient(self: @T) -> u256;
 }
 
 #[starknet::contract]
@@ -104,6 +109,26 @@ pub mod BridgeOutAnonymizer {
                 );
 
             [].span()
+        }
+
+        fn get_cctp_messenger(self: @ContractState) -> ContractAddress {
+            self.cctp_messenger.read()
+        }
+
+        fn get_privacy_contract(self: @ContractState) -> ContractAddress {
+            self.privacy_contract.read()
+        }
+
+        fn get_token(self: @ContractState) -> ContractAddress {
+            self.token.read()
+        }
+
+        fn get_destination_domain(self: @ContractState) -> u32 {
+            self.destination_domain.read()
+        }
+
+        fn get_mint_recipient(self: @ContractState) -> u256 {
+            self.mint_recipient.read()
         }
     }
 }

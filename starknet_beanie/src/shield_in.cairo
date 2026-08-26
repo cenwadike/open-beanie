@@ -10,10 +10,16 @@
 // is cryptographically bound to the merchant's key—preventing fund redirection.
 
 use privacy::objects::OpenNoteDeposit;
+use starknet::ContractAddress;
 
 #[starknet::interface]
 pub trait IShieldInAnonymizer<T> {
     fn privacy_invoke(ref self: T, ephemeral_pubkey: felt252) -> Span<OpenNoteDeposit>;
+    fn get_token(self: @T) -> ContractAddress;
+    fn get_privacy_contract(self: @T) -> ContractAddress;
+    fn get_merchant_pubkey(self: @T) -> felt252;
+    fn get_wallet_a(self: @T) -> ContractAddress;
+    fn get_wallet_b(self: @T) -> ContractAddress;
 }
 
 #[starknet::contract]
@@ -116,6 +122,26 @@ pub mod ShieldInAnonymizer {
             self.emit(Shielded { gross, net, fee, to_a, to_b, stealth_note_id, ephemeral_pubkey });
 
             [OpenNoteDeposit { note_id: stealth_note_id, token, amount }].span()
+        }
+
+        fn get_token(self: @ContractState) -> ContractAddress {
+            self.token.read()
+        }
+
+        fn get_privacy_contract(self: @ContractState) -> ContractAddress {
+            self.privacy_contract.read()
+        }
+
+        fn get_merchant_pubkey(self: @ContractState) -> felt252 {
+            self.merchant_pubkey.read()
+        }
+
+        fn get_wallet_a(self: @ContractState) -> ContractAddress {
+            self.wallet_a.read()
+        }
+
+        fn get_wallet_b(self: @ContractState) -> ContractAddress {
+            self.wallet_b.read()
         }
     }
 }
