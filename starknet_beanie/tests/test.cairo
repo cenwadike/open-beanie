@@ -1,3 +1,21 @@
+// Privacy-pool test flow:
+//
+// - Shield-in test: mint funds into a merchant anonymizer and call it as the privacy pool.
+//   Verify fee split, approved net amount, and stealth note derivation from merchant pubkey + ephemeral key.
+// - Access-control test: call the same function from a non-pool address.
+//   Verify the contract rejects unauthorized execution.
+// - Bridge-out test: mint funds into the bridge anonymizer and call it as the privacy pool.
+//   Verify balance-based burn, fixed destination config, and correct CCTP payload.
+// - Factory test: register a merchant by pubkey.
+//   Verify one anonymizer pair is deployed and duplicate registration is rejected.
+//
+// Core invariant: fixed config is pinned at deploy time.
+// Runtime trigger belongs to the privacy pool.
+// The ephemeral pubkey is the only runtime input needed for note derivation.
+//
+// Mock token and mock messenger are simple fixtures to check real balance, approval, and burn behavior.
+//
+
 use core::array::ArrayTrait;
 use core::traits::TryInto;
 use snforge_std::{
