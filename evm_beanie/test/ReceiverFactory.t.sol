@@ -2,9 +2,9 @@
 pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
-import "../src/Receiver.sol";
+import "../src/ChainXReceiver.sol";
 import "../src/MerchantFactory.sol";
-import "../src/Receiver.sol" as R;
+import "../src/ChainXReceiver.sol" as R;
 
 interface IERC20Minimal {
     function balanceOf(address) external view returns (uint256);
