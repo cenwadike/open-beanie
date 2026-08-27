@@ -8,7 +8,7 @@ that gateway: routing a payment through it delinks the deposit a
 customer makes from the withdrawal a merchant receives, so the two
 can't be tied together on-chain.
 
-## What this is
+## What this is?
 
 Every supported chain gets its own pair of contracts, but they share one
 pattern: **a factory registers a merchant once, and that merchant gets a
