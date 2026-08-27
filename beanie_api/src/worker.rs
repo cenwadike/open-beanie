@@ -17,7 +17,7 @@ use ethers::{
     middleware::{NonceManagerMiddleware, SignerMiddleware},
     providers::{Http as EvmHttp, Provider as EvmProvider},
     signers::LocalWallet,
-    types::Address,
+    types::{Address, U256},
 };
 
 use crate::models::{Chain, DeployTask};
@@ -30,7 +30,7 @@ abigen!(
     MerchantFactory,
     r#"[
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)
-        function getReceiver(address merchant) external view returns (address)
+        function getReceiverCount(address merchant) external view returns (uint256)
     ]"#;
     MerchantWebhookRegistry,
     r#"[
@@ -43,6 +43,10 @@ pub enum DeployError {
     Fatal(String),
     Transient(String),
 }
+
+// Mirrors MAX_RECEIVERS_PER_MERCHANT (Solidity) / MAX_PAIRS_PER_MERCHANT
+// (Cairo) — keep in sync if either contract's cap changes.
+const MAX_RECEIVERS_PER_MERCHANT: u64 = 32;
 
 fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
     let name = match chain {
@@ -81,33 +85,42 @@ pub async fn execute_onchain_deployment(
 
             let factory = MerchantFactory::new(evm_factory_addr, evm_client.clone());
 
-            let existing_receiver =
-                factory
-                    .get_receiver(merchant_addr)
-                    .call()
-                    .await
-                    .map_err(|e| {
-                        DeployError::Transient(format!("Failed RPC call to get_receiver: {e}"))
-                    })?;
-
-            if existing_receiver == Address::zero() {
-                let mut recipient_bytes = [0u8; 32];
-                recipient_bytes[12..].copy_from_slice(merchant_addr.as_bytes());
-
-                let tx = factory.register_merchant(
-                    merchant_addr,
-                    chain_to_bytes32(task.target_chain),
-                    recipient_bytes,
-                );
-
-                let pending_tx = tx.send().await.map_err(|e| {
-                    DeployError::Transient(format!("EVM transaction send failed: {e}"))
+            // MAX_RECEIVERS_PER_MERCHANT receivers (one per target chain, or
+            // even repeats), so this isn't a "skip if already registered"
+            // check — it's a cap check. Fail fast (fatal, not transient)
+            // rather than sending a tx the contract will just revert with
+            // MaximumReceiversExceeded.
+            let existing_count: U256 = factory
+                .get_receiver_count(merchant_addr)
+                .call()
+                .await
+                .map_err(|e| {
+                    DeployError::Transient(format!("Failed RPC call to getReceiverCount: {e}"))
                 })?;
 
-                pending_tx
-                    .await
-                    .map_err(|e| DeployError::Transient(format!("EVM confirmation failed: {e}")))?;
+            if existing_count >= U256::from(MAX_RECEIVERS_PER_MERCHANT) {
+                return Err(DeployError::Fatal(format!(
+                    "Merchant {merchant_addr:?} already has {existing_count} receivers (max {MAX_RECEIVERS_PER_MERCHANT})"
+                )));
             }
+
+            let mut recipient_bytes = [0u8; 32];
+            recipient_bytes[12..].copy_from_slice(merchant_addr.as_bytes());
+
+            let tx = factory.register_merchant(
+                merchant_addr,
+                chain_to_bytes32(task.target_chain),
+                recipient_bytes,
+            );
+
+            let pending_tx = tx
+                .send()
+                .await
+                .map_err(|e| DeployError::Transient(format!("EVM transaction send failed: {e}")))?;
+
+            pending_tx
+                .await
+                .map_err(|e| DeployError::Transient(format!("EVM confirmation failed: {e}")))?;
 
             if let (Some(url), Some(registry_addr)) = (&task.webhook_url, webhook_registry_addr) {
                 if !url.is_empty() {
@@ -131,10 +144,16 @@ pub async fn execute_onchain_deployment(
                 DeployError::Fatal(format!("Invalid Starknet merchant_pubkey felt252: {e}"))
             })?;
 
-            // 1. Check if merchant pair already exists via get_merchant_pair(merchant_pubkey)
+            // 1. Check the merchant isn't already at the pair cap.
+            // the read entrypoint is `get_merchant_pairs`, which returns
+            // Array<MerchantPair>. Cairo's Serde encodes an Array as
+            // [length, ...elements], so the first felt in the response is
+            // the number of pairs already registered — this is a cap check,
+            // not an "already registered" check, since a merchant can hold
+            // up to MAX_PAIRS_PER_MERCHANT pairs.
             let check_call = FunctionCall {
                 contract_address: starknet_factory_addr,
-                entry_point_selector: get_selector_from_name("get_merchant_pair").unwrap(),
+                entry_point_selector: get_selector_from_name("get_merchant_pairs").unwrap(),
                 calldata: vec![merchant_pubkey],
             };
 
@@ -144,37 +163,46 @@ pub async fn execute_onchain_deployment(
                 .await
                 .map_err(|e| DeployError::Transient(format!("Starknet view call failed: {e}")))?;
 
-            let shield_in_addr = pair_res.first().cloned().unwrap_or(Felt::ZERO);
+            let pair_count: u64 = pair_res
+                .first()
+                .cloned()
+                .unwrap_or(Felt::ZERO)
+                .try_into()
+                .unwrap_or(u64::MAX);
 
-            if shield_in_addr == Felt::ZERO {
-                let target_chain_felt = chain_to_felt(task.target_chain);
-
-                // Parse merchant address as uint256 (low: felt252, high: felt252)
-                let cctp_recipient_low = merchant_pubkey;
-                let cctp_recipient_high = Felt::ZERO;
-
-                let register_call = Call {
-                    to: starknet_factory_addr,
-                    selector: get_selector_from_name("register_merchant").unwrap(),
-                    calldata: vec![
-                        merchant_pubkey,
-                        target_chain_felt,
-                        cctp_recipient_low,
-                        cctp_recipient_high,
-                    ],
-                };
-
-                let invoke_result = starknet_account
-                    .execute_v3(vec![register_call])
-                    .send()
-                    .await
-                    .map_err(|e| DeployError::Transient(format!("Starknet invoke failed: {e}")))?;
-
-                println!(
-                    "Starknet merchant pair deployed in tx 0x{:x}",
-                    invoke_result.transaction_hash
-                );
+            if pair_count >= MAX_RECEIVERS_PER_MERCHANT {
+                return Err(DeployError::Fatal(format!(
+                    "Merchant {merchant_pubkey:#x} already has {pair_count} pairs (max {MAX_RECEIVERS_PER_MERCHANT})"
+                )));
             }
+
+            let target_chain_felt = chain_to_felt(task.target_chain);
+
+            // Parse merchant address as uint256 (low: felt252, high: felt252)
+            let cctp_recipient_low = merchant_pubkey;
+            let cctp_recipient_high = Felt::ZERO;
+
+            let register_call = Call {
+                to: starknet_factory_addr,
+                selector: get_selector_from_name("register_merchant").unwrap(),
+                calldata: vec![
+                    merchant_pubkey,
+                    target_chain_felt,
+                    cctp_recipient_low,
+                    cctp_recipient_high,
+                ],
+            };
+
+            let invoke_result = starknet_account
+                .execute_v3(vec![register_call])
+                .send()
+                .await
+                .map_err(|e| DeployError::Transient(format!("Starknet invoke failed: {e}")))?;
+
+            println!(
+                "Starknet merchant pair deployed in tx 0x{:x}",
+                invoke_result.transaction_hash
+            );
 
             Ok(())
         }

@@ -17,6 +17,8 @@
 //! EVM only, deliberately: Starknet's shield-in leg requires the merchant
 //! to hold a real keypair to ever spend their shielded notes later, which
 //! is incompatible with "no crypto knowledge required."
+//! 
+//! Hence privacy is opted-in by privacy seeking merchants
 //!
 //! Env vars: RPC_URL, FACTORY_ADDRESS, CHAIN_NAME (e.g. "BASE" — used only
 //! as the cctpMintChain label on the same-chain settlement path, see

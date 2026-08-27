@@ -1,32 +1,7 @@
-//! Beanie Lanes API — the only user-facing endpoint in Beanie.
-//!
-//! One route: POST /lanes/init. No signup, no login, no wallet connect, no
-//! signed message — paste a destination address (your own wallet, or just
-//! your exchange's deposit address) and get a deterministically predicted
-//! receiver back immediately. Actual on-chain registration happens in the
-//! background, paid for by whoever runs this process.
-//!
-//! MerchantFactory.registerMerchant() has no caller restriction — it's
-//! already permissionless. This process is a convenience, not a gatekeeper:
-//! anyone who doesn't trust a given operator's rate limits can call the
-//! factory directly with their own wallet and skip this entirely. Because
-//! there's no fee or incentive for running this API, rate limiting per IP
-//! is the only thing standing between "free for everyone" and "free until
-//! someone drains the operator's gas."
-//!
-//! EVM only, deliberately: Starknet's shield-in leg requires the merchant
-//! to hold a real keypair to ever spend their shielded notes later, which
-//! is incompatible with "no crypto knowledge required."
-//!
-//! Env vars: RPC_URL, FACTORY_ADDRESS, CHAIN_NAME (e.g. "BASE" — used only
-//! as the cctpMintChain label on the same-chain settlement path, see
-//! init_lane), KEEPER_PRIVATE_KEY, RATE_LIMIT_PER_HOUR (default 5),
-//! LISTEN_ADDR (default 0.0.0.0:8080).
-
 pub use axum::{
-    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 pub use serde::{Deserialize, Serialize};
 pub use std::{
