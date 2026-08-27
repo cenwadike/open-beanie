@@ -217,8 +217,9 @@ fn deploy_factory(
     privacy_contract: ContractAddress,
     cctp_messenger: ContractAddress,
     token: ContractAddress,
-    destination_domain: u32,
-    mint_recipient: u256,
+    base_destination_domain: u32,
+    solana_destination_domain: u32,
+    eth_destination_domain: u32,
     treasury_pubkey: felt252,
     salt: felt252,
     shield_in_class: ContractClass,
@@ -226,9 +227,10 @@ fn deploy_factory(
 ) -> ContractAddress {
     let factory_class = declare("MerchantFactory").unwrap_syscall().contract_class();
     let calldata = array![
-        privacy_contract.into(), cctp_messenger.into(), token.into(), destination_domain.into(),
-        mint_recipient.low.into(), mint_recipient.high.into(), treasury_pubkey, salt,
-        shield_in_class.class_hash.into(), bridge_out_class.class_hash.into(),
+        privacy_contract.into(), cctp_messenger.into(), token.into(),
+        base_destination_domain.into(), solana_destination_domain.into(),
+        eth_destination_domain.into(), treasury_pubkey, salt, shield_in_class.class_hash.into(),
+        bridge_out_class.class_hash.into(),
     ];
     let (factory_addr, _) = factory_class.deploy(@calldata).unwrap_syscall();
     factory_addr
@@ -358,8 +360,9 @@ fn merchant_factory_registers_pair_and_persists_storage() {
         privacy_pool,
         cctp_messenger,
         token,
-        42_u32,
-        0x77_u256,
+        3_u32,
+        5_u32,
+        0_u32,
         treasury_pubkey,
         0xfeed,
         shield_class.clone(),
@@ -367,7 +370,7 @@ fn merchant_factory_registers_pair_and_persists_storage() {
     );
 
     let pair = IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(merchant_pubkey);
+        .register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
 
     assert(pair.shield_in != 0, 'SHIELD_DEPLOYED');
     assert(pair.bridge_out != 0, 'BRIDGE_DEPLOYED');
@@ -391,14 +394,17 @@ fn merchant_factory_rejects_duplicate_merchant() {
         privacy_pool,
         cctp_messenger,
         token,
-        42_u32,
-        0x77_u256,
+        3_u32,
+        5_u32,
+        0_u32,
         treasury_pubkey,
         0xfeed,
         shield_class.clone(),
         bridge_class.clone(),
     );
 
-    IMerchantFactoryDispatcher { contract_address: factory_addr }.register_merchant(0xabc);
-    IMerchantFactoryDispatcher { contract_address: factory_addr }.register_merchant(0xabc);
+    IMerchantFactoryDispatcher { contract_address: factory_addr }
+        .register_merchant(0xabc, 'BASE', 0x77_u256);
+    IMerchantFactoryDispatcher { contract_address: factory_addr }
+        .register_merchant(0xabc, 'BASE', 0x77_u256);
 }

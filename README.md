@@ -50,10 +50,14 @@ arrive, the fee is taken, and the rest routes to the merchant directly.
 - **`MerchantFactory` (Solidity)** — deploys deterministic clones per
   merchant and resolves the CCTP destination domain for Starknet, Base,
   Solana, or Ethereum from a chain name.
+- **`MerchantWebhookRegistry` (Solidity)** — Allows merchants to register and updating their individual delivery endpoints on-chain. This structural layout facilitates dynamic, per-merchant notification webhooks entirely off the ledger state.
 
-The same three-contract shape (factory / per-merchant instance /
-immutable destinations) is referenced in the EVM contract's own comments
-as extending to a Solana leg as well.
+### Off-Chain Automated Infrastructure (`evm_keeper`)
+
+To keep the transaction flow completely fluid on non-custodial EVM legs, a highly efficient **Rust background daemon** acts as the system's operational core:
+- **Chunked State Discovery:** Continuously queries incoming network states via structured `eth_getLogs` block chunking, effortlessly bypassing rigid RPC provider limits (e.g., 10,000 block max thresholds).
+- **Atomic Batch Sweeping:** Consolidates all merchant instances detecting new transactions during a poll cycle and groups them into a single `Multicall3.aggregate3()` execution. It sets `allowFailure: true`, preventing a single broken or racing instance from ruining the gas profile of adjacent batched operations.
+- **Cryptographic Webhook Dispatch:** Resolves active receiver addresses back to their registered on-chain merchant profiles, fetches their webhook metadata, and dispatches authenticated JSON payloads. Webhooks are cryptographically bound using EIP-191 `personal_sign` over the keeper wallet's identity, allowing target nodes to securely confirm identity parity with the transaction sender.
 
 ## How a payment moves
 
@@ -95,7 +99,7 @@ The 0.50% protocol fee is taken once, at deposit
 
 ## Tests
 
-- **`tests/test_anonymizers.cairo`** — snforge tests against mock
+- **`tests/test.cairo`** — snforge tests against mock
   token/messenger contracts, covering: shield-in fee split, allowance,
   and stealth note derivation; access-control rejection on both
   anonymizers; and factory deployment plus duplicate-registration
@@ -131,11 +135,20 @@ before relying on anything downstream of it, and run testnet integration
 tests against the live STRK20 pool and Starknet CCTP contracts before
 touching real funds.
 
-### EVM
+### EVM Smart Contracts
 
 ```bash
 forge install
 forge test
+```
+
+### EVM Daemon Keeper (`evm_keeper`)
+
+```bash
+cd evm_keeper
+cp .env.example .env # Configure your node provider URLs and contract deployments here
+cargo check
+cargo run
 ```
 
 ## File map
@@ -143,9 +156,14 @@ forge test
 | File | Job |
 |---|---|
 | `starknet_beanie/src/merchant_factory.cairo` | Deploys a `ShieldInAnonymizer` + `BridgeOutAnonymizer` pair per merchant |
-| `starknet_beanie/src/shield_in_anonymizer.cairo` | Per-merchant shield-in: fee split + stealth note derivation |
-| `starknet_beanie/src/bridge_out_anonymizer.cairo` | Per-merchant bridge-out: CCTP Fast Transfer exit from Starknet |
+| `starknet_beanie/src/shield_in.cairo` | Per-merchant shield-in: fee split + stealth note derivation |
+| `starknet_beanie/src/bridge_out.cairo` | Per-merchant bridge-out: CCTP Fast Transfer exit from Starknet |
 | `starknet_beanie/tests/test.cairo` | snforge tests for all three Starknet contracts |
 | `evm_beanie/src/MerchantFactory.sol` | Deploys a `ChainXReceiver` clone per merchant; resolves CCTP domain by chain name |
 | `evm_beanie/src/ChainXReceiver.sol` | Per-merchant EVM receiver: fee split + CCTP burn or same-chain transfer |
+| `evm_beanie/src/MerchantWebhookRegistry.sol` | On-chain registration directory storing individual merchant notification links |
 | `evm_beanie/test/ReceiverFactory.t.sol` | Foundry tests for the EVM factory and receiver |
+| `evm_keeper/src/main.rs` | Background scheduling runner controlling chunk logs and async execution loops |
+| `evm_keeper/src/config.rs` | Robust structural schema mapping out the operational environment variables |
+| `evm_keeper/src/sweep.rs` | Handles multi-target index scans, chunk loops, and Multicall3 compilation |
+| `evm_keeper/src/webhook.rs` | Handles cryptographic text payload signatures via EIP-191 and HTTP POST delivery |
