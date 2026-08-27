@@ -17,20 +17,24 @@ pub trait IMerchantFactory<T> {
     fn register_merchant(
         ref self: T, merchant_pubkey: felt252, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
     ) -> MerchantPair;
-    fn get_merchant_pair(self: @T, merchant_pubkey: felt252) -> MerchantPair;
+    fn predict_shield_in_address(self: @T, merchant_pubkey: felt252) -> ContractAddress;
+    fn get_merchant_pairs(self: @T, merchant_pubkey: felt252) -> Array<MerchantPair>;
+    fn get_merchant_pair_at(self: @T, merchant_pubkey: felt252, index: u64) -> MerchantPair;
 }
 
 #[starknet::contract]
 pub mod MerchantFactory {
-    use core::num::traits::Zero;
     use core::poseidon::poseidon_hash_span;
+    use core::traits::TryInto;
     use starknet::storage::{
-        Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
-        StoragePointerWriteAccess,
+        Map, MutableVecTrait, StorageMapReadAccess, StorageMapWriteAccess, StoragePathEntry,
+        StoragePointerReadAccess, StoragePointerWriteAccess, Vec, VecTrait,
     };
     use starknet::syscalls::deploy_syscall;
-    use starknet::{ClassHash, ContractAddress};
+    use starknet::{ClassHash, ContractAddress, get_contract_address};
     use super::{IMerchantFactory, MerchantPair};
+
+    const MAX_PAIRS_PER_MERCHANT: u64 = 32;
 
     #[storage]
     struct Storage {
@@ -41,16 +45,17 @@ pub mod MerchantFactory {
         destination_domains: Map<felt252, u32>,
         treasury_pubkey: felt252,
         salt: felt252,
-        merchant_nonces: Map<felt252, felt252>,
         shield_in_class_hash: ClassHash,
         bridge_out_class_hash: ClassHash,
-        merchant_pairs: Map<felt252, MerchantPair>,
+        merchant_nonces: Map<felt252, felt252>,
+        merchant_pairs: Map<felt252, Vec<MerchantPair>>,
     }
 
     pub mod Errors {
-        pub const ALREADY_REGISTERED: felt252 = 'ALREADY_REGISTERED';
+        pub const MAX_PAIRS_EXCEEDED: felt252 = 'MAX_RECEIVERS_EXCEEDED';
         pub const DEPLOY_FAILED: felt252 = 'DEPLOY_FAILED';
         pub const INVALID_DOMAIN: felt252 = 'INVALID_DOMAIN';
+        pub const INDEX_OUT_OF_BOUNDS: felt252 = 'INDEX_OUT_OF_BOUNDS';
     }
 
     #[constructor]
@@ -70,7 +75,7 @@ pub mod MerchantFactory {
         self.privacy_contract.write(privacy_contract);
         self.cctp_messenger.write(cctp_messenger);
         self.token.write(token);
-        // register valid chain keys and their destination domains
+
         self.valid_domains.write('BASE', true.into());
         self.valid_domains.write('SOLANA', true.into());
         self.valid_domains.write('ETHEREUM', true.into());
@@ -92,13 +97,10 @@ pub mod MerchantFactory {
             cctp_mint_chain: felt252,
             cctp_mint_recipient: u256,
         ) -> MerchantPair {
-            assert(
-                self.merchant_pairs.read(merchant_pubkey).shield_in.is_zero(),
-                Errors::ALREADY_REGISTERED,
-            );
+            // Get mutable reference to the merchant's vector pointer
+            let mut pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
+            assert(pairs_vec.len() < MAX_PAIRS_PER_MERCHANT, Errors::MAX_PAIRS_EXCEEDED);
 
-            // Each merchant owns an independent nonce sequence, while the factory salt stays fixed
-            // across all deployments from this factory instance.
             let merchant_nonce = self.merchant_nonces.read(merchant_pubkey);
             let salt = poseidon_hash_span(
                 array![merchant_pubkey, merchant_nonce, self.salt.read()].span(),
@@ -110,7 +112,6 @@ pub mod MerchantFactory {
             let treasury_pubkey = self.treasury_pubkey.read();
             let cctp_messenger = self.cctp_messenger.read();
 
-            // verify chain and load destination domain
             assert(self.valid_domains.read(cctp_mint_chain) != 0, Errors::INVALID_DOMAIN);
             let destination_domain = self.destination_domains.read(cctp_mint_chain);
 
@@ -133,12 +134,60 @@ pub mod MerchantFactory {
                 .expect(Errors::DEPLOY_FAILED);
 
             let pair = MerchantPair { shield_in: shield_in_addr, bridge_out: bridge_out_addr };
-            self.merchant_pairs.write(merchant_pubkey, pair);
+
+            // Push directly to storage vector entry
+            pairs_vec.push(pair);
             pair
         }
 
-        fn get_merchant_pair(self: @ContractState, merchant_pubkey: felt252) -> MerchantPair {
-            self.merchant_pairs.read(merchant_pubkey)
+        fn predict_shield_in_address(
+            self: @ContractState, merchant_pubkey: felt252,
+        ) -> ContractAddress {
+            let merchant_nonce = self.merchant_nonces.read(merchant_pubkey);
+            let salt = poseidon_hash_span(
+                array![merchant_pubkey, merchant_nonce, self.salt.read()].span(),
+            );
+
+            let shield_in_calldata = array![
+                self.privacy_contract.read().into(), self.token.read().into(), merchant_pubkey,
+                self.treasury_pubkey.read(),
+            ];
+            let calldata_hash = poseidon_hash_span(shield_in_calldata.span());
+
+            let deployer_address: felt252 = get_contract_address().into();
+            let class_hash_felt: felt252 = self.shield_in_class_hash.read().into();
+
+            let raw_address = poseidon_hash_span(
+                array![
+                    'STARKNET_CONTRACT_ADDRESS', deployer_address, salt, class_hash_felt,
+                    calldata_hash,
+                ]
+                    .span(),
+            );
+
+            raw_address.try_into().unwrap()
+        }
+
+        fn get_merchant_pairs(
+            self: @ContractState, merchant_pubkey: felt252,
+        ) -> Array<MerchantPair> {
+            let pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
+            let mut result = array![];
+            let len = pairs_vec.len();
+            let mut i: u64 = 0;
+            while i < len {
+                result.append(pairs_vec.at(i).read());
+                i += 1;
+            }
+            result
+        }
+
+        fn get_merchant_pair_at(
+            self: @ContractState, merchant_pubkey: felt252, index: u64,
+        ) -> MerchantPair {
+            let pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
+            assert(index < pairs_vec.len(), Errors::INDEX_OUT_OF_BOUNDS);
+            pairs_vec.at(index).read()
         }
     }
 }

@@ -17,19 +17,23 @@ interface IChainXReceiver {
 contract MerchantFactory {
     using Clones for address;
 
+    uint256 public constant MAX_RECEIVERS_PER_MERCHANT = 32;
+
     address public immutable receiverImplementation;
     address public token;
     address public treasury;
     address public tokenMessenger;
 
     mapping(address => uint256) public merchantNonces;
-    mapping(address => address) public merchantReceiver;
-    mapping(bytes32 => bool) validDomains;
-    mapping(bytes32 => uint32) destinationDomain; // keyed by chain name
+    mapping(address => address[]) private merchantReceiversMap;
+    mapping(bytes32 => bool) public validDomains;
+    mapping(bytes32 => uint32) public destinationDomain; // keyed by chain name
 
     event MerchantRegistered(address indexed merchant, address receiver);
 
-    error AlreadyRegistered();
+    error MaximumReceiversExceeded();
+    error InvalidDomain();
+    error IndexOutOfBounds();
 
     constructor(
         address _receiverImplementation,
@@ -72,9 +76,14 @@ contract MerchantFactory {
         bytes32 cctpMintChain, // "STARKNET" || "BASE" || "SOLANA" || "ETHEREUM"
         bytes32 cctpMintRecipient
     ) external returns (address) {
-        if (merchantReceiver[merchant] != address(0))
-            revert AlreadyRegistered();
-        require(validDomains[cctpMintChain] == true, "invalid");
+        if (
+            merchantReceiversMap[merchant].length >= MAX_RECEIVERS_PER_MERCHANT
+        ) {
+            revert MaximumReceiversExceeded();
+        }
+        if (!validDomains[cctpMintChain]) {
+            revert InvalidDomain();
+        }
 
         uint256 nonce = merchantNonces[merchant];
         bytes32 salt = keccak256(abi.encodePacked(merchant, nonce));
@@ -92,7 +101,7 @@ contract MerchantFactory {
             merchant
         );
 
-        merchantReceiver[merchant] = clone;
+        merchantReceiversMap[merchant].push(clone);
         merchantNonces[merchant] = nonce + 1;
 
         emit MerchantRegistered(merchant, clone);
@@ -112,7 +121,25 @@ contract MerchantFactory {
             );
     }
 
-    function getReceiver(address merchant) external view returns (address) {
-        return merchantReceiver[merchant];
+    function getReceiverCount(
+        address merchant
+    ) external view returns (uint256) {
+        return merchantReceiversMap[merchant].length;
+    }
+
+    function getMerchantReceivers(
+        address merchant
+    ) external view returns (address[] memory) {
+        return merchantReceiversMap[merchant];
+    }
+
+    function getMerchantReceiverAt(
+        address merchant,
+        uint256 index
+    ) external view returns (address) {
+        if (index >= merchantReceiversMap[merchant].length) {
+            revert IndexOutOfBounds();
+        }
+        return merchantReceiversMap[merchant][index];
     }
 }

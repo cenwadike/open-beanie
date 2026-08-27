@@ -150,7 +150,8 @@ contract ReceiverFactoryTest is Test {
         );
 
         // ensure factory stored it
-        assertEq(factory.getReceiver(merchant), clone);
+        assertEq(factory.getReceiverCount(merchant), 1);
+        assertEq(factory.getMerchantReceiverAt(merchant, 0), clone);
 
         MerchantFactory f2 = new MerchantFactory(
             address(implementation),
@@ -251,11 +252,59 @@ contract ReceiverFactoryTest is Test {
         assertEq(messenger.lastAmount(), 0);
     }
 
-    function test_register_duplicate_reverts() public {
+    function test_multiple_registrations_and_views() public {
         address merchant = address(0x555);
+
+        address clone1 = factory.registerMerchant(
+            merchant,
+            "STARKNET",
+            defaultMintRecipient
+        );
+        address clone2 = factory.registerMerchant(
+            merchant,
+            "SOLANA",
+            defaultMintRecipient
+        );
+
+        assertEq(factory.getReceiverCount(merchant), 2);
+
+        address[] memory receivers = factory.getMerchantReceivers(merchant);
+        assertEq(receivers.length, 2);
+        assertEq(receivers[0], clone1);
+        assertEq(receivers[1], clone2);
+
+        assertEq(factory.getMerchantReceiverAt(merchant, 0), clone1);
+        assertEq(factory.getMerchantReceiverAt(merchant, 1), clone2);
+    }
+
+    function test_revert_exceed_max_receivers() public {
+        address merchant = address(0x777);
+
+        for (uint256 i = 0; i < 32; i++) {
+            factory.registerMerchant(
+                merchant,
+                "STARKNET",
+                defaultMintRecipient
+            );
+        }
+
+        vm.expectRevert(MerchantFactory.MaximumReceiversExceeded.selector);
         factory.registerMerchant(merchant, "STARKNET", defaultMintRecipient);
-        vm.expectRevert();
-        factory.registerMerchant(merchant, "STARKNET", defaultMintRecipient);
+    }
+
+    function test_revert_invalid_domain() public {
+        address merchant = address(0x888);
+
+        vm.expectRevert(MerchantFactory.InvalidDomain.selector);
+        factory.registerMerchant(merchant, "STARKNET2", defaultMintRecipient);
+    }
+
+    function test_revert_get_index_out_of_bounds() public {
+        address merchant = address(0x999);
+        factory.registerMerchant(merchant, "BASE", defaultMintRecipient);
+
+        vm.expectRevert(MerchantFactory.IndexOutOfBounds.selector);
+        factory.getMerchantReceiverAt(merchant, 1);
     }
 
     function test_initialize_guard_and_storage() public {

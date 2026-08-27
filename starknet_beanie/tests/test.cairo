@@ -7,8 +7,9 @@
 //   Verify the contract rejects unauthorized execution.
 // - Bridge-out test: mint funds into the bridge anonymizer and call it as the privacy pool.
 //   Verify balance-based burn, fixed destination config, and correct CCTP payload.
-// - Factory test: register a merchant by pubkey.
-//   Verify one anonymizer pair is deployed and duplicate registration is rejected.
+// - Factory test: register a merchant by pubkey up to cap limit.
+//   Verify pairs are appended to storage array and registered pairs can be retrieved.
+//
 //
 // Core invariant: fixed config is pinned at deploy time.
 // Runtime trigger belongs to the privacy pool.
@@ -21,6 +22,7 @@
 //
 
 use core::array::ArrayTrait;
+use core::num::traits::Zero;
 use core::traits::TryInto;
 use snforge_std::{
     ContractClass, ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address,
@@ -369,24 +371,27 @@ fn merchant_factory_registers_pair_and_persists_storage() {
         bridge_class.clone(),
     );
 
-    let pair = IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
-
-    assert(pair.shield_in != 0, 'SHIELD_DEPLOYED');
-    assert(pair.bridge_out != 0, 'BRIDGE_DEPLOYED');
-
     let factory_dispatcher = IMerchantFactoryDispatcher { contract_address: factory_addr };
-    let stored_pair = factory_dispatcher.get_merchant_pair(merchant_pubkey);
+    let pair = factory_dispatcher.register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
+
+    assert(pair.shield_in.is_non_zero(), 'SHIELD_DEPLOYED');
+    assert(pair.bridge_out.is_non_zero(), 'BRIDGE_DEPLOYED');
+
+    let stored_pairs = factory_dispatcher.get_merchant_pairs(merchant_pubkey);
+    assert(stored_pairs.len() == 1, 'PAIR_COUNT_ONE');
+
+    let stored_pair = *stored_pairs.at(0);
     assert(stored_pair.shield_in == pair.shield_in, 'PAIR_SHIELD');
     assert(stored_pair.bridge_out == pair.bridge_out, 'PAIR_BRIDGE');
 }
 
 #[test]
-#[should_panic(expected: ('ALREADY_REGISTERED',))]
-fn merchant_factory_rejects_duplicate_merchant() {
+#[should_panic(expected: ('MAX_RECEIVERS_EXCEEDED',))]
+fn merchant_factory_rejects_exceeding_max_pairs() {
     let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
     let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
     let token: ContractAddress = 0x4.try_into().unwrap();
+    let merchant_pubkey: felt252 = 0xabc;
     let treasury_pubkey: felt252 = 0x999;
     let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
     let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
@@ -403,8 +408,11 @@ fn merchant_factory_rejects_duplicate_merchant() {
         bridge_class.clone(),
     );
 
-    IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(0xabc, 'BASE', 0x77_u256);
-    IMerchantFactoryDispatcher { contract_address: factory_addr }
-        .register_merchant(0xabc, 'BASE', 0x77_u256);
+    let factory_dispatcher = IMerchantFactoryDispatcher { contract_address: factory_addr };
+
+    let mut i: u32 = 0;
+    while i < 33 {
+        factory_dispatcher.register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
+        i += 1;
+    };
 }
