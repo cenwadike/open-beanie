@@ -121,7 +121,13 @@ contract ReceiverFactoryTest is Test {
     uint32 _solanaDestinationDomain = 5;
     uint32 _baseDestinationDomain = 3;
     uint32 _ethDestinationDomain = 0;
-    bytes32 defaultMintRecipient = bytes32(uint256(uint160(address(0xBEEF))));
+
+    // Helper function to dynamically generate a valid CCTP recipient
+    function getMintRecipient(
+        address merchant
+    ) internal pure returns (bytes32) {
+        return bytes32(uint256(uint160(merchant)));
+    }
 
     function setUp() public {
         token = new MockToken();
@@ -142,11 +148,13 @@ contract ReceiverFactoryTest is Test {
 
     function test_register_and_sweep_burn_path_happy() public {
         address merchant = address(0xABC);
+        bytes32 validRecipient = getMintRecipient(merchant);
+
         // deploy clone via factory
         address clone = factory.registerMerchant(
             merchant,
             "STARKNET",
-            defaultMintRecipient
+            validRecipient
         );
 
         // ensure factory stored it
@@ -167,7 +175,7 @@ contract ReceiverFactoryTest is Test {
         address clone2 = f2.registerMerchant(
             merchant,
             "STARKNET",
-            defaultMintRecipient
+            validRecipient
         );
 
         // mint tokens into clone2
@@ -254,16 +262,17 @@ contract ReceiverFactoryTest is Test {
 
     function test_multiple_registrations_and_views() public {
         address merchant = address(0x555);
+        bytes32 validRecipient = getMintRecipient(merchant);
 
         address clone1 = factory.registerMerchant(
             merchant,
             "STARKNET",
-            defaultMintRecipient
+            validRecipient
         );
         address clone2 = factory.registerMerchant(
             merchant,
             "SOLANA",
-            defaultMintRecipient
+            validRecipient
         );
 
         assertEq(factory.getReceiverCount(merchant), 2);
@@ -279,29 +288,28 @@ contract ReceiverFactoryTest is Test {
 
     function test_revert_exceed_max_receivers() public {
         address merchant = address(0x777);
+        bytes32 validRecipient = getMintRecipient(merchant);
 
         for (uint256 i = 0; i < 32; i++) {
-            factory.registerMerchant(
-                merchant,
-                "STARKNET",
-                defaultMintRecipient
-            );
+            factory.registerMerchant(merchant, "STARKNET", validRecipient);
         }
 
         vm.expectRevert(MerchantFactory.MaximumReceiversExceeded.selector);
-        factory.registerMerchant(merchant, "STARKNET", defaultMintRecipient);
+        factory.registerMerchant(merchant, "STARKNET", validRecipient);
     }
 
     function test_revert_invalid_domain() public {
         address merchant = address(0x888);
+        bytes32 validRecipient = getMintRecipient(merchant);
 
         vm.expectRevert(MerchantFactory.InvalidDomain.selector);
-        factory.registerMerchant(merchant, "STARKNET2", defaultMintRecipient);
+        factory.registerMerchant(merchant, "STARKNET2", validRecipient);
     }
 
     function test_revert_get_index_out_of_bounds() public {
         address merchant = address(0x999);
-        factory.registerMerchant(merchant, "BASE", defaultMintRecipient);
+        bytes32 validRecipient = getMintRecipient(merchant);
+        factory.registerMerchant(merchant, "BASE", validRecipient);
 
         vm.expectRevert(MerchantFactory.IndexOutOfBounds.selector);
         factory.getMerchantReceiverAt(merchant, 1);
@@ -310,13 +318,15 @@ contract ReceiverFactoryTest is Test {
     function test_initialize_guard_and_storage() public {
         // Deploy clone manually from implementation to test initialize guards
         address merchant = address(0xABC);
+        bytes32 validRecipient = getMintRecipient(merchant);
+
         ChainXReceiver r = new ChainXReceiver();
         r.initialize(
             address(token),
             treasury,
             address(messenger),
             _starknetDestinationDomain,
-            defaultMintRecipient,
+            validRecipient,
             merchant
         );
         vm.expectRevert();
@@ -325,7 +335,7 @@ contract ReceiverFactoryTest is Test {
             treasury,
             address(messenger),
             _starknetDestinationDomain,
-            defaultMintRecipient,
+            validRecipient,
             merchant
         );
     }

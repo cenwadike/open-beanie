@@ -1,9 +1,10 @@
 pub use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 pub use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 pub use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -36,7 +37,7 @@ pub struct DeployTask {
 pub struct InitLaneRequest {
     pub merchant_address: String,
     pub target_chain: Chain,
-    pub source_chains: Vec<Chain>,
+    pub source_chains: HashSet<Chain>,
     #[serde(default)]
     pub enable_privacy: bool,
     pub webhook_url: Option<String>,
@@ -45,7 +46,7 @@ pub struct InitLaneRequest {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LaneDeployment {
     pub chain: Chain,
-    pub deployment_address: String,
+    pub address: String,
     pub is_privacy_lane: bool,
 }
 

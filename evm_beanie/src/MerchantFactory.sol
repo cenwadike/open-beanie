@@ -73,18 +73,23 @@ contract MerchantFactory {
 
     function registerMerchant(
         address merchant,
-        bytes32 cctpMintChain, // "STARKNET" || "BASE" || "SOLANA" || "ETHEREUM"
-        bytes32 cctpMintRecipient
+        bytes32 cctpMintChain, // "" || "STARKNET" || "BASE" || "SOLANA" || "ETHEREUM"
+        bytes32 cctpMintRecipient // "" || byte32(merchant)
     ) external returns (address) {
         if (
             merchantReceiversMap[merchant].length >= MAX_RECEIVERS_PER_MERCHANT
         ) {
             revert MaximumReceiversExceeded();
         }
-        if (!validDomains[cctpMintChain]) {
-            revert InvalidDomain();
+        if (cctpMintChain != 0) {
+            require(validDomains[cctpMintChain], InvalidDomain());
         }
-
+        if (cctpMintRecipient != 0) {
+            require(
+                bytes32(uint256(uint160(merchant))) == cctpMintRecipient,
+                "cctp mint recipient must match merchant address"
+            );
+        }
         uint256 nonce = merchantNonces[merchant];
         bytes32 salt = keccak256(abi.encodePacked(merchant, nonce));
 

@@ -60,6 +60,18 @@ pub async fn init_lane(
         return err(StatusCode::BAD_REQUEST, "source_chains cannot be empty");
     }
 
+    let mut source_chains = payload.source_chains.clone();
+    source_chains.insert(payload.target_chain);
+
+    for chain in source_chains.iter() {
+        if Chain::try_from(*chain).is_err() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("{:?} is not a supported chain. Use BASE or STARKNET", chain),
+            );
+        }
+    }
+
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|h| h.to_str().ok())
@@ -84,9 +96,8 @@ pub async fn init_lane(
 
     let mut lane_results = Vec::new();
 
-    for chain in &payload.source_chains {
+    for chain in &source_chains {
         let is_privacy = *chain == Chain::Starknet || payload.enable_privacy;
-
         let predicted_address = match chain {
             Chain::Base | Chain::Ethereum => {
                 let parsed_merchant = match Address::from_str(merchant_address) {
@@ -184,7 +195,7 @@ pub async fn init_lane(
 
         lane_results.push(LaneDeployment {
             chain: *chain,
-            deployment_address: predicted_address,
+            address: predicted_address,
             is_privacy_lane: is_privacy,
         });
     }

@@ -11,13 +11,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
+use ethers::types::Address;
+use ethers::utils::format_bytes32_string;
 #[allow(unused_imports)]
 use ethers::{
     contract::abigen,
     middleware::{NonceManagerMiddleware, SignerMiddleware},
     providers::{Http as EvmHttp, Provider as EvmProvider},
     signers::LocalWallet,
-    types::{Address, U256},
+    types::U256,
 };
 
 use crate::models::{Chain, DeployTask};
@@ -55,18 +57,23 @@ fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
         Chain::Starknet => "STARKNET",
         Chain::Solana => "SOLANA",
     };
-    let mut bytes = [0u8; 32];
-    bytes[..name.len()].copy_from_slice(name.as_bytes());
-    bytes
+
+    format_bytes32_string(name).expect("Chain name fits in bytes32")
 }
 
 fn chain_to_felt(chain: Chain) -> Felt {
     match chain {
-        Chain::Base => Felt::from_hex("0x42415345").unwrap(), // "BASE"
-        Chain::Ethereum => Felt::from_hex("0x455448455245554d").unwrap(), // "ETHEREUM"
-        Chain::Solana => Felt::from_hex("0x534f4c414e41").unwrap(), // "SOLANA"
-        Chain::Starknet => Felt::from_hex("0x535441524b4e4554").unwrap(),
+        Chain::Base => Felt::from_hex(&hex::encode("BASE")).unwrap(),
+        Chain::Ethereum => Felt::from_hex(&hex::encode("ETHEREUM")).unwrap(),
+        Chain::Solana => Felt::from_hex(&hex::encode("SOLANA")).unwrap(),
+        Chain::Starknet => Felt::from_hex(&hex::encode("STARKNET")).unwrap(),
     }
+}
+
+fn evm_address_to_bytes32(addr: Address) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(addr.as_bytes());
+    out
 }
 
 pub async fn execute_onchain_deployment(
@@ -104,8 +111,23 @@ pub async fn execute_onchain_deployment(
                 )));
             }
 
-            let mut recipient_bytes = [0u8; 32];
-            recipient_bytes[12..].copy_from_slice(merchant_addr.as_bytes());
+            // Same-chain (this instance's chain IS the target_chain): leave
+            // the recipient zeroed so ChainXReceiver::sweep() takes the
+            // local safeTransfer(merchant, net) branch instead of trying to
+            // CCTP-burn back onto the chain it's already on.
+            //
+            // Cross-chain: recipient is the merchant's own address, encoded
+            // as a proper CCTP bytes32 (12 zero bytes + 20 address bytes),
+            // since the merchant is both the identity key AND the payout
+            // recipient on the target chain.
+            let is_same_chain = task.chain == task.target_chain;
+            let recipient_bytes;
+
+            if is_same_chain {
+                recipient_bytes = [0u8; 32]
+            } else {
+                recipient_bytes = evm_address_to_bytes32(merchant_addr)
+            };
 
             let tx = factory.register_merchant(
                 merchant_addr,
@@ -140,6 +162,21 @@ pub async fn execute_onchain_deployment(
             Ok(())
         }
         Chain::Starknet => {
+            // Starknet is the privacy leg only — it can never be its own
+            // target. Staying private on Starknet means configuring
+            // ShieldInAnonymizer to spend the shielded note directly
+            // within the STRK20 pool, not registering a BridgeOutAnonymizer.
+            // The Cairo factory's valid_domains map never registers
+            // 'STARKNET' (only BASE/SOLANA/ETHEREUM), so this would always
+            // revert INVALID_DOMAIN on-chain — fail fast instead of
+            // spending a tx on a guaranteed revert.
+            let is_same_chain = task.chain == task.target_chain;
+            if is_same_chain && task.target_chain == Chain::Starknet {
+                return Err(DeployError::Fatal(
+                    "Starknet cannot be its own target_chain; for same-chain privacy, spend the shielded note directly within the STRK20 pool instead of registering a bridge-out pair".to_string(),
+                ));
+            }
+
             let merchant_pubkey = Felt::from_hex(&task.merchant_address).map_err(|e| {
                 DeployError::Fatal(format!("Invalid Starknet merchant_pubkey felt252: {e}"))
             })?;
@@ -178,9 +215,16 @@ pub async fn execute_onchain_deployment(
 
             let target_chain_felt = chain_to_felt(task.target_chain);
 
-            // Parse merchant address as uint256 (low: felt252, high: felt252)
-            let cctp_recipient_low = merchant_pubkey;
-            let cctp_recipient_high = Felt::ZERO;
+            // Encode merchant_pubkey as a proper big-endian u256 split
+            // (low: felt252, high: felt252), each bounded to 128 bits.
+            // The old code put the *entire* felt252 (up to ~252 bits) into
+            // `low` with `high = 0` — for any real merchant identity above
+            // 2^128 (e.g. one sized to double as an EVM address, per the
+            // "merchant is also the recipient" model), Cairo's u128
+            // range-check on `low` fails and the call reverts.
+            let recipient_be = merchant_pubkey.to_bytes_be();
+            let cctp_recipient_high = Felt::from_bytes_be_slice(&recipient_be[0..16]);
+            let cctp_recipient_low = Felt::from_bytes_be_slice(&recipient_be[16..32]);
 
             let register_call = Call {
                 to: starknet_factory_addr,
