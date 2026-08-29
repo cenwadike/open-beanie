@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Slackey&display=swap" rel="stylesheet">
+  <title>Pay with Beanie</title>
+  <link rel="icon" href="/assets/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="/styles/pay.css">
+</head>
+
+<body>
+  <div class="page">
+    <div class="doodle-field" aria-hidden="true"></div>
+    <div class="veil" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/beanie.html" aria-label="Beanie home">
+        <span class="wordmark">bean<span class="colon">:</span>ie</span>
+      </a>
+    </header>
+
+    <main class="pay-shell">
+      <section class="pay-panel" aria-labelledby="payTitle">
+        <div class="panel-copy">
+          <p class="eyebrow">Direct wallet transfer</p>
+          <h1 id="payTitle">Pay with USDC</h1>
+          <p class="subtitle">Choose the chain where you are sending funds and confirm the deposit address.</p>
+        </div>
+
+        <div class="lane-card" id="laneCard" aria-live="polite">
+          <div class="loading">Loading payment details...</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/scripts/qrcode.bundle.js"></script>
+  <script src="/scripts/pay.js" defer></script>
+</body>
+
+</html>

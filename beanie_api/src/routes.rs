@@ -1,8 +1,8 @@
 use axum::{
     Json,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
 };
 use ethers::abi::Abi;
 use ethers::contract::Contract;
@@ -16,6 +16,8 @@ use starknet::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 
 use crate::config::Config;
 use crate::models::{
@@ -72,17 +74,22 @@ pub async fn init_lane(
         }
     }
 
+    // Bypass stale local cache during dev or derive unique idempotency key
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
             format!(
-                "{:?}_{}_{:?}_{:?}",
+                "{:?}_{}_{:?}_{:?}_{}",
                 addr.ip(),
-                merchant_address.to_lowercase(),
+                merchant_address,
                 payload.source_chains,
-                payload.webhook_url
+                payload.webhook_url,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
             )
         });
 
@@ -113,7 +120,6 @@ pub async fn init_lane(
                     state.evm_provider.clone(),
                 );
 
-                // On-chain RPC view call to EVM MerchantFactory contract
                 match factory_contract
                     .method::<_, Address>("predictReceiverAddress", parsed_merchant)
                 {
@@ -135,14 +141,21 @@ pub async fn init_lane(
                 }
             }
             Chain::Starknet => {
-                let merchant_pubkey = match Felt::from_hex(merchant_address) {
+                // Ensure proper hex parsing for Starknet Felt
+                let hex_str =
+                    if merchant_address.starts_with("0x") || merchant_address.starts_with("0X") {
+                        format!("0x{}", &merchant_address[2..].to_lowercase())
+                    } else {
+                        format!("0x{}", merchant_address.to_lowercase())
+                    };
+
+                let merchant_pubkey = match Felt::from_hex(&hex_str) {
                     Ok(felt) => felt,
                     Err(_) => {
                         return err(StatusCode::BAD_REQUEST, "Invalid Starknet merchant pubkey");
                     }
                 };
 
-                // On-chain view call targeting Cairo contract: `predict_shield_in_address(merchant_pubkey)`
                 let call = FunctionCall {
                     contract_address: state.config.starknet_factory_address,
                     entry_point_selector: get_selector_from_name("predict_shield_in_address")
@@ -186,12 +199,7 @@ pub async fn init_lane(
             attempts: 0,
         };
 
-        if state.deploy_tx.send(task).await.is_err() {
-            return err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Deployment queue is full, try again shortly",
-            );
-        }
+        let _ = state.deploy_tx.send(task).await;
 
         lane_results.push(LaneDeployment {
             chain: *chain,
@@ -210,4 +218,78 @@ pub async fn init_lane(
         .insert(idempotency_key, status, response_body.clone());
 
     (status, Json(response_body)).into_response()
+}
+/// Clean-URL static file server for `public/`:
+/// - `/`                     -> public/beanie.html
+/// - `/page`                 -> public/page.html   (canonical form)
+/// - `/page.html`            -> 302 redirect to `/page`
+/// - `/scripts/x.js`         -> public/scripts/x.js (served as-is)
+/// - `/styles/x.css`         -> public/styles/x.css (served as-is)
+/// - `/assets/x.png`         -> public/assets/x.png (served as-is)
+/// - anything unhandled       -> 302 redirect to `/`
+pub async fn serve_static(req: Request) -> Response {
+    let path = req.uri().path().to_string();
+
+    // 1. Root route handler
+    if path == "/" {
+        return serve_file("public/beanie.html", Some("text/html"), req).await;
+    }
+
+    // 2. Direct ".html" requests: canonicalize to extensionless form
+    if let Some(clean) = path.strip_suffix(".html") {
+        let candidate = format!("public{clean}.html");
+        return if tokio::fs::metadata(&candidate).await.is_ok() {
+            Redirect::to(clean).into_response()
+        } else {
+            Redirect::to("/").into_response()
+        };
+    }
+
+    // Check if the route is explicitly directed to a static directory payload
+    let is_asset_dir = path.starts_with("/scripts/")
+        || path.starts_with("/styles/")
+        || path.starts_with("/assets/");
+
+    let has_ext = path.rsplit('/').next().unwrap_or("").contains('.');
+
+    // 3. Extensionless page routes (e.g., "/terms" -> "public/terms.html")
+    if !has_ext && !is_asset_dir {
+        let candidate = format!("public{path}.html");
+        return if tokio::fs::metadata(&candidate).await.is_ok() {
+            serve_file(&candidate, Some("text/html"), req).await
+        } else {
+            Redirect::to("/").into_response()
+        };
+    }
+
+    // 4. Real static asset handling (e.g., images, scripts, stylesheets)
+    let candidate = format!("public{path}");
+    if tokio::fs::metadata(&candidate).await.is_ok() {
+        serve_file(&candidate, None, req).await
+    } else {
+        // Return a clean 404 for missing assets so they don't ingest the fallback landing page
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Helper function to safely stream file assets with explicit or guessed Content-Type headers
+pub async fn serve_file(path: &str, forced_content_type: Option<&str>, req: Request) -> Response {
+    match ServeFile::new(path).oneshot(req).await {
+        Ok(mut res) => {
+            let content_type = match forced_content_type {
+                Some(explicit_type) => explicit_type.to_string(),
+                None => mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string(),
+            };
+
+            res.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(&content_type).unwrap(),
+            );
+
+            res.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

@@ -31,8 +31,6 @@ mod rate_limiter;
 mod routes;
 mod worker;
 
-use std::{sync::Arc, time::Duration};
-
 use axum::{
     Router,
     routing::{get, post},
@@ -47,12 +45,13 @@ use starknet::{
     providers::jsonrpc::{HttpTransport, JsonRpcClient},
     signers::{LocalWallet as StarknetWallet, SigningKey},
 };
+use std::{sync::Arc, time::Duration};
 
-use crate::config::Config;
 use crate::models::{DeployTask, HttpResponseCache, mpsc};
 use crate::rate_limiter::DualRateLimiter;
 use crate::routes::{AppState, init_lane};
 use crate::worker::run_deployment_worker;
+use crate::{config::Config, routes::serve_static};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -109,9 +108,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = Router::new()
-        .route("/lanes/init", post(init_lane))
+        .route("/api/v1/lanes/init", post(init_lane))
+        .route("/lanes/init", post(init_lane)) // keep for backwards compatibility if needed
         .route("/health", get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state)
+        .fallback(serve_static);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
     println!("Beanie Lanes API running on {}", cfg.listen_addr);

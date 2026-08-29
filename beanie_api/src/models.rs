@@ -15,12 +15,12 @@ pub use tokio::sync::mpsc;
 
 // ── 1. Data Models & API Schemas ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Chain {
     Base,
-    Ethereum,
     Starknet,
+    Ethereum,
     Solana,
 }
 

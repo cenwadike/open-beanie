@@ -144,7 +144,7 @@ contract ChainXReceiver {
         if (net > 0 && cctpMintRecipient != bytes32(0)) {
             // Derive the 2 bps FAST CCTP teleport (2 / 10,000 = 0.0002 or 0.02%)
             // 0.05 bps Over reference maximum CCTP FAST EVM finality
-            uint256 max_fee = (balance * 15) / 10_000;
+            uint256 max_fee = (balance * 2) / 10_000;
 
             IERC20(token).approve(tokenMessenger, net);
             ITokenMessengerV2(tokenMessenger).depositForBurn(
