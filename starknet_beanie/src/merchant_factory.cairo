@@ -1,193 +1,213 @@
-// MerchantFactory — Deploys ONE anonymizer pair PER MERCHANT.
+// MerchantFactory — Cairo port aligned with ChainX MerchantFactory.sol
 //
-// Registers the merchant's static spending key (`merchant_pubkey`) into storage
-// during `ShieldInAnonymizer` deployment, alongside a single shared `treasury_pubkey`
-// that every merchant's fee note shields to.
+// Deploys single StarknetReceiver instances per merchant and initializes them
+// with pinned destinations and settlement targets.
 
 use starknet::ContractAddress;
 
-#[derive(Copy, Drop, Serde, starknet::Store)]
-pub struct MerchantPair {
-    pub shield_in: ContractAddress,
-    pub bridge_out: ContractAddress,
+#[starknet::interface]
+pub trait IStarknetReceiver<T> {
+    fn initialize(
+        ref self: T,
+        token: ContractAddress,
+        treasury: ContractAddress,
+        token_messenger: ContractAddress,
+        destination_domain: u32,
+        mint_recipient: u256,
+        merchant: ContractAddress,
+    );
 }
 
 #[starknet::interface]
 pub trait IMerchantFactory<T> {
     fn register_merchant(
-        ref self: T, merchant_pubkey: felt252, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
-    ) -> MerchantPair;
-    fn predict_shield_in_address(self: @T, merchant_pubkey: felt252) -> ContractAddress;
-    fn get_merchant_pairs(self: @T, merchant_pubkey: felt252) -> Array<MerchantPair>;
-    fn get_merchant_pair_at(self: @T, merchant_pubkey: felt252, index: u64) -> MerchantPair;
+        ref self: T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
+    ) -> ContractAddress;
+    fn predict_receiver_address(self: @T, merchant: ContractAddress) -> ContractAddress;
+    fn get_merchant_receivers(self: @T, merchant: ContractAddress) -> Array<ContractAddress>;
+    fn get_merchant_receiver_at(self: @T, merchant: ContractAddress, index: u64) -> ContractAddress;
+    fn get_receiver_count(self: @T, merchant: ContractAddress) -> u64;
 }
 
 #[starknet::contract]
 pub mod MerchantFactory {
+    use core::num::traits::Zero;
     use core::poseidon::poseidon_hash_span;
     use core::traits::TryInto;
+    use openzeppelin::utils::deployments::calculate_contract_address_from_deploy_syscall;
     use starknet::storage::{
         Map, MutableVecTrait, StorageMapReadAccess, StorageMapWriteAccess, StoragePathEntry,
         StoragePointerReadAccess, StoragePointerWriteAccess, Vec, VecTrait,
     };
     use starknet::syscalls::deploy_syscall;
     use starknet::{ClassHash, ContractAddress, get_contract_address};
-    use super::{IMerchantFactory, MerchantPair};
+    use super::{IMerchantFactory, IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
 
-    const MAX_PAIRS_PER_MERCHANT: u64 = 32;
+    const MAX_RECEIVERS_PER_MERCHANT: u64 = 32;
 
     #[storage]
     struct Storage {
-        privacy_contract: ContractAddress,
-        cctp_messenger: ContractAddress,
+        receiver_class_hash: ClassHash,
         token: ContractAddress,
-        valid_domains: Map<felt252, felt252>,
+        treasury: ContractAddress,
+        token_messenger: ContractAddress,
+        valid_domains: Map<felt252, bool>,
         destination_domains: Map<felt252, u32>,
-        treasury_pubkey: felt252,
-        salt: felt252,
-        shield_in_class_hash: ClassHash,
-        bridge_out_class_hash: ClassHash,
-        merchant_nonces: Map<felt252, felt252>,
-        merchant_pairs: Map<felt252, Vec<MerchantPair>>,
+        merchant_nonces: Map<ContractAddress, felt252>,
+        merchant_receivers: Map<ContractAddress, Vec<ContractAddress>>,
+    }
+
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    pub enum Event {
+        MerchantRegistered: MerchantRegistered,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct MerchantRegistered {
+        pub merchant: ContractAddress,
+        pub receiver: ContractAddress,
     }
 
     pub mod Errors {
-        pub const MAX_PAIRS_EXCEEDED: felt252 = 'MAX_RECEIVERS_EXCEEDED';
+        pub const MAX_RECEIVERS_EXCEEDED: felt252 = 'MAX_RECEIVERS_EXCEEDED';
         pub const DEPLOY_FAILED: felt252 = 'DEPLOY_FAILED';
         pub const INVALID_DOMAIN: felt252 = 'INVALID_DOMAIN';
         pub const INDEX_OUT_OF_BOUNDS: felt252 = 'INDEX_OUT_OF_BOUNDS';
+        pub const ZERO_ADDRESS: felt252 = 'ZERO_ADDRESS';
+        pub const INVALID_RECIPIENT: felt252 = 'INVALID_RECIPIENT';
     }
 
     #[constructor]
     fn constructor(
         ref self: ContractState,
-        privacy_contract: ContractAddress,
-        cctp_messenger: ContractAddress,
+        receiver_class_hash: ClassHash,
         token: ContractAddress,
+        treasury: ContractAddress,
+        token_messenger: ContractAddress,
         base_destination_domain: u32,
         solana_destination_domain: u32,
         eth_destination_domain: u32,
-        treasury_pubkey: felt252,
-        salt: felt252,
-        shield_in_class_hash: ClassHash,
-        bridge_out_class_hash: ClassHash,
     ) {
-        self.privacy_contract.write(privacy_contract);
-        self.cctp_messenger.write(cctp_messenger);
-        self.token.write(token);
+        assert(
+            token.is_non_zero() && treasury.is_non_zero() && token_messenger.is_non_zero(),
+            Errors::ZERO_ADDRESS,
+        );
 
-        self.valid_domains.write('BASE', true.into());
-        self.valid_domains.write('SOLANA', true.into());
-        self.valid_domains.write('ETHEREUM', true.into());
+        self.receiver_class_hash.write(receiver_class_hash);
+        self.token.write(token);
+        self.treasury.write(treasury);
+        self.token_messenger.write(token_messenger);
+
+        self.valid_domains.write('BASE', true);
+        self.valid_domains.write('SOLANA', true);
+        self.valid_domains.write('ETHEREUM', true);
 
         self.destination_domains.write('BASE', base_destination_domain);
         self.destination_domains.write('SOLANA', solana_destination_domain);
         self.destination_domains.write('ETHEREUM', eth_destination_domain);
-        self.treasury_pubkey.write(treasury_pubkey);
-        self.salt.write(salt);
-        self.shield_in_class_hash.write(shield_in_class_hash);
-        self.bridge_out_class_hash.write(bridge_out_class_hash);
     }
 
     #[abi(embed_v0)]
     pub impl MerchantFactoryImpl of IMerchantFactory<ContractState> {
         fn register_merchant(
             ref self: ContractState,
-            merchant_pubkey: felt252,
+            merchant: ContractAddress,
             cctp_mint_chain: felt252,
             cctp_mint_recipient: u256,
-        ) -> MerchantPair {
-            // Get mutable reference to the merchant's vector pointer
-            let mut pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
-            assert(pairs_vec.len() < MAX_PAIRS_PER_MERCHANT, Errors::MAX_PAIRS_EXCEEDED);
-
-            let merchant_nonce = self.merchant_nonces.read(merchant_pubkey);
-            let salt = poseidon_hash_span(
-                array![merchant_pubkey, merchant_nonce, self.salt.read()].span(),
-            );
-            self.merchant_nonces.write(merchant_pubkey, merchant_nonce + 1);
-
-            let privacy_contract = self.privacy_contract.read();
-            let token = self.token.read();
-            let treasury_pubkey = self.treasury_pubkey.read();
-            let cctp_messenger = self.cctp_messenger.read();
-
-            assert(self.valid_domains.read(cctp_mint_chain) != 0, Errors::INVALID_DOMAIN);
-            let destination_domain = self.destination_domains.read(cctp_mint_chain);
-
-            let shield_in_calldata = array![
-                privacy_contract.into(), token.into(), merchant_pubkey, treasury_pubkey,
-            ];
-            let (shield_in_addr, _) = deploy_syscall(
-                self.shield_in_class_hash.read(), salt, shield_in_calldata.span(), false,
-            )
-                .expect(Errors::DEPLOY_FAILED);
-
-            let bridge_out_calldata = array![
-                cctp_messenger.into(), privacy_contract.into(), token.into(),
-                destination_domain.into(), cctp_mint_recipient.low.into(),
-                cctp_mint_recipient.high.into(),
-            ];
-            let (bridge_out_addr, _) = deploy_syscall(
-                self.bridge_out_class_hash.read(), salt, bridge_out_calldata.span(), false,
-            )
-                .expect(Errors::DEPLOY_FAILED);
-
-            let pair = MerchantPair { shield_in: shield_in_addr, bridge_out: bridge_out_addr };
-
-            // Push directly to storage vector entry
-            pairs_vec.push(pair);
-            pair
-        }
-
-        fn predict_shield_in_address(
-            self: @ContractState, merchant_pubkey: felt252,
         ) -> ContractAddress {
-            let merchant_nonce = self.merchant_nonces.read(merchant_pubkey);
-            let salt = poseidon_hash_span(
-                array![merchant_pubkey, merchant_nonce, self.salt.read()].span(),
+            assert(merchant.is_non_zero(), Errors::ZERO_ADDRESS);
+
+            let mut receivers_vec = self.merchant_receivers.entry(merchant);
+            assert(
+                receivers_vec.len() < MAX_RECEIVERS_PER_MERCHANT, Errors::MAX_RECEIVERS_EXCEEDED,
             );
 
-            let shield_in_calldata = array![
-                self.privacy_contract.read().into(), self.token.read().into(), merchant_pubkey,
-                self.treasury_pubkey.read(),
-            ];
-            let calldata_hash = poseidon_hash_span(shield_in_calldata.span());
+            let mut destination_domain: u32 = 0;
 
-            let deployer_address: felt252 = get_contract_address().into();
-            let class_hash_felt: felt252 = self.shield_in_class_hash.read().into();
+            if cctp_mint_chain != 0 {
+                assert(self.valid_domains.read(cctp_mint_chain), Errors::INVALID_DOMAIN);
+                assert(cctp_mint_recipient != 0, Errors::INVALID_RECIPIENT);
+                destination_domain = self.destination_domains.read(cctp_mint_chain);
+            } else {
+                assert(cctp_mint_recipient == 0, Errors::INVALID_RECIPIENT);
+            }
 
-            let raw_address = poseidon_hash_span(
-                array![
-                    'STARKNET_CONTRACT_ADDRESS', deployer_address, salt, class_hash_felt,
-                    calldata_hash,
-                ]
-                    .span(),
-            );
+            let nonce = self.merchant_nonces.read(merchant);
+            let merchant_felt: felt252 = merchant.into();
+            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
+            self.merchant_nonces.write(merchant, nonce + 1);
 
-            raw_address.try_into().unwrap()
+            let empty_calldata = array![];
+            let (receiver_address, _) = deploy_syscall(
+                self.receiver_class_hash.read(), salt, empty_calldata.span(), false,
+            )
+                .expect(Errors::DEPLOY_FAILED);
+
+            IStarknetReceiverDispatcher { contract_address: receiver_address }
+                .initialize(
+                    self.token.read(),
+                    self.treasury.read(),
+                    self.token_messenger.read(),
+                    destination_domain,
+                    cctp_mint_recipient,
+                    merchant,
+                );
+
+            receivers_vec.push(receiver_address);
+
+            self
+                .emit(
+                    Event::MerchantRegistered(
+                        MerchantRegistered { merchant, receiver: receiver_address },
+                    ),
+                );
+            receiver_address
         }
 
-        fn get_merchant_pairs(
-            self: @ContractState, merchant_pubkey: felt252,
-        ) -> Array<MerchantPair> {
-            let pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
+        fn predict_receiver_address(
+            self: @ContractState, merchant: ContractAddress,
+        ) -> ContractAddress {
+            let nonce = self.merchant_nonces.read(merchant);
+            let merchant_felt: felt252 = merchant.into();
+            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
+
+            let empty_calldata: Array<felt252> = array![];
+
+            // Uses the official Starknet address calculation matching deploy_syscall
+            calculate_contract_address_from_deploy_syscall(
+                salt,
+                self.receiver_class_hash.read(),
+                empty_calldata.span(),
+                get_contract_address(),
+            )
+        }
+
+        fn get_merchant_receivers(
+            self: @ContractState, merchant: ContractAddress,
+        ) -> Array<ContractAddress> {
+            let receivers_vec = self.merchant_receivers.entry(merchant);
             let mut result = array![];
-            let len = pairs_vec.len();
+            let len = receivers_vec.len();
             let mut i: u64 = 0;
             while i < len {
-                result.append(pairs_vec.at(i).read());
+                result.append(receivers_vec.at(i).read());
                 i += 1;
             }
             result
         }
 
-        fn get_merchant_pair_at(
-            self: @ContractState, merchant_pubkey: felt252, index: u64,
-        ) -> MerchantPair {
-            let pairs_vec = self.merchant_pairs.entry(merchant_pubkey);
-            assert(index < pairs_vec.len(), Errors::INDEX_OUT_OF_BOUNDS);
-            pairs_vec.at(index).read()
+        fn get_merchant_receiver_at(
+            self: @ContractState, merchant: ContractAddress, index: u64,
+        ) -> ContractAddress {
+            let receivers_vec = self.merchant_receivers.entry(merchant);
+            assert(index < receivers_vec.len(), Errors::INDEX_OUT_OF_BOUNDS);
+            receivers_vec.at(index).read()
+        }
+
+        fn get_receiver_count(self: @ContractState, merchant: ContractAddress) -> u64 {
+            let receivers_vec = self.merchant_receivers.entry(merchant);
+            receivers_vec.len()
         }
     }
 }

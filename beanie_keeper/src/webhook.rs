@@ -1,30 +1,52 @@
 use std::{cmp::min, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use ethers::signers::Signer;
+use ethers::signers::Signer as EvmSignerTrait;
 use serde::Serialize;
+use starknet::{core::types::Felt, signers::Signer as StarknetSignerTrait};
+use starknet_crypto::poseidon_hash_many;
 use tokio::time::sleep;
 
 use crate::config::{Config, Deposit, now_unix};
 
-/// Standard EIP-191 personal_sign — recoverable, so merchants don't need a separately
-/// published pubkey. They recover the address from (signature, message) with any
-/// standard EVM library and compare it to the keeper address they subscribed to.
-async fn sign_eip191(cfg: &Config, data: &[u8]) -> Result<String> {
-    let signature = cfg
-        .keeper_wallet
-        .sign_message(data)
-        .await
-        .context("failed signing webhook payload")?;
-    Ok(format!("0x{}", hex::encode(signature.to_vec())))
+// ── Signing Logic ─────────────────────────────────────────────────────────────
+
+async fn sign_payload(cfg: &Config, data: &[u8]) -> Result<String> {
+    match cfg {
+        Config::Evm(evm_cfg) => {
+            let signature = evm_cfg
+                .keeper_wallet
+                .sign_message(data)
+                .await
+                .context("failed signing EIP-191 payload")?;
+            Ok(format!("0x{}", hex::encode(signature.to_vec())))
+        }
+        Config::Starknet(starknet_cfg) => {
+            let mut felts = Vec::new();
+            for chunk in data.chunks(31) {
+                felts.push(Felt::from_bytes_be_slice(chunk));
+            }
+
+            let message_hash = poseidon_hash_many(&felts);
+            let signature = starknet_cfg
+                .keeper_wallet
+                .sign_hash(&message_hash)
+                .await
+                .context("failed signing Starknet payload")?;
+
+            Ok(format!("{:#x}:{:#x}", signature.r, signature.s))
+        }
+    }
 }
+
+// ── Serialization Payload ─────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct DepositPayload<'a> {
     pub chain: &'a str,
     pub tx_hash: &'a str,
     pub from: &'a str,
-    pub receiver: &'a str, // merchant's ChainXReceiver clone address
+    pub receiver: &'a str,
     pub amount_raw: &'a str,
     pub token: &'a str,
     pub block_number: u64,
@@ -37,7 +59,7 @@ struct NotificationBody<'a> {
     pub sweep_tx: Option<&'a str>,
 }
 
-// ── Webhook Delivery ──────────────────────────────────────────────────────────
+// ── Delivery Pipeline ─────────────────────────────────────────────────────────
 
 async fn send_webhook_once(
     http: &reqwest::Client,
@@ -47,15 +69,16 @@ async fn send_webhook_once(
     sweep_tx: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let timestamp = now_unix();
+    let token_str = cfg.token_address_str();
 
     let body_struct = NotificationBody {
         deposit: DepositPayload {
-            chain: &cfg.chain_name,
+            chain: cfg.chain_name(),
             tx_hash: &deposit.tx_hash,
             from: &deposit.from_address,
             receiver: &deposit.receiver,
             amount_raw: &deposit.amount_raw,
-            token: &format!("{:?}", cfg.token_address),
+            token: &token_str,
             block_number: deposit.block_number,
             timestamp,
         },
@@ -63,18 +86,14 @@ async fn send_webhook_once(
     };
 
     let body = serde_json::to_string(&body_struct).context("webhook body serialization failed")?;
-
-    let signature = sign_eip191(cfg, format!("{timestamp}.{body}").as_bytes()).await?;
+    let signature = sign_payload(cfg, format!("{timestamp}.{body}").as_bytes()).await?;
 
     let resp = http
         .post(webhook_url)
         .header("Content-Type", "application/json")
-        .header("X-Signature-Scheme", "eip191")
+        .header("X-Signature-Scheme", cfg.signature_scheme())
         .header("X-Signature", signature)
-        .header(
-            "X-Signer-Address",
-            format!("{:?}", cfg.keeper_wallet.address()),
-        )
+        .header("X-Signer-Address", cfg.keeper_address_str())
         .header("X-Timestamp", timestamp.to_string())
         .header("Idempotency-Key", &deposit.tx_hash)
         .timeout(Duration::from_secs(3))

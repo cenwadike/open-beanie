@@ -1,41 +1,24 @@
-// Privacy-pool test flow:
+// StarknetReceiver & MerchantFactory test suite
 //
-// - Shield-in test: mint funds into a merchant anonymizer and call it as the privacy pool.
-//   Verify fee split into a merchant note + treasury note, full-balance approval, and
-//   stealth note derivation from merchant/treasury pubkeys + a shared ephemeral key.
-// - Access-control test: call the same function from a non-pool address.
-//   Verify the contract rejects unauthorized execution.
-// - Bridge-out test: mint funds into the bridge anonymizer and call it as the privacy pool.
-//   Verify balance-based burn, fixed destination config, and correct CCTP payload.
-// - Factory test: register a merchant by pubkey up to cap limit.
-//   Verify pairs are appended to storage array and registered pairs can be retrieved.
-//
-//
-// Core invariant: fixed config is pinned at deploy time.
-// Runtime trigger belongs to the privacy pool.
-// The ephemeral pubkey is the only runtime input needed for note derivation, and it's
-// reused across both the merchant and treasury note hashes — domain separation comes
-// from the two distinct static keys, not from the ephemeral.
-//
-// Mock token and mock messenger are simple fixtures to check real balance, approval, and burn
-// behavior.
-//
+// Invariants tested:
+// - Initialization safety & single-invocation restriction.
+// - Permissionless sweep execution (caller gets 10% of fee, treasury gets 90%).
+// - Same-chain settlement direct to merchant when mint_recipient == 0.
+// - Cross-chain CCTP deposit_for_burn with 15 bps max fee when mint_recipient != 0.
+// - Idempotent zero-balance sweeps.
+// - Factory receiver deployment, state tracking, prediction, and cap enforcement.
 
 use core::array::ArrayTrait;
-use core::num::traits::Zero;
 use core::traits::TryInto;
 use snforge_std::{
     ContractClass, ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address,
     stop_cheat_caller_address,
 };
 use starknet::{ContractAddress, SyscallResultTrait};
-use starknet_beanie::bridge_out::{
-    IBridgeOutAnonymizerDispatcher, IBridgeOutAnonymizerDispatcherTrait,
-};
 use starknet_beanie::merchant_factory::{
     IMerchantFactoryDispatcher, IMerchantFactoryDispatcherTrait,
 };
-use starknet_beanie::shield_in::{IShieldInAnonymizerDispatcher, IShieldInAnonymizerDispatcherTrait};
+use starknet_beanie::receiver::{IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
 
 #[starknet::interface]
 pub trait IToken<T> {
@@ -174,7 +157,6 @@ pub mod MockCctpMessenger {
 }
 
 fn deploy_mock_token() -> ContractAddress {
-    // Access .contract_class after unwrapping declare()
     let token_class = declare("MockToken").unwrap_syscall().contract_class();
     let (token_address, _) = token_class.deploy(@array![]).unwrap_syscall();
     token_address
@@ -186,233 +168,170 @@ fn deploy_mock_messenger() -> ContractAddress {
     messenger_address
 }
 
-fn deploy_shield_in(
-    privacy_contract: ContractAddress,
-    token: ContractAddress,
-    merchant_pubkey: felt252,
-    treasury_pubkey: felt252,
-) -> ContractAddress {
-    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
-
-    let calldata = array![privacy_contract.into(), token.into(), merchant_pubkey, treasury_pubkey];
-    let (shield_addr, _) = shield_class.deploy(@calldata).unwrap_syscall();
-    shield_addr
-}
-
-fn deploy_bridge_out(
-    cctp_messenger: ContractAddress,
-    privacy_contract: ContractAddress,
-    token: ContractAddress,
-    destination_domain: u32,
-    mint_recipient: u256,
-) -> ContractAddress {
-    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
-    let calldata = array![
-        cctp_messenger.into(), privacy_contract.into(), token.into(), destination_domain.into(),
-        mint_recipient.low.into(), mint_recipient.high.into(),
-    ];
-    let (bridge_addr, _) = bridge_class.deploy(@calldata).unwrap_syscall();
-    bridge_addr
+fn deploy_receiver() -> ContractAddress {
+    let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
+    let (receiver_address, _) = receiver_class.deploy(@array![]).unwrap_syscall();
+    receiver_address
 }
 
 fn deploy_factory(
-    privacy_contract: ContractAddress,
-    cctp_messenger: ContractAddress,
     token: ContractAddress,
+    treasury: ContractAddress,
+    token_messenger: ContractAddress,
     base_destination_domain: u32,
     solana_destination_domain: u32,
     eth_destination_domain: u32,
-    treasury_pubkey: felt252,
-    salt: felt252,
-    shield_in_class: ContractClass,
-    bridge_out_class: ContractClass,
+    receiver_class: ContractClass,
 ) -> ContractAddress {
     let factory_class = declare("MerchantFactory").unwrap_syscall().contract_class();
     let calldata = array![
-        privacy_contract.into(), cctp_messenger.into(), token.into(),
+        receiver_class.class_hash.into(), token.into(), treasury.into(), token_messenger.into(),
         base_destination_domain.into(), solana_destination_domain.into(),
-        eth_destination_domain.into(), treasury_pubkey, salt, shield_in_class.class_hash.into(),
-        bridge_out_class.class_hash.into(),
+        eth_destination_domain.into(),
     ];
     let (factory_addr, _) = factory_class.deploy(@calldata).unwrap_syscall();
     factory_addr
 }
 
 #[test]
-fn shield_in_happy_path_updates_balances_and_returns_note() {
+fn sweep_same_chain_settlement_transfers_net_to_merchant() {
     let token = deploy_mock_token();
-    let privacy_pool: ContractAddress = 0x300.try_into().unwrap();
-    let merchant_pubkey: felt252 = 0x777;
-    let treasury_pubkey: felt252 = 0x778;
-    let anonymous_contract = deploy_shield_in(
-        privacy_pool, token, merchant_pubkey, treasury_pubkey,
-    );
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+    let caller: ContractAddress = 0x999.try_into().unwrap();
 
-    let amount: u256 = 1_000_u256;
+    let receiver_addr = deploy_receiver();
+    let receiver = IStarknetReceiverDispatcher { contract_address: receiver_addr };
+    receiver.initialize(token, treasury, messenger, 0, 0, merchant);
+
+    let gross_amount: u256 = 10_000_u256;
     let token_dispatcher = ITokenDispatcher { contract_address: token };
-    token_dispatcher.mint(anonymous_contract, amount);
+    token_dispatcher.mint(receiver_addr, gross_amount);
 
-    let dispatcher = IShieldInAnonymizerDispatcher { contract_address: anonymous_contract };
+    start_cheat_caller_address(receiver_addr, caller);
+    let (net, fee_to_caller, fee_to_treasury, fee) = receiver.sweep();
+    stop_cheat_caller_address(receiver_addr);
 
-    start_cheat_caller_address(anonymous_contract, privacy_pool);
-    let result = dispatcher.privacy_invoke(0xabc);
-    stop_cheat_caller_address(anonymous_contract);
+    // Gross = 10,000 | Fee (0.5%) = 50 | Net = 9,950
+    // Fee split: Caller (10% of fee) = 5 | Treasury (90% of fee) = 45
+    assert(fee == 50, 'FEE_CALC');
+    assert(net == 9950, 'NET_CALC');
+    assert(fee_to_caller == 5, 'CALLER_FEE_CALC');
+    assert(fee_to_treasury == 45, 'TREASURY_FEE_CALC');
 
-    // Two notes now: the merchant's net amount, and the treasury's fee — both shielded,
-    // neither transferred as a plain ERC20 transfer.
-    assert!(result.len() == 2, "RESULT_LEN");
-    let merchant_note = *result.at(0);
-    let treasury_note = *result.at(1);
-    assert!(merchant_note.token == token, "MERCHANT_NOTE_TOKEN");
-    assert!(treasury_note.token == token, "TREASURY_NOTE_TOKEN");
-
-    // Fee = 1000 * 50 / 10000 = 5; Net = 995
-    assert!(merchant_note.amount == 995_u128, "MERCHANT_NOTE_AMOUNT");
-    assert!(treasury_note.amount == 5_u128, "TREASURY_NOTE_AMOUNT");
-
-    // Same ephemeral key, different static keys -> distinct note IDs
-    assert!(merchant_note.note_id != treasury_note.note_id, "NOTE_ID_COLLISION");
-
-    // Full gross balance approved to the pool in one call, since both notes are pulled
-    // from this contract's balance rather than one being transferred out beforehand.
-    assert!(
-        token_dispatcher.allowance(anonymous_contract, privacy_pool) == 1_000_u256, "ALLOWANCE",
-    );
-
-    assert!(dispatcher.get_privacy_contract() == privacy_pool, "STORAGE_PRIVACY");
-    assert!(dispatcher.get_token() == token, "STORAGE_TOKEN");
-    assert!(dispatcher.get_merchant_pubkey() == merchant_pubkey, "STORAGE_PUBKEY");
-    assert!(dispatcher.get_treasury_pubkey() == treasury_pubkey, "STORAGE_TREASURY");
+    assert(token_dispatcher.balance_of(merchant) == 9950, 'MERCHANT_BALANCE');
+    assert(token_dispatcher.balance_of(treasury) == 45, 'TREASURY_BALANCE');
+    assert(token_dispatcher.balance_of(caller) == 5, 'CALLER_BALANCE');
+    assert(token_dispatcher.balance_of(receiver_addr) == 0, 'RECEIVER_ZERO');
 }
 
 #[test]
-#[should_panic(expected: ('CALLER_NOT_PRIVACY_POOL',))]
-fn shield_in_rejects_non_pool_caller() {
+fn sweep_cross_chain_settlement_burns_via_cctp() {
     let token = deploy_mock_token();
-    let privacy_pool: ContractAddress = 0x300.try_into().unwrap();
-    let bad_caller: ContractAddress = 0x999.try_into().unwrap();
-    let anonymous_contract = deploy_shield_in(privacy_pool, token, 0x777, 0x778);
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+    let caller: ContractAddress = 0x999.try_into().unwrap();
+    let mint_recipient: u256 = 0xdef_u256;
+    let destination_domain: u32 = 6; // Base domain
 
-    start_cheat_caller_address(anonymous_contract, bad_caller);
-    IShieldInAnonymizerDispatcher { contract_address: anonymous_contract }.privacy_invoke(0xabc);
-    stop_cheat_caller_address(anonymous_contract);
-}
+    let receiver_addr = deploy_receiver();
+    let receiver = IStarknetReceiverDispatcher { contract_address: receiver_addr };
+    receiver.initialize(token, treasury, messenger, destination_domain, mint_recipient, merchant);
 
-#[test]
-fn bridge_out_happy_path_uses_contract_balance_and_calls_cctp() {
-    let token = deploy_mock_token();
-    let privacy_pool: ContractAddress = 0x10.try_into().unwrap();
-    let messenger: ContractAddress = deploy_mock_messenger();
-    let bridge = deploy_bridge_out(messenger, privacy_pool, token, 2_u32, 0x123_u256);
+    let gross_amount: u256 = 10_000_u256;
     let token_dispatcher = ITokenDispatcher { contract_address: token };
-    let amount: u256 = 10_000_u256;
-    token_dispatcher.mint(bridge, amount);
+    token_dispatcher.mint(receiver_addr, gross_amount);
 
-    start_cheat_caller_address(bridge, privacy_pool);
-    IBridgeOutAnonymizerDispatcher { contract_address: bridge }.privacy_invoke();
-    stop_cheat_caller_address(bridge);
+    start_cheat_caller_address(receiver_addr, caller);
+    let (net, fee_to_caller, fee_to_treasury, _) = receiver.sweep();
+    stop_cheat_caller_address(receiver_addr);
 
     let messenger_dispatcher = IMockMessengerDispatcher { contract_address: messenger };
-    assert(messenger_dispatcher.get_last_amount() == amount, 'LAST_AMOUNT');
-    assert(messenger_dispatcher.get_last_destination_domain() == 2_u32, 'LAST_DOMAIN');
-    assert(messenger_dispatcher.get_last_mint_recipient() == 0x123_u256, 'LAST_RECIPIENT');
-    assert(messenger_dispatcher.get_last_burn_token() == token, 'LAST_TOKEN');
-    assert(messenger_dispatcher.get_last_max_fee() == 15_u256, 'LAST_FEE');
+    assert(messenger_dispatcher.get_last_amount() == net, 'CCTP_AMOUNT');
+    assert(messenger_dispatcher.get_last_destination_domain() == destination_domain, 'CCTP_DOMAIN');
+    assert(messenger_dispatcher.get_last_mint_recipient() == mint_recipient, 'CCTP_RECIPIENT');
+    assert(messenger_dispatcher.get_last_burn_token() == token, 'CCTP_TOKEN');
 
-    assert(
-        IBridgeOutAnonymizerDispatcher { contract_address: bridge }.get_token() == token,
-        'BRIDGE_TOKEN',
-    );
-    assert(
-        IBridgeOutAnonymizerDispatcher { contract_address: bridge }
-            .get_destination_domain() == 2_u32,
-        'BRIDGE_DOMAIN',
-    );
-    assert(
-        IBridgeOutAnonymizerDispatcher { contract_address: bridge }
-            .get_mint_recipient() == 0x123_u256,
-        'BRIDGE_RECIP',
-    );
+    // CCTP max_fee (15 bps of gross) = 10_000 * 15 / 10_000 = 15
+    assert(messenger_dispatcher.get_last_max_fee() == 15, 'CCTP_MAX_FEE');
+
+    assert(token_dispatcher.balance_of(treasury) == fee_to_treasury, 'TREASURY_FEE_BAL');
+    assert(token_dispatcher.balance_of(caller) == fee_to_caller, 'CALLER_FEE_BAL');
 }
 
 #[test]
-#[should_panic(expected: ('CALLER_NOT_PRIVACY',))]
-fn bridge_out_rejects_non_pool_caller() {
+fn sweep_is_idempotent_on_zero_balance() {
     let token = deploy_mock_token();
-    let messenger: ContractAddress = deploy_mock_messenger();
-    let privacy_pool: ContractAddress = 0x10.try_into().unwrap();
-    let bad_caller: ContractAddress = 0x99.try_into().unwrap();
-    let bridge = deploy_bridge_out(messenger, privacy_pool, token, 2_u32, 0x123_u256);
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
 
-    start_cheat_caller_address(bridge, bad_caller);
-    IBridgeOutAnonymizerDispatcher { contract_address: bridge }.privacy_invoke();
-    stop_cheat_caller_address(bridge);
+    let receiver_addr = deploy_receiver();
+    let receiver = IStarknetReceiverDispatcher { contract_address: receiver_addr };
+    receiver.initialize(token, treasury, messenger, 0, 0, merchant);
+
+    let (net, fee_to_caller, fee_to_treasury, fee) = receiver.sweep();
+    assert(net == 0 && fee_to_caller == 0 && fee_to_treasury == 0 && fee == 0, 'ZERO_SWEEP');
 }
 
 #[test]
-fn merchant_factory_registers_pair_and_persists_storage() {
-    let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
-    let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
-    let token: ContractAddress = 0x4.try_into().unwrap();
-    let merchant_pubkey: felt252 = 0xabc;
-    let treasury_pubkey: felt252 = 0x999;
-    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
-    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
+#[should_panic(expected: ('ALREADY_INITIALIZED',))]
+fn receiver_prevents_double_initialization() {
+    let token = deploy_mock_token();
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+
+    let receiver_addr = deploy_receiver();
+    let receiver = IStarknetReceiverDispatcher { contract_address: receiver_addr };
+    receiver.initialize(token, treasury, messenger, 0, 0, merchant);
+    receiver.initialize(token, treasury, messenger, 0, 0, merchant);
+}
+
+#[test]
+fn merchant_factory_registers_and_predicts_receiver() {
+    let token = deploy_mock_token();
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+    let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
+
     let factory_addr = deploy_factory(
-        privacy_pool,
-        cctp_messenger,
-        token,
-        3_u32,
-        5_u32,
-        0_u32,
-        treasury_pubkey,
-        0xfeed,
-        shield_class.clone(),
-        bridge_class.clone(),
+        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
     );
 
-    let factory_dispatcher = IMerchantFactoryDispatcher { contract_address: factory_addr };
-    let pair = factory_dispatcher.register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
+    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
 
-    assert(pair.shield_in.is_non_zero(), 'SHIELD_DEPLOYED');
-    assert(pair.bridge_out.is_non_zero(), 'BRIDGE_DEPLOYED');
+    let predicted_addr = factory.predict_receiver_address(merchant);
+    let registered_addr = factory.register_merchant(merchant, 'BASE', 0x777_u256);
 
-    let stored_pairs = factory_dispatcher.get_merchant_pairs(merchant_pubkey);
-    assert(stored_pairs.len() == 1, 'PAIR_COUNT_ONE');
+    assert(predicted_addr == registered_addr, 'PREDICTION_MATCH');
 
-    let stored_pair = *stored_pairs.at(0);
-    assert(stored_pair.shield_in == pair.shield_in, 'PAIR_SHIELD');
-    assert(stored_pair.bridge_out == pair.bridge_out, 'PAIR_BRIDGE');
+    let receivers = factory.get_merchant_receivers(merchant);
+    assert(receivers.len() == 1, 'RECEIVER_COUNT_ONE');
+    assert(*receivers.at(0) == registered_addr, 'STORED_MATCH');
 }
 
 #[test]
 #[should_panic(expected: ('MAX_RECEIVERS_EXCEEDED',))]
-fn merchant_factory_rejects_exceeding_max_pairs() {
-    let privacy_pool: ContractAddress = 0x2.try_into().unwrap();
-    let cctp_messenger: ContractAddress = 0x3.try_into().unwrap();
-    let token: ContractAddress = 0x4.try_into().unwrap();
-    let merchant_pubkey: felt252 = 0xabc;
-    let treasury_pubkey: felt252 = 0x999;
-    let shield_class = declare("ShieldInAnonymizer").unwrap_syscall().contract_class();
-    let bridge_class = declare("BridgeOutAnonymizer").unwrap_syscall().contract_class();
+fn merchant_factory_rejects_exceeding_max_receivers() {
+    let token = deploy_mock_token();
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+    let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
+
     let factory_addr = deploy_factory(
-        privacy_pool,
-        cctp_messenger,
-        token,
-        3_u32,
-        5_u32,
-        0_u32,
-        treasury_pubkey,
-        0xfeed,
-        shield_class.clone(),
-        bridge_class.clone(),
+        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
     );
 
-    let factory_dispatcher = IMerchantFactoryDispatcher { contract_address: factory_addr };
+    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
 
     let mut i: u32 = 0;
     while i < 33 {
-        factory_dispatcher.register_merchant(merchant_pubkey, 'BASE', 0x77_u256);
+        factory.register_merchant(merchant, 'BASE', 0x777_u256);
         i += 1;
     };
 }

@@ -104,7 +104,6 @@ pub async fn init_lane(
     let mut lane_results = Vec::new();
 
     for chain in &source_chains {
-        let is_privacy = *chain == Chain::Starknet || payload.enable_privacy;
         let predicted_address = match chain {
             Chain::Base | Chain::Ethereum => {
                 let parsed_merchant = match Address::from_str(merchant_address) {
@@ -158,7 +157,7 @@ pub async fn init_lane(
 
                 let call = FunctionCall {
                     contract_address: state.config.starknet_factory_address,
-                    entry_point_selector: get_selector_from_name("predict_shield_in_address")
+                    entry_point_selector: get_selector_from_name("predict_receiver_address")
                         .expect("Valid selector"),
                     calldata: vec![merchant_pubkey],
                 };
@@ -204,7 +203,6 @@ pub async fn init_lane(
         lane_results.push(LaneDeployment {
             chain: *chain,
             address: predicted_address,
-            is_privacy_lane: is_privacy,
         });
     }
 

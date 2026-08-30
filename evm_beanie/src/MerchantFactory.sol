@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3
 pragma solidity ^0.8.24;
 
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -81,13 +81,16 @@ contract MerchantFactory {
         ) {
             revert MaximumReceiversExceeded();
         }
-        if (cctpMintChain != 0) {
+        if (cctpMintChain != bytes32(0)) {
             require(validDomains[cctpMintChain], InvalidDomain());
-        }
-        if (cctpMintRecipient != 0) {
             require(
-                bytes32(uint256(uint160(merchant))) == cctpMintRecipient,
-                "cctp mint recipient must match merchant address"
+                cctpMintRecipient != bytes32(0),
+                "Cross-chain requires destination recipient"
+            );
+        } else {
+            require(
+                cctpMintRecipient == bytes32(0),
+                "Same-chain recipient must be zero"
             );
         }
         uint256 nonce = merchantNonces[merchant];

@@ -34,9 +34,13 @@ abigen!(
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)
         function getReceiverCount(address merchant) external view returns (uint256)
     ]"#;
+    // Chain-agnostic — the ONE webhook registry across all of Beanie, not just EVM.
+    // No factory-existence gate anymore: an EVM contract can't read Starknet state,
+    // so any such gate could only ever cover EVM registrations. See
+    // MerchantWebhookRegistry.sol for the full reasoning.
     MerchantWebhookRegistry,
     r#"[
-        function setWebhookUrl(string calldata url) external
+        function setWebhookUrl(address merchant, string calldata url) external
     ]"#;
 );
 
@@ -46,8 +50,8 @@ pub enum DeployError {
     Transient(String),
 }
 
-// Mirrors MAX_RECEIVERS_PER_MERCHANT (Solidity) / MAX_PAIRS_PER_MERCHANT
-// (Cairo) — keep in sync if either contract's cap changes.
+// Mirrors MAX_RECEIVERS_PER_MERCHANT — now literally the same constant name
+// in both the Solidity and Cairo factories, keep in sync if either changes.
 const MAX_RECEIVERS_PER_MERCHANT: u64 = 32;
 
 fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
@@ -74,6 +78,31 @@ fn evm_address_to_bytes32(addr: Address) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[12..].copy_from_slice(addr.as_bytes());
     out
+}
+
+/// Registers a webhook URL for `merchant` in the single, chain-agnostic
+/// MerchantWebhookRegistry. Called from every chain's registration arm —
+/// Starknet included — always through `evm_client`, since the registry
+/// itself only ever lives on one EVM chain. A Starknet-only merchant still
+/// needs an EVM-address-shaped identity for this call, same system-wide
+/// assumption the rest of Beanie already makes about merchant_address
+/// being reused verbatim across chains.
+async fn register_webhook(
+    evm_client: Arc<EvmSignerProvider>,
+    webhook_registry_addr: Address,
+    merchant_addr: Address,
+    url: &str,
+) -> Result<(), DeployError> {
+    let registry = MerchantWebhookRegistry::new(webhook_registry_addr, evm_client);
+    let tx = registry.set_webhook_url(merchant_addr, url.to_string());
+    let pending_tx = tx
+        .send()
+        .await
+        .map_err(|e| DeployError::Transient(format!("Webhook registration send failed: {e}")))?;
+    pending_tx.await.map_err(|e| {
+        DeployError::Transient(format!("Webhook registration confirmation failed: {e}"))
+    })?;
+    Ok(())
 }
 
 pub async fn execute_onchain_deployment(
@@ -117,16 +146,12 @@ pub async fn execute_onchain_deployment(
             // CCTP-burn back onto the chain it's already on.
             //
             // Cross-chain: recipient is the merchant's own address, encoded
-            // as a proper CCTP bytes32 (12 zero bytes + 20 address bytes),
-            // since the merchant is both the identity key AND the payout
-            // recipient on the target chain.
+            // as a proper CCTP bytes32 (12 zero bytes + 20 address bytes).
             let is_same_chain = task.chain == task.target_chain;
-            let recipient_bytes;
-
-            if is_same_chain {
-                recipient_bytes = [0u8; 32]
+            let recipient_bytes = if is_same_chain {
+                [0u8; 32]
             } else {
-                recipient_bytes = evm_address_to_bytes32(merchant_addr)
+                evm_address_to_bytes32(merchant_addr)
             };
 
             let tx = factory.register_merchant(
@@ -146,92 +171,73 @@ pub async fn execute_onchain_deployment(
 
             if let (Some(url), Some(registry_addr)) = (&task.webhook_url, webhook_registry_addr) {
                 if !url.is_empty() {
-                    let registry = MerchantWebhookRegistry::new(registry_addr, evm_client.clone());
-                    let tx = registry.set_webhook_url(url.clone());
-                    let pending_tx = tx.send().await.map_err(|e| {
-                        DeployError::Transient(format!("Webhook registration send failed: {e}"))
-                    })?;
-                    pending_tx.await.map_err(|e| {
-                        DeployError::Transient(format!(
-                            "Webhook registration confirmation failed: {e}"
-                        ))
-                    })?;
+                    register_webhook(evm_client.clone(), registry_addr, merchant_addr, url).await?;
                 }
             }
 
             Ok(())
         }
         Chain::Starknet => {
-            // Starknet is the privacy leg only — it can never be its own
-            // target. Staying private on Starknet means configuring
-            // ShieldInAnonymizer to spend the shielded note directly
-            // within the STRK20 pool, not registering a BridgeOutAnonymizer.
-            // The Cairo factory's valid_domains map never registers
-            // 'STARKNET' (only BASE/SOLANA/ETHEREUM), so this would always
-            // revert INVALID_DOMAIN on-chain — fail fast instead of
-            // spending a tx on a guaranteed revert.
-            let is_same_chain = task.chain == task.target_chain;
-            if is_same_chain && task.target_chain == Chain::Starknet {
-                return Err(DeployError::Fatal(
-                    "Starknet cannot be its own target_chain; for same-chain privacy, spend the shielded note directly within the STRK20 pool instead of registering a bridge-out pair".to_string(),
-                ));
-            }
-
-            let merchant_pubkey = Felt::from_hex(&task.merchant_address).map_err(|e| {
-                DeployError::Fatal(format!("Invalid Starknet merchant_pubkey felt252: {e}"))
+            // StarknetReceiver is symmetric with ChainXReceiver now — no
+            // pool coupling, no privacy_invoke, no restriction on Starknet
+            // being its own target. Privacy is a payer-side choice (an
+            // unshielding transfer vs. a plain one, both landing as an
+            // ordinary balance this contract sweeps identically), not a
+            // property of which chain got registered.
+            let merchant_felt = Felt::from_hex(&task.merchant_address).map_err(|e| {
+                DeployError::Fatal(format!("Invalid Starknet merchant address felt252: {e}"))
             })?;
 
-            // 1. Check the merchant isn't already at the pair cap.
-            // the read entrypoint is `get_merchant_pairs`, which returns
-            // Array<MerchantPair>. Cairo's Serde encodes an Array as
-            // [length, ...elements], so the first felt in the response is
-            // the number of pairs already registered — this is a cap check,
-            // not an "already registered" check, since a merchant can hold
-            // up to MAX_PAIRS_PER_MERCHANT pairs.
+            // Cap check — mirrors the EVM arm's getReceiverCount() exactly
+            // now that the Cairo factory exposes the same view.
             let check_call = FunctionCall {
                 contract_address: starknet_factory_addr,
-                entry_point_selector: get_selector_from_name("get_merchant_pairs").unwrap(),
-                calldata: vec![merchant_pubkey],
+                entry_point_selector: get_selector_from_name("get_receiver_count").unwrap(),
+                calldata: vec![merchant_felt],
             };
 
-            let pair_res = starknet_account
+            let count_res = starknet_account
                 .provider()
                 .call(check_call, BlockId::Tag(BlockTag::Latest))
                 .await
                 .map_err(|e| DeployError::Transient(format!("Starknet view call failed: {e}")))?;
 
-            let pair_count: u64 = pair_res
+            let existing_count: u64 = count_res
                 .first()
                 .cloned()
                 .unwrap_or(Felt::ZERO)
                 .try_into()
                 .unwrap_or(u64::MAX);
 
-            if pair_count >= MAX_RECEIVERS_PER_MERCHANT {
+            if existing_count >= MAX_RECEIVERS_PER_MERCHANT {
                 return Err(DeployError::Fatal(format!(
-                    "Merchant {merchant_pubkey:#x} already has {pair_count} pairs (max {MAX_RECEIVERS_PER_MERCHANT})"
+                    "Merchant {merchant_felt:#x} already has {existing_count} receivers (max {MAX_RECEIVERS_PER_MERCHANT})"
                 )));
             }
 
-            let target_chain_felt = chain_to_felt(task.target_chain);
+            // Same-chain (Starknet targeting Starknet is now valid, same as
+            // any EVM leg): zero chain + zero recipient.
+            // Cross-chain: recipient is the merchant's address zero-padded
+            // into a 32-byte word (same shape as evm_address_to_bytes32)
+            // and split into Cairo's u256 (low, high) felt pair.
+            let is_same_chain = task.chain == task.target_chain;
 
-            // Encode merchant_pubkey as a proper big-endian u256 split
-            // (low: felt252, high: felt252), each bounded to 128 bits.
-            // The old code put the *entire* felt252 (up to ~252 bits) into
-            // `low` with `high = 0` — for any real merchant identity above
-            // 2^128 (e.g. one sized to double as an EVM address, per the
-            // "merchant is also the recipient" model), Cairo's u128
-            // range-check on `low` fails and the call reverts.
-            let recipient_be = merchant_pubkey.to_bytes_be();
-            let cctp_recipient_high = Felt::from_bytes_be_slice(&recipient_be[0..16]);
-            let cctp_recipient_low = Felt::from_bytes_be_slice(&recipient_be[16..32]);
+            let (cctp_mint_chain_felt, cctp_recipient_low, cctp_recipient_high) = if is_same_chain {
+                (Felt::ZERO, Felt::ZERO, Felt::ZERO)
+            } else {
+                let target_chain_felt = chain_to_felt(task.target_chain);
+                let recipient_be = merchant_felt.to_bytes_be();
+                let high = Felt::from_bytes_be_slice(&recipient_be[0..16]);
+                let low = Felt::from_bytes_be_slice(&recipient_be[16..32]);
+                (target_chain_felt, low, high)
+            };
 
             let register_call = Call {
                 to: starknet_factory_addr,
                 selector: get_selector_from_name("register_merchant").unwrap(),
                 calldata: vec![
-                    merchant_pubkey,
-                    target_chain_felt,
+                    merchant_felt,
+                    cctp_mint_chain_felt,
                     cctp_recipient_low,
                     cctp_recipient_high,
                 ],
@@ -244,9 +250,21 @@ pub async fn execute_onchain_deployment(
                 .map_err(|e| DeployError::Transient(format!("Starknet invoke failed: {e}")))?;
 
             println!(
-                "Starknet merchant pair deployed in tx 0x{:x}",
+                "Starknet receiver deployed in tx 0x{:x}",
                 invoke_result.transaction_hash
             );
+
+            if let (Some(url), Some(registry_addr)) = (&task.webhook_url, webhook_registry_addr) {
+                if !url.is_empty() {
+                    let merchant_evm_addr: Address = task.merchant_address.parse().map_err(|e| {
+                        DeployError::Fatal(format!(
+                            "Webhook registry needs an EVM-address-shaped merchant identity: {e}"
+                        ))
+                    })?;
+                    register_webhook(evm_client.clone(), registry_addr, merchant_evm_addr, url)
+                        .await?;
+                }
+            }
 
             Ok(())
         }

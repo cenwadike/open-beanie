@@ -10,7 +10,7 @@ use ethers::{
     types::{Address, BlockNumber, Filter, H256, U256, ValueOrArray},
 };
 
-use crate::config::{Config, Deposit, now_formatted};
+use crate::config::{Deposit, EvmConfig, now_formatted};
 
 abigen!(
     ChainXReceiver,
@@ -69,7 +69,7 @@ abigen!(
 
 pub type SignerProvider = SignerMiddleware<NonceManagerMiddleware<Provider<Http>>, LocalWallet>;
 
-pub async fn build_client(cfg: &Config) -> AnyhowResult<Arc<SignerProvider>> {
+pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> {
     let provider = Provider::<Http>::try_from(cfg.rpc_url.as_str()).context("invalid RPC URL")?;
     let chain_id = provider
         .get_chainid()
@@ -93,7 +93,7 @@ pub async fn build_client(cfg: &Config) -> AnyhowResult<Arc<SignerProvider>> {
 /// `getProgramAccounts` scan: it already lives on-chain, nothing kept in sync separately.
 pub async fn discover_merchants(
     client: &Arc<SignerProvider>,
-    cfg: &Config,
+    cfg: &EvmConfig,
     from_block: u64,
     to_block: u64,
 ) -> AnyhowResult<Vec<(Address, Address)>> {
@@ -145,7 +145,7 @@ pub async fn discover_merchants(
 /// correctly overwrite earlier ones as the caller folds this into a map.
 pub async fn discover_webhook_urls(
     client: &Arc<SignerProvider>,
-    cfg: &Config,
+    cfg: &EvmConfig,
     from_block: u64,
     to_block: u64,
 ) -> AnyhowResult<Vec<(Address, String)>> {
@@ -155,7 +155,7 @@ pub async fn discover_webhook_urls(
 
     let filter = Filter::new()
         .address(cfg.webhook_registry_address)
-        .event("WebhookUrlSet(address,string)")
+        .event("WebhookUrlSet(string,string)")
         .from_block(BlockNumber::Number(from_block.into()))
         .to_block(BlockNumber::Number(to_block.into()));
 
@@ -189,7 +189,7 @@ pub async fn discover_webhook_urls(
 /// per block range since `to` is an indexed Transfer topic.
 pub async fn fetch_deposits_since_block(
     client: &Arc<SignerProvider>,
-    cfg: &Config,
+    cfg: &EvmConfig,
     receivers: &[Address],
     from_block: u64,
     to_block: u64,

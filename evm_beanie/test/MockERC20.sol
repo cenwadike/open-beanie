@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3
 pragma solidity ^0.8.24;
 
 contract MockERC20 {

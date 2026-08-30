@@ -47,7 +47,6 @@ pub struct InitLaneRequest {
 pub struct LaneDeployment {
     pub chain: Chain,
     pub address: String,
-    pub is_privacy_lane: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
