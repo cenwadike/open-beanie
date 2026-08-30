@@ -13,19 +13,33 @@
 
 use starknet::ContractAddress;
 
-/// CCTP `TokenMessengerMinterV2` burn entrypoint. Identical shape to the one
-/// already written in bridge_out.cairo — mirrors circlefin/starknet-cctp.
+/// CCTP `TokenMessengerMinterV2` burn entrypoint.
 #[starknet::interface]
-pub trait ITokenMessengerMinterV2<T> {
-    fn deposit_for_burn(
+pub trait IMessageTransmitterV2<T> {
+    /// Sends a cross-chain message to a recipient on another domain.
+    ///
+    /// # Arguments
+    ///
+    /// * `destination_domain` - The domain ID of the destination chain
+    /// * `recipient` - The address of the recipient on the destination chain
+    /// * `destination_caller` - The authorized caller on destination domain (0 allows any)
+    /// * `min_finality_threshold` - The minimum finality threshold for the message
+    /// * `message_body` - The message content to send
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if:
+    /// - The contract is paused
+    /// - The destination_domain equals the local domain
+    /// - The message body size exceeds the maximum allowed size
+    /// - The recipient is zero address
+    fn send_message(
         ref self: T,
-        amount: u256,
         destination_domain: u32,
-        mint_recipient: u256,
-        burn_token: ContractAddress,
+        recipient: u256,
         destination_caller: u256,
-        max_fee: u256,
         min_finality_threshold: u32,
+        message_body: ByteArray,
     );
 }
 
@@ -51,13 +65,14 @@ pub trait IStarknetReceiver<T> {
 #[starknet::contract]
 pub mod StarknetReceiver {
     use core::num::traits::Zero;
+    use message::BurnMessageV2;
     use openzeppelin::interfaces::token::erc20::{IERC20Dispatcher, IERC20DispatcherTrait};
     use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
     use starknet::{ContractAddress, get_caller_address, get_contract_address};
     use super::{
-        IStarknetReceiver, ITokenMessengerMinterV2Dispatcher,
-        ITokenMessengerMinterV2DispatcherTrait,
+        IMessageTransmitterV2Dispatcher, IMessageTransmitterV2DispatcherTrait, IStarknetReceiver,
     };
+
 
     const FEE_BPS: u256 = 50; // 0.50% of gross — matches ChainXReceiver.sol
     const BPS_DENOM: u256 = 10_000;
@@ -109,9 +124,6 @@ pub mod StarknetReceiver {
         pub const ZERO_ADDRESS: felt252 = 'ZERO_ADDRESS';
         pub const TRANSFER_FAILED: felt252 = 'TRANSFER_FAILED';
     }
-
-    #[constructor]
-    fn constructor(ref self: ContractState) {}
 
     #[abi(embed_v0)]
     pub impl StarknetReceiverImpl of IStarknetReceiver<ContractState> {
@@ -188,16 +200,30 @@ pub mod StarknetReceiver {
                     // destination (e.g. domain 6 = Base).
                     let max_fee = (gross * CCTP_MAX_FEE_BPS) / BPS_DENOM;
                     let messenger = self.token_messenger.read();
+
+                    let token_u256: u256 = {
+                        let t: felt252 = token.into();
+                        t.into()
+                    };
+                    let sender_u256: u256 = {
+                        let s: felt252 = get_contract_address().into();
+                        s.into()
+                    };
+
+                    let burn_message: ByteArray = BurnMessageV2::format_message_for_relay(
+                        1,
+                        token_u256,
+                        mint_recipient,
+                        net,
+                        sender_u256,
+                        max_fee,
+                        @Default::default(),
+                    );
+
                     erc20.approve(messenger, net);
-                    ITokenMessengerMinterV2Dispatcher { contract_address: messenger }
-                        .deposit_for_burn(
-                            net,
-                            self.destination_domain.read(),
-                            mint_recipient,
-                            token,
-                            0, // destination_caller: 0 = permissionless mint
-                            max_fee,
-                            1000 // standard finality threshold
+                    IMessageTransmitterV2Dispatcher { contract_address: messenger }
+                        .send_message(
+                            self.destination_domain.read(), mint_recipient, 0, 1000, burn_message,
                         );
                 } else {
                     // Same-chain settlement direct to the merchant.

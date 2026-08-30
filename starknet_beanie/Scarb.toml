@@ -8,6 +8,7 @@ edition = "2024_07"
 [dependencies]
 starknet = "2.20.0"
 openzeppelin = "3.0.0"
+message = { git = "https://github.com/circlefin/starknet-cctp", rev = "a16ba41c18a5c8115a5380eee054ce1a6c727d27" }
 
 [dev-dependencies]
 snforge_std = "0.63.0"

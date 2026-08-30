@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: AGPL-3
 pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
@@ -233,8 +233,8 @@ contract ReceiverFactoryTest is Test {
             _ethDestinationDomain
         );
 
-        // zero recipient => same-chain settlement path
-        address clone = f3.registerMerchant(merchant, "STARKNET", bytes32(0));
+        // zero chain and zero recipient => same-chain settlement path
+        address clone = f3.registerMerchant(merchant, bytes32(0), bytes32(0));
 
         token.mint(clone, 1_000);
 

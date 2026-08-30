@@ -82,7 +82,7 @@ contract MerchantFactory {
             revert MaximumReceiversExceeded();
         }
         if (cctpMintChain != bytes32(0)) {
-            require(validDomains[cctpMintChain], InvalidDomain());
+            if (validDomains[cctpMintChain] == false) revert InvalidDomain();
             require(
                 cctpMintRecipient != bytes32(0),
                 "Cross-chain requires destination recipient"

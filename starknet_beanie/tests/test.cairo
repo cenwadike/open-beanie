@@ -79,36 +79,38 @@ pub mod MockToken {
 }
 
 #[starknet::interface]
-pub trait IMockMessenger<T> {
-    fn deposit_for_burn(
+pub trait IMessageTransmitterV2<T> {
+    fn send_message(
         ref self: T,
-        amount: u256,
         destination_domain: u32,
-        mint_recipient: u256,
-        burn_token: ContractAddress,
+        recipient: u256,
         destination_caller: u256,
-        max_fee: u256,
         min_finality_threshold: u32,
+        message_body: ByteArray,
     );
+}
+
+#[starknet::interface]
+pub trait IMockMessageTransmitter<T> {
     fn get_last_amount(self: @T) -> u256;
     fn get_last_destination_domain(self: @T) -> u32;
     fn get_last_mint_recipient(self: @T) -> u256;
-    fn get_last_burn_token(self: @T) -> ContractAddress;
+    fn get_last_burn_token(self: @T) -> u256;
     fn get_last_max_fee(self: @T) -> u256;
 }
 
 #[starknet::contract]
 pub mod MockCctpMessenger {
-    use starknet::ContractAddress;
+    use message::BurnMessageV2;
     use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
-    use super::IMockMessenger;
+    use super::{IMessageTransmitterV2, IMockMessageTransmitter};
 
     #[storage]
     struct Storage {
         last_amount: u256,
         last_destination_domain: u32,
         last_mint_recipient: u256,
-        last_burn_token: ContractAddress,
+        last_burn_token: u256,
         last_max_fee: u256,
     }
 
@@ -116,46 +118,42 @@ pub mod MockCctpMessenger {
     fn constructor(ref self: ContractState) {}
 
     #[abi(embed_v0)]
-    pub impl MockCctpMessengerImpl of IMockMessenger<ContractState> {
-        fn deposit_for_burn(
+    pub impl MessageTransmitterImpl of IMessageTransmitterV2<ContractState> {
+        fn send_message(
             ref self: ContractState,
-            amount: u256,
             destination_domain: u32,
-            mint_recipient: u256,
-            burn_token: ContractAddress,
+            recipient: u256,
             destination_caller: u256,
-            max_fee: u256,
             min_finality_threshold: u32,
+            message_body: ByteArray,
         ) {
-            self.last_amount.write(amount);
             self.last_destination_domain.write(destination_domain);
-            self.last_mint_recipient.write(mint_recipient);
-            self.last_burn_token.write(burn_token);
-            self.last_max_fee.write(max_fee);
+            self.last_mint_recipient.write(recipient);
+            self.last_amount.write(BurnMessageV2::get_amount(@message_body));
+            self.last_burn_token.write(BurnMessageV2::get_burn_token(@message_body));
+            self.last_max_fee.write(BurnMessageV2::get_max_fee(@message_body));
         }
+    }
 
+    #[abi(embed_v0)]
+    pub impl MockGettersImpl of IMockMessageTransmitter<ContractState> {
         fn get_last_amount(self: @ContractState) -> u256 {
             self.last_amount.read()
         }
-
         fn get_last_destination_domain(self: @ContractState) -> u32 {
             self.last_destination_domain.read()
         }
-
         fn get_last_mint_recipient(self: @ContractState) -> u256 {
             self.last_mint_recipient.read()
         }
-
-        fn get_last_burn_token(self: @ContractState) -> ContractAddress {
+        fn get_last_burn_token(self: @ContractState) -> u256 {
             self.last_burn_token.read()
         }
-
         fn get_last_max_fee(self: @ContractState) -> u256 {
             self.last_max_fee.read()
         }
     }
 }
-
 fn deploy_mock_token() -> ContractAddress {
     let token_class = declare("MockToken").unwrap_syscall().contract_class();
     let (token_address, _) = token_class.deploy(@array![]).unwrap_syscall();
@@ -248,11 +246,14 @@ fn sweep_cross_chain_settlement_burns_via_cctp() {
     let (net, fee_to_caller, fee_to_treasury, _) = receiver.sweep();
     stop_cheat_caller_address(receiver_addr);
 
-    let messenger_dispatcher = IMockMessengerDispatcher { contract_address: messenger };
+    let messenger_dispatcher = IMockMessageTransmitterDispatcher { contract_address: messenger };
     assert(messenger_dispatcher.get_last_amount() == net, 'CCTP_AMOUNT');
     assert(messenger_dispatcher.get_last_destination_domain() == destination_domain, 'CCTP_DOMAIN');
     assert(messenger_dispatcher.get_last_mint_recipient() == mint_recipient, 'CCTP_RECIPIENT');
-    assert(messenger_dispatcher.get_last_burn_token() == token, 'CCTP_TOKEN');
+
+    let token_felt: felt252 = token.into();
+    let token_u256: u256 = token_felt.into();
+    assert(messenger_dispatcher.get_last_burn_token() == token_u256, 'CCTP_TOKEN');
 
     // CCTP max_fee (15 bps of gross) = 10_000 * 15 / 10_000 = 15
     assert(messenger_dispatcher.get_last_max_fee() == 15, 'CCTP_MAX_FEE');

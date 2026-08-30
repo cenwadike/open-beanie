@@ -4,3 +4,5 @@ snfoundry_trace/
 coverage/
 profile/
 Scarb.lock
+.env
+
