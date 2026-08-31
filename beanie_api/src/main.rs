@@ -29,6 +29,7 @@ mod config;
 mod models;
 mod rate_limiter;
 mod routes;
+mod scanner;
 mod worker;
 
 use axum::{
@@ -47,11 +48,14 @@ use starknet::{
 };
 use std::{sync::Arc, time::Duration};
 
-use crate::models::{DeployTask, HttpResponseCache, mpsc};
 use crate::rate_limiter::DualRateLimiter;
 use crate::routes::{AppState, init_lane};
 use crate::worker::run_deployment_worker;
 use crate::{config::Config, routes::serve_static};
+use crate::{
+    models::{DeployTask, HttpResponseCache, mpsc},
+    scanner::scan_stealth_payments,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -110,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/v1/lanes/init", post(init_lane))
+        .route("/api/v1/stealth/scan", post(scan_stealth_payments))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);

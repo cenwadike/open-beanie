@@ -20,6 +20,7 @@ pub struct Config {
     pub starknet_private_key: Felt,
     pub starknet_chain_id: Felt,
     pub starknet_factory_address: Felt,
+    pub stealth_registry_address: Felt,
 }
 
 impl Config {
@@ -40,6 +41,8 @@ impl Config {
                 .unwrap_or_else(|_| "0x534e5f5345504f4c4941".to_string()),
         )?;
         let starknet_factory_address = Felt::from_hex(&std::env::var("STARKNET_FACTORY_ADDRESS")?)?;
+
+        let stealth_registry_address = Felt::from_hex(&std::env::var("STARKNET_STEALTH_ADDRESS")?)?;
 
         let rate_limit_per_hour = std::env::var("RATE_LIMIT_PER_HOUR")
             .ok()
@@ -62,6 +65,7 @@ impl Config {
             starknet_private_key,
             starknet_chain_id,
             starknet_factory_address,
+            stealth_registry_address,
         })
     }
 }
