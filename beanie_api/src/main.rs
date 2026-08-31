@@ -110,7 +110,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/v1/lanes/init", post(init_lane))
-        .route("/lanes/init", post(init_lane)) // keep for backwards compatibility if needed
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);

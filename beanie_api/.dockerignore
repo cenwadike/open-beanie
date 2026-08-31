@@ -1,0 +1,19 @@
+# Build targets
+target/
+
+# Local configuration & secrets
+.env
+*.env
+*.pem
+*.key
+
+# Git and IDE files
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Documentation and temporary files
+*.md
+*.tmp
+*.log

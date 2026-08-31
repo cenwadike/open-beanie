@@ -441,7 +441,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut starknet_watermark = starknet_config.start_block;
+    let mut starknet_registry_watermark = starknet_config.registry_start_block;
+    let mut starknet_deposit_watermark = starknet_config.start_block;
 
     // Starknet execution loop
     let starknet_handle = tokio::spawn(async move {
@@ -455,18 +456,20 @@ async fn main() -> Result<()> {
                 }
             };
 
-            if let Err(e) = refresh_registry(&starknet_client, &mut starknet_watermark, tip).await {
+            if let Err(e) =
+                refresh_registry(&starknet_client, &mut starknet_registry_watermark, tip).await
+            {
                 eprintln!(
                     "[{}] starknet registry refresh error: {e:#}",
                     now_formatted()
                 );
             }
 
-            if starknet_watermark <= tip && !starknet_registry.lock().await.is_empty() {
+            if starknet_deposit_watermark <= tip && !starknet_registry.lock().await.is_empty() {
                 println!(
                     "[{}] starknet cycle start, deposit_watermark={} tip={} known_receivers={}",
                     now_formatted(),
-                    starknet_watermark,
+                    starknet_deposit_watermark,
                     tip,
                     starknet_registry.lock().await.keys().count()
                 );
@@ -478,7 +481,7 @@ async fn main() -> Result<()> {
                     &starknet_account,
                     &starknet_config,
                     &receiver_keys,
-                    starknet_watermark,
+                    starknet_deposit_watermark,
                     tip,
                 )
                 .await
@@ -497,7 +500,7 @@ async fn main() -> Result<()> {
                                 now_formatted()
                             );
                         }
-                        starknet_watermark = tip + 1;
+                        starknet_deposit_watermark = tip + 1;
                     }
                     Err(e) => {
                         eprintln!("[{}] starknet deposit fetch error: {e:#}", now_formatted())

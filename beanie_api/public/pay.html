@@ -22,27 +22,22 @@
     <div class="veil" aria-hidden="true"></div>
 
     <header class="topbar">
-      <a class="brand" href="/beanie.html" aria-label="Beanie home">
+      <a class="brand" href="/" aria-label="Beanie home">
         <span class="wordmark">bean<span class="colon">:</span>ie</span>
       </a>
     </header>
 
     <main class="pay-shell">
       <section class="pay-panel" aria-labelledby="payTitle">
-        <div class="panel-copy">
-          <p class="eyebrow">Direct wallet transfer</p>
-          <h1 id="payTitle">Pay with USDC</h1>
-          <p class="subtitle">Choose the chain where you are sending funds and confirm the deposit address.</p>
-        </div>
-
         <div class="lane-card" id="laneCard" aria-live="polite">
           <div class="loading">Loading payment details...</div>
         </div>
       </section>
     </main>
+
+    <div class="toast-stack" id="payToastStack"></div>
   </div>
 
-  <script src="/scripts/qrcode.bundle.js"></script>
   <script src="/scripts/pay.js" defer></script>
 </body>
 

@@ -91,7 +91,7 @@ impl StarknetConfig {
             token_address: parse_felt_env("STARKNET_TOKEN_ADDRESS")?,
             factory_address: parse_felt_env("STARKNET_FACTORY_ADDRESS")?,
             webhook_registry_address: parse_felt_env("WEBHOOK_REGISTRY_ADDRESS")?,
-            keeper_address: parse_felt_env("KEEPER_ADDRESS")?,
+            keeper_address: parse_felt_env("STARKNET_KEEPER_ADDRESS")?,
             keeper_wallet: wallet,
             poll_interval: Duration::from_secs(
                 env("POLL_INTERVAL_SECS")
@@ -102,7 +102,7 @@ impl StarknetConfig {
             start_block: env("STARKNET_START_BLOCK")?
                 .parse()
                 .context("invalid START_BLOCK")?,
-            registry_start_block: env("REGISTRY_START_BLOCK")?
+            registry_start_block: env("STARKNET_START_BLOCK")?
                 .parse()
                 .context("invalid REGISTRY_START_BLOCK")?,
             webhook_registry_start_block: env("WEBHOOK_REGISTRY_START_BLOCK")?
@@ -144,7 +144,7 @@ pub struct EvmConfig {
 impl EvmConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            rpc_url: env("RPC_URL")?,
+            rpc_url: env("BASE_RPC_URL")?,
             chain_name: "base".into(),
             token_address: addr(&env("BASE_TOKEN_ADDRESS")?)?,
             factory_address: addr(&env("BASE_FACTORY_ADDRESS")?)?,
@@ -155,7 +155,7 @@ impl EvmConfig {
             webhook_registry_start_block: env("WEBHOOK_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("WEBHOOK_REGISTRY_START_BLOCK must be a valid u64")?,
-            keeper_wallet: load_keeper_wallet(&env("SWEEP_PRIVATE_KEY")?)?,
+            keeper_wallet: load_keeper_wallet(&env("BASE_SWEEP_PRIVATE_KEY")?)?,
             poll_interval: Duration::from_secs(
                 env("POLL_INTERVAL_SECS")
                     .ok()
@@ -164,7 +164,7 @@ impl EvmConfig {
             ),
             start_block: env("BASE_START_BLOCK")?
                 .parse()
-                .context("START_BLOCK must be a valid u64")?,
+                .context("BASE_START_BLOCK must be a valid u64")?,
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -193,12 +193,12 @@ fn addr(s: &str) -> Result<Address> {
         .with_context(|| format!("invalid address: {s}"))
 }
 
-/// WEBHOOK_ED25519_SEED_HEX is gone — same key as SWEEP_PRIVATE_KEY, parsed without a
+/// WEBHOOK_ED25519_SEED_HEX is gone — same key as BASE_SWEEP_PRIVATE_KEY, parsed without a
 /// chain ID since personal_sign message signing doesn't bind to one.
 fn load_keeper_wallet(hex_key: &str) -> Result<EvmLocalWallet> {
     hex_key
         .parse::<EvmLocalWallet>()
-        .context("SWEEP_PRIVATE_KEY is not a valid private key")
+        .context("BASE_SWEEP_PRIVATE_KEY is not a valid private key")
 }
 
 pub fn now_unix() -> i64 {

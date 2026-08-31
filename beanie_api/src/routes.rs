@@ -25,6 +25,7 @@ use crate::models::{
     SocketAddr, err, mpsc,
 };
 use crate::rate_limiter::DualRateLimiter;
+use crate::worker::derive_felt_from_foreign_address;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -161,18 +162,27 @@ pub async fn init_lane(
             }
             Chain::Starknet => {
                 // Ensure proper hex parsing for Starknet Felt
-                let hex_str =
-                    if merchant_address.starts_with("0x") || merchant_address.starts_with("0X") {
+                let parsed_merchant = if is_target {
+                    // Ensure proper hex parsing for Starknet Felt
+                    let hex_str = if merchant_address.starts_with("0x")
+                        || merchant_address.starts_with("0X")
+                    {
                         format!("0x{}", &merchant_address[2..].to_lowercase())
                     } else {
                         format!("0x{}", merchant_address.to_lowercase())
                     };
 
-                let parsed_merchant = match Felt::from_hex(&hex_str) {
-                    Ok(felt) => felt,
-                    Err(_) => {
-                        return err(StatusCode::BAD_REQUEST, "Invalid Starknet merchant address");
+                    match Felt::from_hex(&hex_str) {
+                        Ok(felt) => felt,
+                        Err(_) => {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "Settlement (target) chain address must be a valid Starknet address",
+                            );
+                        }
                     }
+                } else {
+                    derive_felt_from_foreign_address(merchant_address)
                 };
 
                 let call = FunctionCall {

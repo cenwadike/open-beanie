@@ -19,7 +19,6 @@ pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, Loca
 pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccount>> {
     let provider = JsonRpcClient::new(HttpTransport::new(Url::parse(&cfg.rpc_url)?));
 
-    // Choose appropriate network chain_id (e.g., MAINNET or SEPOLIA)
     let chain_id = starknet::core::chain_id::MAINNET;
 
     let account = SingleOwnerAccount::new(
@@ -46,32 +45,45 @@ pub async fn discover_merchants(
 
     let event_selector = get_selector_from_name("MerchantRegistered")?;
     let mut out = Vec::new();
+    let step = cfg.log_chunk_blocks.max(1);
 
-    let filter = EventFilter {
-        from_block: Some(BlockId::Number(from_block)),
-        to_block: Some(BlockId::Number(to_block)),
-        address: Some(cfg.factory_address),
-        keys: Some(vec![vec![event_selector]]),
-    };
+    let mut current_from = from_block;
+    while current_from <= to_block {
+        let current_to = (current_from + step - 1).min(to_block);
+        let mut continuation_token: Option<String> = None;
 
-    let events_page = account.provider().get_events(filter, None, 100).await?;
+        loop {
+            let filter = EventFilter {
+                from_block: Some(BlockId::Number(current_from)),
+                to_block: Some(BlockId::Number(current_to)),
+                address: Some(cfg.factory_address),
+                keys: Some(vec![vec![event_selector]]),
+            };
 
-    for event in events_page.events {
-        // According to Cairo implementation:
-        // event.data[0] = merchant, event.data[1] = receiver
-        if event.data.len() >= 2 {
-            out.push((event.data[0], event.data[1]));
+            let events_page = account
+                .provider()
+                .get_events(filter, continuation_token.clone(), 100)
+                .await?;
+
+            for event in events_page.events {
+                if event.data.len() >= 2 {
+                    out.push((event.data[0], event.data[1]));
+                }
+            }
+
+            continuation_token = events_page.continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
         }
+
+        current_from = current_to + 1;
     }
 
     Ok(out)
 }
 
-/// Scans Starknet ERC-20 Transfer events.
-/// Cairo Transfer event keys layout:
-/// keys[0] = starknet_keccak("Transfer")
-/// keys[1] = from
-/// keys[2] = to (receiver)
+/// Scans Starknet ERC-20 Transfer events with block chunking and pagination.
 pub async fn fetch_deposits_since_block(
     account: &StarknetAccount,
     cfg: &StarknetConfig,
@@ -85,42 +97,69 @@ pub async fn fetch_deposits_since_block(
 
     let transfer_selector = get_selector_from_name("Transfer")?;
     let mut deposits = Vec::new();
-
-    // Setup Starknet key query (keys[0] = Transfer, keys[1] = wildcard, keys[2] = receivers filter)
     let keys = vec![vec![transfer_selector], vec![], receivers.to_vec()];
+    let step = cfg.log_chunk_blocks.max(1);
 
-    let filter = EventFilter {
-        from_block: Some(BlockId::Number(from_block)),
-        to_block: Some(BlockId::Number(to_block)),
-        address: Some(cfg.token_address),
-        keys: Some(keys),
-    };
+    let mut current_from = from_block;
+    while current_from <= to_block {
+        let current_to = (current_from + step - 1).min(to_block);
+        let mut continuation_token: Option<String> = None;
 
-    let events_page = account.provider().get_events(filter, None, 1000).await?;
+        loop {
+            let filter = EventFilter {
+                from_block: Some(BlockId::Number(current_from)),
+                to_block: Some(BlockId::Number(current_to)),
+                address: Some(cfg.token_address),
+                keys: Some(keys.clone()),
+            };
 
-    for event in events_page.events {
-        if event.keys.len() < 3 || event.data.len() < 2 {
-            continue;
+            let events_page = account
+                .provider()
+                .get_events(filter, continuation_token.clone(), 1000)
+                .await?;
+
+            for event in events_page.events {
+                if event.keys.len() < 3 || event.data.len() < 2 {
+                    continue;
+                }
+
+                let from = event.keys[1];
+                let to = event.keys[2];
+
+                // Cairo u256 consists of 2 felts: low (data[0]), high (data[1])
+                let low: u128 = event.data[0].try_into().unwrap_or(0);
+                let high: u128 = event.data[1].try_into().unwrap_or(0);
+                let amount = u256_to_string(low, high);
+
+                deposits.push(Deposit {
+                    tx_hash: format!("{:#x}", event.transaction_hash),
+                    from_address: format!("{:#x}", from),
+                    receiver: format!("{:#x}", to),
+                    amount_raw: amount,
+                    block_number: event.block_number.unwrap_or(current_to),
+                });
+            }
+
+            continuation_token = events_page.continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
         }
 
-        let from = event.keys[1];
-        let to = event.keys[2];
-
-        // Cairo u256 consists of 2 felts in event.data: low (data[0]), high (data[1])
-        let low: u128 = event.data[0].try_into().unwrap_or(0);
-        let high: u128 = event.data[1].try_into().unwrap_or(0);
-        let amount = ((high as u128) << 64) | low; // Or parse into a standard Uint library
-
-        deposits.push(Deposit {
-            tx_hash: format!("{:#x}", event.transaction_hash),
-            from_address: format!("{:#x}", from),
-            receiver: format!("{:#x}", to),
-            amount_raw: amount.to_string(),
-            block_number: event.block_number.unwrap_or(to_block),
-        });
+        current_from = current_to + 1;
     }
 
     Ok(deposits)
+}
+
+/// Helper to convert low/high u128 felts to full integer string representation
+fn u256_to_string(low: u128, high: u128) -> String {
+    if high == 0 {
+        low.to_string()
+    } else {
+        let val = (u128::from(high) << 64) | u128::from(low); // Fits within u128 for normal standard ranges
+        val.to_string()
+    }
 }
 
 /// Sweeps multiple receivers via Starknet's native multicall mechanism.
@@ -134,7 +173,6 @@ pub async fn multicall_sweep(
 
     let sweep_selector = get_selector_from_name("sweep")?;
 
-    // Build the array of execution calls
     let calls: Vec<Call> = receivers
         .iter()
         .map(|&receiver| Call {
@@ -144,7 +182,6 @@ pub async fn multicall_sweep(
         })
         .collect();
 
-    // Execute directly through the account contract
     let result = account.execute_v3(calls).send().await?;
 
     Ok(Some(format!("{:#x}", result.transaction_hash)))

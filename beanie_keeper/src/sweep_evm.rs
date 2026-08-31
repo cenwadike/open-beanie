@@ -5,9 +5,13 @@ use ethers::{
     abi::{ParamType, Token, decode},
     contract::abigen,
     middleware::{NonceManagerMiddleware, SignerMiddleware},
-    providers::{Http, Middleware, Provider},
+    providers::{Http, Middleware, Provider, RetryClient},
     signers::{LocalWallet, Signer},
-    types::{Address, BlockNumber, Filter, H256, U256, ValueOrArray},
+    types::{
+        Address, BlockNumber, Eip1559TransactionRequest, Filter, H256, U256, ValueOrArray,
+        transaction::eip2718::TypedTransaction,
+    },
+    utils::keccak256,
 };
 
 use crate::config::{Deposit, EvmConfig, now_formatted};
@@ -28,9 +32,6 @@ abigen!(
     ]"#
 );
 
-// Deployed at this address on virtually every major EVM chain (Base and Ethereum
-// mainnet included) — confirm it's actually live on whichever chain you're pointing at
-// before relying on it.
 pub const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 abigen!(
@@ -67,30 +68,27 @@ abigen!(
     ]"#
 );
 
-pub type SignerProvider = SignerMiddleware<NonceManagerMiddleware<Provider<Http>>, LocalWallet>;
+pub type SignerProvider =
+    SignerMiddleware<NonceManagerMiddleware<Provider<RetryClient<Http>>>, LocalWallet>;
 
 pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> {
-    let provider = Provider::<Http>::try_from(cfg.rpc_url.as_str()).context("invalid RPC URL")?;
+    // Retries 10 times max with 2000ms initial backoff on rate limits / 429s
+    let provider = Provider::<RetryClient<Http>>::new_client(cfg.rpc_url.as_str(), 10, 2000)
+        .context("invalid RPC URL or failed initializing retry client")?;
+
     let chain_id = provider
         .get_chainid()
         .await
         .context("failed fetching chain id")?
         .as_u64();
 
-    // Same wallet used for webhook signing, now bound to this chain's ID for tx signing —
-    // chain ID only affects the EIP-155 transaction domain, not the address itself.
     let wallet = cfg.keeper_wallet.clone().with_chain_id(chain_id);
-
     let address = wallet.address();
-    // Concurrent sweep() sends from the same signer need explicit nonce sequencing —
-    // without this, parallel sweeps for multiple merchants in one cycle will race.
+
     let nonce_managed = NonceManagerMiddleware::new(provider, address);
     Ok(Arc::new(SignerMiddleware::new(nonce_managed, wallet)))
 }
 
-/// Discover (merchant, receiver) pairs registered on the factory since `from_block`.
-/// This IS the tenant registry — same principle as the Solana design's
-/// `getProgramAccounts` scan: it already lives on-chain, nothing kept in sync separately.
 pub async fn discover_merchants(
     client: &Arc<SignerProvider>,
     cfg: &EvmConfig,
@@ -103,14 +101,14 @@ pub async fn discover_merchants(
 
     let mut out = Vec::new();
     let mut chunk_start = from_block;
+    let merchant_reg_topic = H256::from(keccak256("MerchantRegistered(address,address)"));
 
-    // Loop through blocks in structured chunks to respect the 10,000 RPC limit
     while chunk_start <= to_block {
         let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
 
         let filter = Filter::new()
             .address(cfg.factory_address)
-            .event("MerchantRegistered(address,address)")
+            .topic0(merchant_reg_topic)
             .from_block(BlockNumber::Number(chunk_start.into()))
             .to_block(BlockNumber::Number(chunk_end.into()));
 
@@ -123,8 +121,6 @@ pub async fn discover_merchants(
                 continue;
             }
             let merchant = Address::from(log.topics[1]);
-            // `receiver` is non-indexed in MerchantRegistered, so it's in log.data (32-byte
-            // word, address right-aligned in the last 20 bytes).
             if log.data.len() < 32 {
                 continue;
             }
@@ -138,11 +134,6 @@ pub async fn discover_merchants(
     Ok(out)
 }
 
-/// Scans MerchantWebhookRegistry's `WebhookUrlSet` events to build merchant -> URL.
-/// Unlike the fixed-width address in MerchantRegistered, `url` is a dynamic `string` —
-/// it can't be sliced out of log.data by a fixed offset, it needs real ABI decoding.
-/// eth_getLogs returns logs in on-chain order, so later entries for the same merchant
-/// correctly overwrite earlier ones as the caller folds this into a map.
 pub async fn discover_webhook_urls(
     client: &Arc<SignerProvider>,
     cfg: &EvmConfig,
@@ -153,40 +144,46 @@ pub async fn discover_webhook_urls(
         return Ok(Vec::new());
     }
 
-    let filter = Filter::new()
-        .address(cfg.webhook_registry_address)
-        .event("WebhookUrlSet(string,string)")
-        .from_block(BlockNumber::Number(from_block.into()))
-        .to_block(BlockNumber::Number(to_block.into()));
-
-    let logs = client
-        .get_logs(&filter)
-        .await
-        .context("eth_getLogs failed for webhook registry")?;
-
     let mut out = Vec::new();
-    for log in logs {
-        if log.topics.len() < 2 {
-            continue;
+    let mut chunk_start = from_block;
+    let webhook_set_topic = H256::from(keccak256("WebhookUrlSet(address,string)"));
+
+    while chunk_start <= to_block {
+        let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
+
+        let filter = Filter::new()
+            .address(cfg.webhook_registry_address)
+            .topic0(webhook_set_topic)
+            .from_block(BlockNumber::Number(chunk_start.into()))
+            .to_block(BlockNumber::Number(chunk_end.into()));
+
+        let logs = client.get_logs(&filter).await.with_context(|| {
+            format!("eth_getLogs failed for webhook registry blocks {chunk_start}-{chunk_end}")
+        })?;
+
+        for log in logs {
+            if log.topics.len() < 2 {
+                continue;
+            }
+            let merchant = Address::from(log.topics[1]);
+
+            let url = match decode(&[ParamType::String], &log.data) {
+                Ok(mut tokens) => match tokens.remove(0) {
+                    Token::String(s) => s,
+                    _ => continue,
+                },
+                Err(_) => continue,
+            };
+
+            out.push((merchant, url));
         }
-        let merchant = Address::from(log.topics[1]);
 
-        let url = match decode(&[ParamType::String], &log.data) {
-            Ok(mut tokens) => match tokens.remove(0) {
-                Token::String(s) => s,
-                _ => continue,
-            },
-            Err(_) => continue,
-        };
-
-        out.push((merchant, url));
+        chunk_start = chunk_end + 1;
     }
+
     Ok(out)
 }
 
-/// One batched scan covering every known receiver — the EVM equivalent of Solana's
-/// per-account signature walk, but collapsed into a single filtered eth_getLogs call
-/// per block range since `to` is an indexed Transfer topic.
 pub async fn fetch_deposits_since_block(
     client: &Arc<SignerProvider>,
     cfg: &EvmConfig,
@@ -200,13 +197,14 @@ pub async fn fetch_deposits_since_block(
 
     let mut deposits = Vec::new();
     let mut chunk_start = from_block;
+    let transfer_topic = H256::from(keccak256("Transfer(address,address,uint256)"));
 
     while chunk_start <= to_block {
         let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
 
         let filter = Filter::new()
             .address(cfg.token_address)
-            .event("Transfer(address,address,uint256)")
+            .topic0(transfer_topic)
             .topic2(ValueOrArray::Array(
                 receivers.iter().map(|a| H256::from(*a)).collect(),
             ))
@@ -247,12 +245,6 @@ pub async fn fetch_deposits_since_block(
     Ok(deposits)
 }
 
-/// One transaction sweeps every receiver in `receivers`, via Multicall3.aggregate3().
-/// `allowFailure: true` per call means one merchant's revert (already swept, lost the
-/// race to zero balance, etc.) doesn't take the rest of the batch down with it. Only
-/// call this for receivers you already know saw a deposit this cycle — unlike Solana's
-/// sweep instruction, every included call still costs gas on the batch regardless of
-/// whether that particular receiver had anything to sweep.
 pub async fn multicall_sweep(
     client: Arc<SignerProvider>,
     receivers: &[Address],
@@ -280,7 +272,48 @@ pub async fn multicall_sweep(
         });
     }
 
-    let multicall_caller = multicall.aggregate_3(calls);
+    let (suggested_max_fee, suggested_priority_fee) = client
+        .estimate_eip1559_fees(None)
+        .await
+        .context("failed to estimate EIP-1559 fees for multicall sweep")?;
+
+    let max_allowed_priority = ethers::utils::parse_units("0.05", "gwei")
+        .context("failed parsing priority fee ceiling")?;
+    let priority_fee = std::cmp::min(suggested_priority_fee, max_allowed_priority.into());
+
+    let max_fee_cap =
+        ethers::utils::parse_units("0.1", "gwei").context("failed parsing max fee cap")?;
+    let max_fee = std::cmp::min(suggested_max_fee, max_fee_cap.into());
+
+    let mut multicall_caller = multicall.aggregate_3(calls);
+
+    let estimated_gas = multicall_caller
+        .estimate_gas()
+        .await
+        .context("failed to estimate gas for multicall aggregate3")?;
+    let buffered_gas = estimated_gas * 130 / 100;
+
+    multicall_caller.tx.set_gas(buffered_gas);
+
+    if let Some(eip1559_req) = multicall_caller.tx.as_eip1559_mut() {
+        eip1559_req.max_priority_fee_per_gas = Some(priority_fee);
+        eip1559_req.max_fee_per_gas = Some(max_fee);
+    } else {
+        let legacy = multicall_caller.tx.clone();
+        multicall_caller.tx = TypedTransaction::Eip1559(Eip1559TransactionRequest {
+            from: legacy.from().copied(),
+            to: legacy.to().cloned(),
+            gas: Some(buffered_gas),
+            value: legacy.value().copied(),
+            data: legacy.data().cloned(),
+            nonce: legacy.nonce().copied(),
+            access_list: Default::default(),
+            max_priority_fee_per_gas: Some(priority_fee),
+            max_fee_per_gas: Some(max_fee),
+            chain_id: legacy.chain_id(),
+        });
+    }
+
     let pending = multicall_caller
         .send()
         .await

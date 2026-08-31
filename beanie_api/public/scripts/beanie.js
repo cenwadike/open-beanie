@@ -7,14 +7,14 @@
       name: "Base",
       kind: "evm",
       chainId: 8453,
-      rpc: "https://mainnet.base.org",
+      rpc: "https://base-mainnet.g.alchemy.com/v2/alch_ElnVnrKipwLUIRlEuAmno",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       explorerAddress: "https://basescan.org/address/",
     },
     STARKNET: {
       name: "Starknet",
       kind: "starknet",
-      rpc: "https://free-rpc.nethermind.io/mainnet-juno/v0_7",
+      rpc: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_ElnVnrKipwLUIRlEuAmno",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
       explorerAddress: "https://starkscan.co/contract/",
     },
@@ -65,8 +65,11 @@
   async function rpcCall(url, method, params) {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      headers: {
+        "content-type": "application/json",
+        "Origin": window.location.origin, // Guarantees origin presence for Alchemy domain restrictions
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
     });
     const json = await res.json();
     if (json.error) throw new Error(json.error.message || `${method} failed`);
@@ -296,10 +299,13 @@
     if (changed) { saveLanes(lanes); renderLanes(); }
   }
 
+  // Automatically update routing to point to /pay with full receiver params after lane creation:
   function laneShareUrl(lane) {
-    const url = new URL("/pay.html", window.location.origin);
+    const url = new URL("/pay", window.location.origin);
     url.searchParams.set("lane", lane.id);
-    for (const r of lane.receivers) url.searchParams.append("r", `${r.chain}:${r.address}`);
+    for (const r of lane.receivers) {
+      url.searchParams.append("r", `${r.chain}:${r.address}`);
+    }
     return url.toString();
   }
 
@@ -556,18 +562,13 @@
       const all = getLanes();
       all.unshift(record);
       saveLanes(all);
-      renderLanes();
-      notify("Payment lane created", "success", `${record.receivers.length} route${record.receivers.length === 1 ? "" : "s"} ready to poll.`);
 
-      const primary = record.receivers.find((r) => r.chain === targetChain) || record.receivers[0];
-      activeLane = record;
-      revealShareRoute();
-      if (primary) await showResultFor(record, primary);
-      pollAllLanes();
+      // Immediately redirect to main page with lane parameters attached
+      window.location.href = laneShareUrl(record);
+      pollAllLanes()
     } catch (error) {
       console.error("[beanie] Submission error:", error);
       notify("Could not create payment lane", "error", error.message || "");
-    } finally {
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Create Payment Lane";

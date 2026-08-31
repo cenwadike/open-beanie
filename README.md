@@ -66,7 +66,7 @@ Because `registerMerchant`/`register_merchant` are already permissionless on-cha
 
 ## Frontend
 
-Served from `beanie_api/public/`. `beanie.html` is the lane-creation flow (pick a settlement chain, get a receiver address + QR code, poll for deposits); `pay.html` is the customer-facing payment page for a shared lane link. Balance polling reads directly from public RPCs — a balance increase on a Starknet receiver is reported as "deposit detected" without distinguishing a plain transfer from an unshielding one, since the contract itself doesn't distinguish them either.
+Served from `beanie_api/public/`. `beanie.html` is the lane-creation flow (pick a settlement chain, get a receiver address, poll for deposits); `pay.html` is the customer-facing payment page for a shared lane link. Balance polling reads directly from public RPCs — a balance increase on a Starknet receiver is reported as "deposit detected" without distinguishing a plain transfer from an unshielding one, since the contract itself doesn't distinguish them either.
 
 ## Local setup
 
@@ -95,7 +95,7 @@ forge test
 ### Keeper
 
 ```bash
-cd evm_keeper
+cd beanie_keeper
 cp .env.example .env   # RPC URLs, factory/token/registry addresses for BOTH chains
 cargo check
 cargo run
@@ -127,11 +127,11 @@ cargo run
 | `evm_beanie/src/ChainXReceiver.sol` | Per-merchant EVM receiver: fee split + CCTP burn or same-chain transfer |
 | `evm_beanie/src/MerchantWebhookRegistry.sol` | The single, chain-agnostic webhook URL registry |
 | `evm_beanie/test/ReceiverFactory.t.sol` | Foundry tests for the EVM factory and receiver |
-| `evm_keeper/src/main.rs` | Dual-chain sweep loops (Base + Starknet), run concurrently from one process |
-| `evm_keeper/src/config.rs` | Per-chain environment/config schema |
-| `evm_keeper/src/sweep_evm.rs` | Base-side log scanning, chunk loops, and Multicall3 sweep compilation |
-| `evm_keeper/src/sweep_starknet.rs` | Starknet-side event scanning and multicall sweep compilation |
-| `evm_keeper/src/webhook.rs` | Dual signature scheme (EIP-191 / Starknet-native) + signed webhook delivery |
+| `beanie_keeper/src/main.rs` | Dual-chain sweep loops (Base + Starknet), run concurrently from one process |
+| `beanie_keeper/src/config.rs` | Per-chain environment/config schema |
+| `beanie_keeper/src/sweep_evm.rs` | Base-side log scanning, chunk loops, and Multicall3 sweep compilation |
+| `beanie_keeper/src/sweep_starknet.rs` | Starknet-side event scanning and multicall sweep compilation |
+| `beanie_keeper/src/webhook.rs` | Dual signature scheme (EIP-191 / Starknet-native) + signed webhook delivery |
 | `beanie_api/src/main.rs` | Boots the EVM + Starknet clients, the deploy worker, and the HTTP server |
 | `beanie_api/src/routes.rs` | `POST /api/v1/lanes/init` + static frontend fallback |
 | `beanie_api/src/worker.rs` | Background on-chain registration across both chains, plus webhook registration |
