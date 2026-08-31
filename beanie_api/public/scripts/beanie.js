@@ -1,10 +1,7 @@
 (() => {
   "use strict";
 
-  /* ---------- Config ----------
-   * Base and Starknet only, per the current contract set. Solana stays in the
-   * <select> markup but is disabled below until a real receiver exists for it.
-   */
+  /* ---------- Config ---------- */
   const CHAINS = {
     BASE: {
       name: "Base",
@@ -17,16 +14,15 @@
     STARKNET: {
       name: "Starknet",
       kind: "starknet",
-      rpc: "https://starknet-mainnet.public.blastapi.io/rpc/v0_7",
-      // TODO: the token contract the ShieldInAnonymizer pool actually holds balances in.
-      usdc: "",
+      rpc: "https://free-rpc.nethermind.io/mainnet-juno/v0_7",
+      usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
       explorerAddress: "https://starkscan.co/contract/",
     },
   };
+
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
   const POLL_INTERVAL_MS = 20000;
-  // Standard Starknet "balanceOf" entry-point selector (get_selector_from_name("balanceOf")).
   const STARKNET_BALANCEOF_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
 
   const STORAGE_LANES = "beanie.lanes.v1";
@@ -130,12 +126,50 @@
   }
 
   /* ---------- wallet-address validation ---------- */
-  const isValidEvmAddress = (v) => /^0x[a-fA-F0-9]{40}$/.test(v);
-  const isValidStarknetAddress = (v) => /^(0x)?[a-fA-F0-9]{1,64}$/.test(v);
+  const EVM_MAGNITUDE_LIMIT = 1n << 160n;
+  const STARK_PRIME = (1n << 251n) + (17n * (1n << 192n)) + 1n;
+
+  function isValidEvmAddress(v) {
+    if (typeof v !== "string" || !v.startsWith("0x")) return false;
+    const hex = v.slice(2);
+    if (hex.length !== 40) return false;
+    try {
+      const val = BigInt(`0x${hex}`);
+      return val < EVM_MAGNITUDE_LIMIT;
+    } catch {
+      return false;
+    }
+  }
+
+  function isValidStarknetAddress(v) {
+    if (typeof v !== "string" || !v) return false;
+    const hex = (v.startsWith("0x") || v.startsWith("0X")) ? v.slice(2) : v;
+    if (hex.length < 1 || hex.length > 64) return false;
+    try {
+      const val = BigInt(`0x${hex}`);
+      return val >= EVM_MAGNITUDE_LIMIT && val < STARK_PRIME;
+    } catch {
+      return false;
+    }
+  }
+
   function walletMatchesChain(chainKey, value) {
     if (CHAINS[chainKey]?.kind === "evm") return isValidEvmAddress(value);
     if (CHAINS[chainKey]?.kind === "starknet") return isValidStarknetAddress(value);
     return false;
+  }
+
+  /* ---------- URL sanitization ---------- */
+  function sanitizeWebhookUrl(raw) {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) return { ok: true, value: null };
+    let parsed;
+    try { parsed = new URL(trimmed); }
+    catch { return { ok: false, error: "Webhook URL is not a valid URL." }; }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { ok: false, error: "Webhook URL must use http or https." };
+    }
+    return { ok: true, value: parsed.toString() };
   }
 
   /* ---------- backend API ---------- */
@@ -191,7 +225,10 @@
   /* ---------- toasts ---------- */
   function notify(title, tone = "info", detail = "") {
     const stack = $("#toastStack");
-    if (!stack) return;
+    if (!stack) {
+      console.warn(`[notify] ${tone.toUpperCase()}: ${title} - ${detail}`);
+      return;
+    }
     const toast = el("div", `live-toast ${tone}`, `
       <span class="live-toast-icon">${tone === "success" ? "✓" : tone === "error" ? "!" : "i"}</span>
       <div>
@@ -200,12 +237,12 @@
       </div>
       <button class="live-toast-close" type="button" aria-label="Dismiss">×</button>
     `);
-    toast.querySelector(".live-toast-close").addEventListener("click", () => toast.remove());
+    toast.querySelector(".live-toast-close")?.addEventListener("click", () => toast.remove());
     stack.append(toast);
     setTimeout(() => toast.remove(), 7000);
   }
 
-  /* ---------- unread-deposit pulse dot on the History button ---------- */
+  /* ---------- UI State & Execution ---------- */
   function historyToggleBtn() {
     return document.querySelector(".history-btn:not(.receivers-btn)");
   }
@@ -233,7 +270,6 @@
     if (dot) dot.hidden = pendingDepositCount() === 0;
   }
 
-  /* ---------- chain icons (Base + Starknet only) ---------- */
   const chainIcons = {
     BASE: `<svg viewBox="0 0 42 42" width="24" height="24" aria-hidden="true">
       <circle cx="21" cy="21" r="21" fill="#0052ff"/>
@@ -246,7 +282,6 @@
   };
   const chainLabel = (chainKey) => CHAINS[chainKey]?.name || chainKey;
 
-  /* ---------- lane status helpers ---------- */
   function setReceiverStatus(chain, address, status) {
     const lanes = getLanes();
     let changed = false;
@@ -261,7 +296,6 @@
     if (changed) { saveLanes(lanes); renderLanes(); }
   }
 
-  /* ---------- rendering: Lanes modal ---------- */
   function laneShareUrl(lane) {
     const url = new URL("/pay.html", window.location.origin);
     url.searchParams.set("lane", lane.id);
@@ -288,7 +322,7 @@
         <button class="receiver-copy" type="button" aria-label="Copy pay link">⧉</button>
       `);
       row.style.gridTemplateColumns = "24px 1fr auto auto";
-      row.querySelector(".receiver-copy").addEventListener("click", async () => {
+      row.querySelector(".receiver-copy")?.addEventListener("click", async () => {
         try { await navigator.clipboard.writeText(laneUrl); notify("Pay link copied"); }
         catch { notify("Copy failed", "error"); }
       });
@@ -298,7 +332,6 @@
 
   function escapeAttr(value) { return escapeHtml(value).replace(/`/g, "&#096;"); }
 
-  /* ---------- rendering: History modal ---------- */
   let historyFilterChain = "ALL";
 
   function renderHistoryChainMenu() {
@@ -363,51 +396,49 @@
     updateHistoryChainControl();
     renderHistoryChainMenu();
     renderHistory();
-    $("#historyModal").classList.add("open");
+    $("#historyModal")?.classList.add("open");
     setSeenAt(Date.now());
     refreshNotifyDot();
   }
 
-  /* ---------- Share Route: hidden until a lane exists ---------- */
   function revealShareRoute() {
     $("#shareBtn")?.classList.remove("is-hidden");
   }
 
-  /* ---------- checkout panel on the create page ---------- */
   let activeLane = null;
   let activeReceiver = null;
 
   async function showResultFor(lane, receiver) {
     activeLane = lane;
     activeReceiver = receiver;
-    $("#address").textContent = receiver.address;
-    $("#routeSummary").textContent = `USDC lands on ${chainLabel(lane.targetChain)}`;
-    $("#statusLine").textContent = "Waiting for chain confirmation...";
-    $("#qrWrap").classList.add("pending");
-    $("#result").classList.add("visible");
-    $("#result").classList.remove("locked");
+    const addrEl = $("#address");
+    if (addrEl) addrEl.textContent = receiver.address;
+
+    const summaryEl = $("#routeSummary");
+    if (summaryEl) summaryEl.textContent = `USDC lands on ${chainLabel(lane.targetChain)}`;
+
+    const statusEl = $("#statusLine");
+    if (statusEl) statusEl.textContent = "Waiting for chain confirmation...";
+
+    $("#qrWrap")?.classList.add("pending");
+    $("#result")?.classList.add("visible");
+    $("#result")?.classList.remove("locked");
     document.querySelector(".stage")?.classList.add("created");
-    await renderQr($("#qr"), paymentUri(receiver.chain, receiver.address));
-    $("#qrLink").href = paymentUri(receiver.chain, receiver.address);
+
+    const qrImg = $("#qr");
+    if (qrImg) await renderQr(qrImg, paymentUri(receiver.chain, receiver.address));
+
+    const qrLink = $("#qrLink");
+    if (qrLink) qrLink.href = paymentUri(receiver.chain, receiver.address);
+
     const exists = await contractExists(receiver.chain, receiver.address).catch(() => false);
     if (exists) {
       setReceiverStatus(receiver.chain, receiver.address, "active");
-      $("#statusLine").textContent = "Ready to receive USDC.";
-      $("#qrWrap").classList.remove("pending");
+      if (statusEl) statusEl.textContent = "Ready to receive USDC.";
+      $("#qrWrap")?.classList.remove("pending");
     }
   }
 
-  /* ---------- background polling: deployment confirmation + deposit detection ----------
-   * Deliberately simple: poll public RPCs on an interval instead of running a
-   * websocket/event-subscription stack. Both ChainXReceiver (Base) and
-   * ShieldInAnonymizer (Starknet) hold the token balance until swept/shielded,
-   * so a balance-delta increase reliably means "deposit detected" on either
-   * chain. A balance *decrease* does NOT mean the same thing on both:
-   *   - Base:     sweep() sent the funds onward (same-chain or CCTP burn).
-   *   - Starknet: privacy_invoke() shielded the funds into a stealth note —
-   *               the merchant hasn't been paid yet; that happens later via
-   *               BridgeOutAnonymizer, which this balance poll can't see.
-   */
   async function pollDeposits(chain, address) {
     let balance;
     try { balance = await tokenBalance(chain, address); } catch { return; }
@@ -423,14 +454,10 @@
       notify("Deposit detected", "success", `${formatUsdc(balance - previous)} USDC on ${chainLabel(chain)}`);
       refreshNotifyDot();
       if (activeReceiver?.chain === chain && activeReceiver?.address === address) {
-        $("#statusLine").textContent = "Payment received.";
+        const statusEl = $("#statusLine");
+        if (statusEl) statusEl.textContent = "Payment received.";
       }
     } else if (balance < previous) {
-      // Base: sweep() ran — funds actually left for the merchant (same-chain)
-      // or CCTP (cross-chain). Starknet: privacy_invoke() ran instead — the
-      // balance moved into a stealth note in the STRK20 pool, not to the
-      // merchant. The real payout happens later via BridgeOutAnonymizer,
-      // which we have no visibility into from this receiver's balance.
       if (chain === "BASE") {
         notify("Funds settled", "success", `${chainLabel(chain)} lane swept to your wallet.`);
       } else {
@@ -455,9 +482,8 @@
     getLanes().forEach((lane) => pollLane(lane).catch(() => { }));
   }
 
-  /* ---------- settlement-chain <select>: Base + Starknet only ---------- */
   function restrictChainSelect() {
-    const select = $("#settlementChain");
+    const select = $("#settlementChain") || $("#targetChain");
     if (!select) return;
     const solanaOption = select.querySelector('option[value="solana"]');
     if (solanaOption) {
@@ -466,38 +492,58 @@
     }
   }
 
-  /* ---------- form ---------- */
+  /* ---------- Unified Form Submission ---------- */
   async function handleSubmit(event) {
-    event.preventDefault();
-    const wallet = $("#wallet");
-    const settlementChain = $("#settlementChain");
-    const webhookUrl = $("#webhookUrl").value.trim();
-    const merchantAddress = wallet.value.trim();
-    const chainOption = settlementChain.value;
-    const targetChain = OPTION_TO_CHAIN[chainOption];
+    if (event) event.preventDefault();
 
-    wallet.classList.remove("invalid");
+    const btn = $("#createReceiverBtn") || $("#submitBtn");
+    if (btn?.disabled) return;
 
-    if (!targetChain) {
+    // Safely extract inputs across differing markup structures
+    const walletEl = $("#wallet") || $("#merchantAddress");
+    const settlementEl = $("#settlementChain") || $("#targetChain");
+    const webhookEl = $("#webhookUrl");
+
+    const merchantAddress = walletEl?.value?.trim() || "";
+    const chainOption = settlementEl?.value || "";
+    const targetChain = OPTION_TO_CHAIN[chainOption] || chainOption.toUpperCase();
+
+    if (walletEl) walletEl.classList.remove("invalid");
+
+    if (!targetChain || !CHAINS[targetChain]) {
       notify("Choose a settlement chain", "error", "Base and Starknet are supported right now.");
       return;
     }
+
     if (!merchantAddress || !walletMatchesChain(targetChain, merchantAddress)) {
-      wallet.classList.add("invalid");
+      if (walletEl) walletEl.classList.add("invalid");
       notify("Check your wallet address", "error", `Enter a valid ${chainLabel(targetChain)} address.`);
       return;
     }
 
-    const btn = $("#createReceiverBtn");
-    btn.disabled = true;
-    btn.textContent = "Creating…";
+    const webhookResult = sanitizeWebhookUrl(webhookEl?.value || "");
+    if (!webhookResult.ok) {
+      notify("Check your webhook URL", "error", webhookResult.error);
+      return;
+    }
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Creating…";
+    }
+
     try {
-      const lanes = await createLane({ merchantAddress, targetChain, webhookUrl });
+      const lanes = await createLane({
+        merchantAddress,
+        targetChain,
+        webhookUrl: webhookResult.value,
+      });
+
       const record = {
         id: `lane_${Date.now()}`,
         merchantAddress,
         targetChain,
-        webhookUrl,
+        webhookUrl: webhookResult.value,
         createdAt: Date.now(),
         receivers: lanes.map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
@@ -506,6 +552,7 @@
           status: "pending",
         })),
       };
+
       const all = getLanes();
       all.unshift(record);
       saveLanes(all);
@@ -518,74 +565,48 @@
       if (primary) await showResultFor(record, primary);
       pollAllLanes();
     } catch (error) {
+      console.error("[beanie] Submission error:", error);
       notify("Could not create payment lane", "error", error.message || "");
     } finally {
-      btn.disabled = false;
-      btn.textContent = "Create Payment Lane";
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Create Payment Lane";
+      }
     }
   }
 
-  /* ---------- wire up ---------- */
+  /* ---------- Event Listeners ---------- */
   $("#receiverForm")?.addEventListener("submit", handleSubmit);
-  $("#createReceiverBtn")?.addEventListener("click", handleSubmit);
+  $("#laneForm")?.addEventListener("submit", handleSubmit);
 
-  $("#laneForm")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
+  // Bind click only if button isn't nested inside a handled form
+  const createBtn = $("#createReceiverBtn") || $("#submitBtn");
+  if (createBtn && !createBtn.closest("form")) {
+    createBtn.addEventListener("click", handleSubmit);
+  }
 
-    const submitBtn = $("#submitBtn");
-    if (submitBtn) submitBtn.disabled = true;
-
-    try {
-      const merchantAddress = $("#merchantAddress")?.value.trim();
-      const rawTarget = $("#targetChain")?.value;
-      const targetChain = OPTION_TO_CHAIN[rawTarget] || rawTarget?.toUpperCase();
-      const webhookUrl = $("#webhookUrl")?.value.trim();
-
-      if (!merchantAddress || !targetChain) {
-        throw new Error("Please enter a valid merchant address and target chain.");
-      }
-
-      const lanes = await createLane({ merchantAddress, targetChain, webhookUrl });
-
-      const record = {
-        id: `lane_${Date.now()}`,
-        merchantAddress,
-        targetChain,
-        webhookUrl,
-        createdAt: Date.now(),
-        receivers: lanes.map((l) => ({
-          chain: String(l.chain || "").toUpperCase(),
-          address: l.address,
-          isPrivacy: Boolean(l.is_privacy_lane),
-          status: "pending",
-        })),
-      };
-
-      const all = getLanes();
-      all.unshift(record);
-      saveLanes(all);
-      renderLanes();
-      notify("Payment lane created", "success");
-    } catch (err) {
-      notify(err.message || "Failed to create lane", "error");
-    } finally {
-      if (submitBtn) submitBtn.disabled = false;
+  const selectEl = $("#settlementChain") || $("#targetChain");
+  selectEl?.addEventListener("change", () => {
+    const rawVal = selectEl.value;
+    const targetChain = OPTION_TO_CHAIN[rawVal] || rawVal?.toUpperCase();
+    const summaryEl = $("#routeSummary");
+    if (summaryEl) {
+      summaryEl.textContent = targetChain ? `USDC lands on ${chainLabel(targetChain)}` : "USDC lands on Starknet";
+    }
+    const walletEl = $("#wallet") || $("#merchantAddress");
+    if (walletEl && walletEl.value.trim()) {
+      walletEl.classList.toggle("invalid", !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim()));
     }
   });
 
-  $("#settlementChain")?.addEventListener("change", () => {
-    const targetChain = OPTION_TO_CHAIN[$("#settlementChain").value];
-    $("#routeSummary").textContent = targetChain ? `USDC lands on ${chainLabel(targetChain)}` : "USDC lands on Starknet";
-  });
-
   historyToggleBtn()?.addEventListener("click", openHistory);
-  $("#closeHistoryModal")?.addEventListener("click", () => $("#historyModal").classList.remove("open"));
-  $("#historyModal")?.addEventListener("click", (e) => { if (e.target.id === "historyModal") $("#historyModal").classList.remove("open"); });
+  $("#closeHistoryModal")?.addEventListener("click", () => $("#historyModal")?.classList.remove("open"));
+  $("#historyModal")?.addEventListener("click", (e) => { if (e.target.id === "historyModal") $("#historyModal")?.classList.remove("open"); });
 
   $("#historyChainSelect")?.addEventListener("click", (e) => {
     e.stopPropagation();
     renderHistoryChainMenu();
-    $("#historyChainMenu").classList.toggle("open");
+    $("#historyChainMenu")?.classList.toggle("open");
   });
   $("#historyChainMenu")?.addEventListener("click", (e) => {
     const option = e.target.closest(".history-chain-option");
@@ -593,7 +614,7 @@
     historyFilterChain = option.dataset.chain;
     updateHistoryChainControl();
     renderHistoryChainMenu();
-    $("#historyChainMenu").classList.remove("open");
+    $("#historyChainMenu")?.classList.remove("open");
     renderHistory();
   });
   document.addEventListener("click", (e) => {
@@ -602,13 +623,13 @@
     }
   });
 
-  $("#receiversBtn")?.addEventListener("click", () => { renderLanes(); $("#receiversModal").classList.add("open"); });
-  $("#closeReceiversModal")?.addEventListener("click", () => $("#receiversModal").classList.remove("open"));
-  $("#receiversModal")?.addEventListener("click", (e) => { if (e.target.id === "receiversModal") $("#receiversModal").classList.remove("open"); });
+  $("#receiversBtn")?.addEventListener("click", () => { renderLanes(); $("#receiversModal")?.classList.add("open"); });
+  $("#closeReceiversModal")?.addEventListener("click", () => $("#receiversModal")?.classList.remove("open"));
+  $("#receiversModal")?.addEventListener("click", (e) => { if (e.target.id === "receiversModal") $("#receiversModal")?.classList.remove("open"); });
 
   $("#backBtn")?.addEventListener("click", () => {
     document.querySelector(".stage")?.classList.remove("created");
-    $("#result").classList.remove("visible");
+    $("#result")?.classList.remove("visible");
   });
 
   $("#copyBtn")?.addEventListener("click", async () => {

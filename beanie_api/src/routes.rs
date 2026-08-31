@@ -4,10 +4,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
-use ethers::abi::Abi;
 use ethers::contract::Contract;
 use ethers::providers::{Http, Provider};
 use ethers::types::Address;
+use ethers::{abi::Abi, utils::keccak256};
 use starknet::core::utils::get_selector_from_name;
 use starknet::providers::{JsonRpcClient, Provider as StarknetProvider};
 use starknet::{
@@ -31,7 +31,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub limiter: Arc<DualRateLimiter>,
     pub http_cache: Arc<HttpResponseCache>,
-    pub deploy_tx: mpsc::Sender<DeployTask>,
+    pub deploy_tx: Arc<mpsc::Sender<DeployTask>>,
     pub evm_provider: Arc<Provider<Http>>,
     pub starknet_provider: Arc<JsonRpcClient<HttpTransport>>,
 }
@@ -104,11 +104,31 @@ pub async fn init_lane(
     let mut lane_results = Vec::new();
 
     for chain in &source_chains {
+        // Whether funds actually settle here (the merchant's real wallet)
+        // vs. this being a pass-through receiver that forwards on to the
+        // target chain via CCTP. Only the target gets strict, fallback-free
+        // address parsing — see identity::resolve_evm_identity's doc comment
+        // for why silently hash-deriving a settlement address would be a
+        // fund-loss footgun.
+        let is_target = *chain == payload.target_chain;
+
         let predicted_address = match chain {
             Chain::Base | Chain::Ethereum => {
-                let parsed_merchant = match Address::from_str(merchant_address) {
-                    Ok(addr) => addr,
-                    Err(_) => return err(StatusCode::BAD_REQUEST, "Invalid EVM merchant address"),
+                let parsed_merchant = if is_target {
+                    match Address::from_str(merchant_address) {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "Settlement (target) chain address must be a valid EVM address",
+                            );
+                        }
+                    }
+                } else {
+                    merchant_address.parse().unwrap_or_else(|_| {
+                        let hash = keccak256(merchant_address.as_bytes());
+                        Address::from_slice(&hash[12..32])
+                    })
                 };
 
                 let abi: Abi =
@@ -148,10 +168,10 @@ pub async fn init_lane(
                         format!("0x{}", merchant_address.to_lowercase())
                     };
 
-                let merchant_pubkey = match Felt::from_hex(&hex_str) {
+                let parsed_merchant = match Felt::from_hex(&hex_str) {
                     Ok(felt) => felt,
                     Err(_) => {
-                        return err(StatusCode::BAD_REQUEST, "Invalid Starknet merchant pubkey");
+                        return err(StatusCode::BAD_REQUEST, "Invalid Starknet merchant address");
                     }
                 };
 
@@ -159,7 +179,7 @@ pub async fn init_lane(
                     contract_address: state.config.starknet_factory_address,
                     entry_point_selector: get_selector_from_name("predict_receiver_address")
                         .expect("Valid selector"),
-                    calldata: vec![merchant_pubkey],
+                    calldata: vec![parsed_merchant],
                 };
 
                 match state
@@ -186,7 +206,7 @@ pub async fn init_lane(
                 }
             }
             Chain::Solana => {
-                format!("SOL_{}", &merchant_address[..6.min(merchant_address.len())])
+                unimplemented!();
             }
         };
 
@@ -217,6 +237,7 @@ pub async fn init_lane(
 
     (status, Json(response_body)).into_response()
 }
+
 /// Clean-URL static file server for `public/`:
 /// - `/`                     -> public/beanie.html
 /// - `/page`                 -> public/page.html   (canonical form)

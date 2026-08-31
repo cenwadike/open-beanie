@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Setup Bounded Channel and Background Deployment Worker
     let (deploy_tx, deploy_rx) = mpsc::channel::<DeployTask>(2048);
-
+    let deploy_tx = Arc::new(deploy_tx);
     tokio::spawn(run_deployment_worker(
         evm_client,
         starknet_account,
@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.starknet_factory_address,
         cfg.webhook_registry_address,
         deploy_rx,
+        deploy_tx.clone(),
     ));
 
     // 4. Router & Server Setup

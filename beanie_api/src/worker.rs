@@ -11,7 +11,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
-use ethers::types::Address;
 use ethers::utils::format_bytes32_string;
 #[allow(unused_imports)]
 use ethers::{
@@ -21,6 +20,7 @@ use ethers::{
     signers::LocalWallet,
     types::U256,
 };
+use ethers::{types::Address, utils::keccak256};
 
 use crate::models::{Chain, DeployTask};
 
@@ -115,9 +115,12 @@ pub async fn execute_onchain_deployment(
 ) -> Result<(), DeployError> {
     match task.chain {
         Chain::Base | Chain::Ethereum => {
-            let merchant_addr: Address = task.merchant_address.parse().map_err(|e| {
-                DeployError::Fatal(format!("Invalid EVM merchant_address string: {e}"))
-            })?;
+            let merchant_addr: Address = task.merchant_address.parse().unwrap_or_else(|_| {
+                // Universal Fallback: Hash the arbitrary non-evm address string to get a 32-byte digest
+                let hash = keccak256(task.merchant_address.as_bytes());
+                // Construct a valid 20-byte EVM Address from the last 20 bytes of the hash
+                Address::from_slice(&hash[12..32])
+            });
 
             let factory = MerchantFactory::new(evm_factory_addr, evm_client.clone());
 
@@ -256,13 +259,15 @@ pub async fn execute_onchain_deployment(
 
             if let (Some(url), Some(registry_addr)) = (&task.webhook_url, webhook_registry_addr) {
                 if !url.is_empty() {
-                    let merchant_evm_addr: Address = task.merchant_address.parse().map_err(|e| {
-                        DeployError::Fatal(format!(
-                            "Webhook registry needs an EVM-address-shaped merchant identity: {e}"
-                        ))
-                    })?;
-                    register_webhook(evm_client.clone(), registry_addr, merchant_evm_addr, url)
-                        .await?;
+                    let merchant_addr: Address =
+                        task.merchant_address.parse().unwrap_or_else(|_| {
+                            //  Universal Fallback: Hash the arbitrary string to get a 32-byte digest
+                            let hash = keccak256(task.merchant_address.as_bytes());
+
+                            // Construct a valid 20-byte EVM Address from the last 20 bytes of the hash
+                            Address::from_slice(&hash[12..32])
+                        });
+                    register_webhook(evm_client.clone(), registry_addr, merchant_addr, url).await?;
                 }
             }
 
@@ -282,6 +287,7 @@ pub async fn run_deployment_worker(
     starknet_factory_addr: Felt,
     webhook_registry_addr: Option<Address>,
     mut rx: mpsc::Receiver<DeployTask>,
+    tx: Arc<mpsc::Sender<DeployTask>>,
 ) {
     println!("Deployment worker active for EVM & Starknet...");
 
@@ -324,9 +330,10 @@ pub async fn run_deployment_worker(
                     .await;
                 } else {
                     eprintln!(
-                        "Exhausted retries on {:?} for {}: {}. Dropping task.",
+                        "Exhausted retries on {:?} for {}: {}. Requeue.",
                         task.chain, task.merchant_address, reason
                     );
+                    let _ = tx.send(task).await;
                 }
             }
         }

@@ -120,6 +120,10 @@ a {
   letter-spacing: 0;
 }
 
+.colon {
+  color: #d84fff;
+}
+
 .right-rail {
   position: fixed;
   top: 32px;

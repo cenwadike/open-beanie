@@ -88,8 +88,8 @@ impl StarknetConfig {
         Ok(Self {
             rpc_url: env("STARKNET_RPC_URL").context("missing STARKNET_RPC_URL")?,
             chain_name: "starknet".into(),
-            token_address: parse_felt_env("TOKEN_ADDRESS")?,
-            factory_address: parse_felt_env("FACTORY_ADDRESS")?,
+            token_address: parse_felt_env("STARKNET_TOKEN_ADDRESS")?,
+            factory_address: parse_felt_env("STARKNET_FACTORY_ADDRESS")?,
             webhook_registry_address: parse_felt_env("WEBHOOK_REGISTRY_ADDRESS")?,
             keeper_address: parse_felt_env("KEEPER_ADDRESS")?,
             keeper_wallet: wallet,
@@ -99,7 +99,9 @@ impl StarknetConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12),
             ),
-            start_block: env("START_BLOCK")?.parse().context("invalid START_BLOCK")?,
+            start_block: env("STARKNET_START_BLOCK")?
+                .parse()
+                .context("invalid START_BLOCK")?,
             registry_start_block: env("REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid REGISTRY_START_BLOCK")?,
@@ -144,8 +146,8 @@ impl EvmConfig {
         Ok(Self {
             rpc_url: env("RPC_URL")?,
             chain_name: "base".into(),
-            token_address: addr(&env("TOKEN_ADDRESS")?)?,
-            factory_address: addr(&env("FACTORY_ADDRESS")?)?,
+            token_address: addr(&env("BASE_TOKEN_ADDRESS")?)?,
+            factory_address: addr(&env("BASE_FACTORY_ADDRESS")?)?,
             registry_start_block: env("REGISTRY_START_BLOCK")?
                 .parse()
                 .context("REGISTRY_START_BLOCK must be a valid u64")?,
@@ -160,7 +162,7 @@ impl EvmConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12), // ~1 EVM block on most L2s; tune per chain
             ),
-            start_block: env("START_BLOCK")?
+            start_block: env("BASE_START_BLOCK")?
                 .parse()
                 .context("START_BLOCK must be a valid u64")?,
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")

@@ -441,7 +441,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut starknet_watermark = starknet_config.registry_start_block;
+    let mut starknet_watermark = starknet_config.start_block;
 
     // Starknet execution loop
     let starknet_handle = tokio::spawn(async move {

@@ -1,13 +1,16 @@
 {
   "transactions": [
-    "0x07c0...",
-    "0x04b2...",
-    "0x0919..."
+    {
+      "base_outbound": "0x172998f1682259a4fc790ac7919fbe93b7805c9d2296c74caf45c42600a9a95e",
+      "base_sweep": "0x45b18787ab8b6977796f63b9ffbe63a302dd2a7d4d71e6e16e139e48c5397f84",
+      "starknet_inbound": "0x76d06ba1baa8c57a77031308fdc3c51f8565f6f62aa08ff5e047ee904b20710"
+    }
   ],
   "contracts": {
     "starknet": {
-      "StarknetReceiver_class_hash": "0x04a26a0c634686af653f72dfa8a1e65e8c74dce085e9e6adb6f21804621754ca",
-      "MerchantFactory": "0x07AbEE2A0f0108075C35B2B249CD193E4246ca067D9C26f57c086b37fE55dc73"
+      "StarknetReceiverImpl": "0x04a26a0c634686af653f72dfa8a1e65e8c74dce085e9e6adb6f21804621754ca",
+      "MerchantFactory": "0x7abee2a0f0108075c35b2b249cd193e4246ca067d9c26f57c086b37fe55dc73",
+      "MerchantReceiver": "0x06035cbd7feeaf2130f93a5b702a2f73b34f52d7286be5bd27d439125fc7b9d0"
     },
     "base": {
       "ChainXReceiver": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
