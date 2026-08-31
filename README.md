@@ -1,6 +1,6 @@
 # Beanie
 
-A multichain, non-custodial, permissionless stablecoin payment gateway. A merchant registers one destination address and chain and gets dedicated, non-custodial receiving instances; deposits settle to them without Beanie ever holding custody of merchant funds. Starknet is one of the receiving chains, and its STRK20 privacy pool is available to any customer paying a Beanie merchant: routing a payment through an unshielding transfer delinks the deposit a customer makes from the deposit the receiver contract sees. Payments can also land on a STRK20 anonymizer address
+A multichain, non-custodial, permissionless stablecoin payment gateway. A merchant registers one destination address and chain and gets dedicated, non-custodial receiving instances; deposits settle to them without Beanie ever holding custody of merchant funds. Starknet is one of the receiving chains, and its STRK20 privacy pool is available to any customer paying a Beanie merchant: routing a payment through an unshielding transfer delinks the deposit a customer makes from the deposit the receiver contract sees. Payments can also land on a stealth address
 
 ## What this is
 
