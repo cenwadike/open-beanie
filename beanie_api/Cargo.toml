@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+beanie_keeper = { path = "../beanie_keeper" }
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.151", features = ["derive"] }
 anyhow = "1.0.104"
@@ -20,3 +21,5 @@ starknet-crypto = "0.8.1"
 tower-http = { version = "0.7.0", features = ["fs"] }
 tower = { version = "0.5.3", features = ["util"] }
 mime_guess = "2.0.5"
+webauthn-rs = "0.5.5"
+base64 = "0.23.1"

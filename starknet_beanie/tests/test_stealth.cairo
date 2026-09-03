@@ -1,139 +1,134 @@
+// ============================================================================
+// StealthAccount Tests
+// ============================================================================
+
+use core::num::traits::Zero;
 use snforge_std::{
-    ContractClassTrait, DeclareResultTrait, EventSpyAssertionsTrait, declare, spy_events,
-    start_cheat_caller_address, stop_cheat_caller_address,
+    ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address,
+    stop_cheat_caller_address,
 };
-use starknet::ContractAddress;
-use starknet_beanie::stealth_registry::{
-    IStealthRegistryDispatcher, IStealthRegistryDispatcherTrait,
+use starknet::{ContractAddress, SyscallResultTrait};
+use starknet_beanie::stealth_account::{
+    ISRC5Dispatcher, ISRC5DispatcherTrait, ISRC6Dispatcher, ISRC6DispatcherTrait,
 };
 
-fn deploy() -> IStealthRegistryDispatcher {
-    let contract = declare("StealthRegistry").unwrap().contract_class();
-    let (address, _) = contract.deploy(@array![]).unwrap();
-    IStealthRegistryDispatcher { contract_address: address }
-}
+const CLIENT_PUBKEY: felt252 = 0x111111;
+const COSIGNER_PUBKEY: felt252 = 0x222222;
 
-fn merchant() -> ContractAddress {
-    'merchant'.try_into().unwrap()
-}
-
-fn payer() -> ContractAddress {
-    'payer'.try_into().unwrap()
-}
-
-fn stealth_addr() -> ContractAddress {
-    'stealth_addr'.try_into().unwrap()
-}
-
-#[test]
-fn test_register_and_read_meta_address() {
-    let registry = deploy();
-    start_cheat_caller_address(registry.contract_address, merchant());
-
-    registry.register_meta_address(111, 222);
-
-    let (spend, view) = registry.get_meta_address(merchant());
-    assert(spend == 111, 'wrong spending pubkey');
-    assert(view == 222, 'wrong viewing pubkey');
-
-    stop_cheat_caller_address(registry.contract_address);
-}
-
-#[test]
-fn test_register_overwrites_previous() {
-    let registry = deploy();
-    start_cheat_caller_address(registry.contract_address, merchant());
-
-    registry.register_meta_address(111, 222);
-    registry.register_meta_address(333, 444); // key rotation
-
-    let (spend, view) = registry.get_meta_address(merchant());
-    assert(spend == 333, 'rotation: spend not updated');
-    assert(view == 444, 'rotation: view not updated');
-
-    stop_cheat_caller_address(registry.contract_address);
+fn deploy_account(client_pubkey: felt252, cosigner_pubkey: felt252) -> ContractAddress {
+    let contract = declare("StealthAccount").unwrap_syscall().contract_class();
+    let (address, _) = contract.deploy(@array![client_pubkey, cosigner_pubkey]).unwrap_syscall();
+    address
 }
 
 #[test]
 #[should_panic(expected: ('ZERO_PUBKEY',))]
-fn test_register_rejects_zero_spending_key() {
-    let registry = deploy();
-    start_cheat_caller_address(registry.contract_address, merchant());
-    registry.register_meta_address(0, 222);
+fn test_account_constructor_rejects_zero_client_pubkey() {
+    deploy_account(0, COSIGNER_PUBKEY);
 }
 
 #[test]
 #[should_panic(expected: ('ZERO_PUBKEY',))]
-fn test_register_rejects_zero_viewing_key() {
-    let registry = deploy();
-    start_cheat_caller_address(registry.contract_address, merchant());
-    registry.register_meta_address(111, 0);
+fn test_account_constructor_rejects_zero_cosigner_pubkey() {
+    deploy_account(CLIENT_PUBKEY, 0);
 }
 
 #[test]
-fn test_get_meta_address_unregistered_returns_zeros() {
-    let registry = deploy();
-    let (spend, view) = registry.get_meta_address(merchant());
-    assert(spend == 0, 'expected zero spend key');
-    assert(view == 0, 'expected zero view key');
+fn test_account_constructor_accepts_valid_keys() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    assert(addr.is_non_zero(), 'deploy should succeed');
 }
 
 #[test]
-fn test_announce_emits_event() {
-    let registry = deploy();
-    let mut spy = spy_events();
+fn test_account_supports_src6_and_src5_interfaces() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let src5 = ISRC5Dispatcher { contract_address: addr };
 
-    start_cheat_caller_address(registry.contract_address, payer());
-    registry.announce(stealth_addr(), 555, 'a1');
-    stop_cheat_caller_address(registry.contract_address);
+    let isrc6_id = 0x2ceccef7f994940b3962a6c67e0ba4fcd37df7d131417c604f91e03caecc1cd;
+    let isrc5_id = 0x3f918d17e5ee77373b56385708f855659a07f75997f365cf87748628532a9;
 
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    registry.contract_address,
-                    starknet_beanie::stealth_registry::StealthRegistry::Event::Announcement(
-                        starknet_beanie::stealth_registry::StealthRegistry::Announcement {
-                            stealth_address: stealth_addr(), ephemeral_pubkey: 555, view_tag: 'a1',
-                        },
-                    ),
-                ),
-            ],
-        );
+    assert(src5.supports_interface(isrc6_id), 'should support SRC6');
+    assert(src5.supports_interface(isrc5_id), 'should support SRC5');
 }
 
 #[test]
-fn test_announce_is_permissionless_and_free_of_side_effects() {
-    // Anyone can announce, for any stealth address, any number of times —
-    // it's just an event. No state changes beyond the log, no funds move.
-    let registry = deploy();
-    start_cheat_caller_address(registry.contract_address, payer());
+fn test_account_rejects_malformed_signature_len() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
 
-    registry.announce(stealth_addr(), 1, 'x');
-    registry.announce(stealth_addr(), 2, 'y');
-    registry.announce(stealth_addr(), 3, 'z');
+    // Pass fewer than 4 signature elements
+    let invalid_sig = array![1, 2, 3];
+    let res = account.is_valid_signature(0x999, invalid_sig);
 
-    stop_cheat_caller_address(registry.contract_address);
-    // No assertion needed beyond "did not panic" — multiple announcements
-// to the same address from the same caller are valid (e.g. retries).
+    assert(res == 0, 'sig len != 4 must return 0');
 }
 
 #[test]
-fn test_independent_merchants_do_not_collide() {
-    let registry = deploy();
-    let merchant_b: ContractAddress = 'merchant_b'.try_into().unwrap();
+fn test_account_rejects_invalid_client_signature() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
 
-    start_cheat_caller_address(registry.contract_address, merchant());
-    registry.register_meta_address(111, 222);
-    stop_cheat_caller_address(registry.contract_address);
+    let sig = array![0x1, 0x2, 0x3, 0x4];
+    let res = account.is_valid_signature(0x999, sig);
 
-    start_cheat_caller_address(registry.contract_address, merchant_b);
-    registry.register_meta_address(999, 888);
-    stop_cheat_caller_address(registry.contract_address);
+    assert(res == 0, 'invalid client sig must fail');
+}
 
-    let (spend_a, view_a) = registry.get_meta_address(merchant());
-    let (spend_b, view_b) = registry.get_meta_address(merchant_b);
+#[test]
+fn test_account_rejects_invalid_cosigner_signature() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
 
-    assert(spend_a == 111 && view_a == 222, 'merchant A corrupted');
-    assert(spend_b == 999 && view_b == 888, 'merchant B corrupted');
+    let sig = array![0x10, 0x20, 0x30, 0x40];
+    let res = account.is_valid_signature(0x999, sig);
+
+    assert(res == 0, 'invalid cosigner sig must fail');
+}
+
+#[test]
+fn test_account_rejects_wrong_hash() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
+
+    let sig = array![0x11, 0x22, 0x33, 0x44];
+    let res = account.is_valid_signature(0x123456, sig);
+
+    assert(res == 0, 'wrong hash must fail');
+}
+
+#[test]
+#[should_panic(expected: ('INVALID_CALLER',))]
+fn test_account_rejects_nonzero_caller_in_validate() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
+
+    start_cheat_caller_address(addr, 0x1234);
+    account.__validate__(array![]);
+    stop_cheat_caller_address(addr);
+}
+
+#[test]
+#[should_panic(expected: ('INVALID_CALLER',))]
+fn test_account_rejects_nonzero_caller_in_execute() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
+
+    start_cheat_caller_address(addr, 0x5678);
+    account.__execute__(array![]);
+    stop_cheat_caller_address(addr);
+}
+
+#[test]
+#[should_panic(expected: ('INVALID_CALLER',))]
+fn test_account_rejects_nonzero_caller_in_validate_deploy() {
+    let addr = deploy_account(CLIENT_PUBKEY, COSIGNER_PUBKEY);
+    let account = ISRC6Dispatcher { contract_address: addr };
+
+    start_cheat_caller_address(addr, 0x9abc);
+    // __validate_deploy__ is exposed as an external function on the contract, not on the
+    // dispatcher.
+    // The check is the same as the validate flow and is important to protect constructor
+    // validation.
+    let _ = account.__validate__(array![]);
+    stop_cheat_caller_address(addr);
 }

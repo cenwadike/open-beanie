@@ -9,13 +9,15 @@
       chainId: 8453,
       rpc: "https://base-mainnet.g.alchemy.com/v2/alch_ElnVnrKipwLUIRlEuAmno",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      factory: "0x0000000000000000000000000000000000000000", // Deploy / Factory contract
       explorerAddress: "https://basescan.org/address/",
     },
     STARKNET: {
       name: "Starknet",
       kind: "starknet",
-      rpc: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_ElnVnrKipwLUIRlEuAmno",
+      rpc: "https://starknet-mainnet.public.blastapi.io",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
+      factory: "0x0000000000000000000000000000000000000000", // MerchantFactory contract
       explorerAddress: "https://starkscan.co/contract/",
     },
   };
@@ -23,7 +25,10 @@
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
   const POLL_INTERVAL_MS = 20000;
+
   const STARKNET_BALANCEOF_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
+  const STARKNET_PREDICT_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76"; // predict_receiver_address selector
+  const STARKNET_NONCE_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76"; // get_merchant_nonce selector
 
   const STORAGE_LANES = "beanie.lanes.v1";
   const STORAGE_HISTORY = "beanie.history.v1";
@@ -43,7 +48,7 @@
   }[c]));
   const short = (v) => (v && v.length > 16 ? `${v.slice(0, 8)}…${v.slice(-6)}` : v || "");
 
-  /* ---------- local storage ---------- */
+  /* ---------- Local storage ---------- */
   const readJson = (key, fallback) => {
     try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
     catch { return fallback; }
@@ -61,13 +66,13 @@
   const setSeenAt = (ts) => { try { localStorage.setItem(STORAGE_SEEN, String(ts)); } catch { /* noop */ } };
   const receiverKey = (chain, address) => `${chain}:${address}`.toLowerCase();
 
-  /* ---------- public-RPC reads ---------- */
+  /* ---------- Public-RPC reads ---------- */
   async function rpcCall(url, method, params) {
     const res = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "Origin": window.location.origin, // Guarantees origin presence for Alchemy domain restrictions
+        "Origin": window.location.origin,
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
     });
@@ -128,7 +133,56 @@
     return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
   }
 
-  /* ---------- wallet-address validation ---------- */
+  /* ---------- Client-side Address Prediction ---------- */
+  async function predictEvmReceiver(merchantAddress) {
+    const chain = CHAINS.BASE;
+    // 1. Read current nonce from MerchantFactory: getMerchantNonce(merchant)
+    const nonceData = `0x7b11d9a2${merchantAddress.replace(/^0x/i, "").padStart(64, "0")}`;
+    const nonceHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data: nonceData }, "latest"]);
+
+    // 2. Predict address: predictReceiverAddress(merchant, nonce)
+    const predictData = `0x3a4b9c1d${merchantAddress.replace(/^0x/i, "").padStart(64, "0")}${BigInt(nonceHex || "0").toString(16).padStart(64, "0")}`;
+    const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data: predictData }, "latest"]);
+
+    const address = `0x${predictedAddrHex.slice(-40)}`;
+    return { chain: "BASE", address, is_privacy_lane: false };
+  }
+
+  async function predictStarknetReceiver(merchantAddress) {
+    const chain = CHAINS.STARKNET;
+    // 1. Read current nonce from Cairo MerchantFactory contract
+    const nonceRes = await rpcCall(chain.rpc, "starknet_call", [
+      { contract_address: chain.factory, entry_point_selector: STARKNET_NONCE_SELECTOR, calldata: [merchantAddress] },
+      "latest",
+    ]);
+    const nonce = nonceRes?.[0] || "0x0";
+
+    // 2. Predict address from Cairo MerchantFactory contract
+    const predictRes = await rpcCall(chain.rpc, "starknet_call", [
+      { contract_address: chain.factory, entry_point_selector: STARKNET_PREDICT_SELECTOR, calldata: [merchantAddress, nonce] },
+      "latest",
+    ]);
+
+    return { chain: "STARKNET", address: predictRes?.[0] || "0x0", is_privacy_lane: true };
+  }
+
+  async function deriveLanes({ merchantAddress }) {
+    console.info("[beanie] Deriving payment lanes locally via RPC...");
+    const results = await Promise.all([
+      predictEvmReceiver(merchantAddress).catch((e) => {
+        console.error("Failed EVM prediction", e);
+        return null;
+      }),
+      predictStarknetReceiver(merchantAddress).catch((e) => {
+        console.error("Failed Starknet prediction", e);
+        return null;
+      }),
+    ]);
+
+    return results.filter(Boolean);
+  }
+
+  /* ---------- Wallet-address validation ---------- */
   const EVM_MAGNITUDE_LIMIT = 1n << 160n;
   const STARK_PRIME = (1n << 251n) + (17n * (1n << 192n)) + 1n;
 
@@ -162,7 +216,7 @@
     return false;
   }
 
-  /* ---------- URL sanitization ---------- */
+  /* ---------- URL Sanitization ---------- */
   function sanitizeWebhookUrl(raw) {
     const trimmed = (raw || "").trim();
     if (!trimmed) return { ok: true, value: null };
@@ -173,43 +227,6 @@
       return { ok: false, error: "Webhook URL must use http or https." };
     }
     return { ok: true, value: parsed.toString() };
-  }
-
-  /* ---------- backend API ---------- */
-  async function createLane({ merchantAddress, targetChain, webhookUrl }) {
-    const normalizedTargetChain = (targetChain || "").toUpperCase();
-
-    const body = {
-      merchant_address: merchantAddress,
-      target_chain: normalizedTargetChain,
-      source_chains: SOURCE_CHAINS,
-      enable_privacy: false,
-      webhook_url: webhookUrl || null,
-    };
-
-    console.info("[beanie] POST /api/v1/lanes/init", body);
-
-    const res = await fetch("/api/v1/lanes/init", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "Idempotency-Key": `lane_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-      },
-      body: JSON.stringify(body),
-    }).catch((err) => {
-      console.error("[beanie] Network error reaching API:", err);
-      throw err;
-    });
-
-    const payload = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-      console.error("[beanie] /api/v1/lanes/init failed", res.status, payload);
-      throw new Error(payload.error || payload.message || `HTTP ${res.status}`);
-    }
-
-    console.info("[beanie] /api/v1/lanes/init OK", payload);
-    return payload.lanes || [];
   }
 
   /* ---------- QR ---------- */
@@ -225,7 +242,7 @@
     } catch { imgEl.removeAttribute("src"); }
   }
 
-  /* ---------- toasts ---------- */
+  /* ---------- Toasts ---------- */
   function notify(title, tone = "info", detail = "") {
     const stack = $("#toastStack");
     if (!stack) {
@@ -299,10 +316,10 @@
     if (changed) { saveLanes(lanes); renderLanes(); }
   }
 
-  // Automatically update routing to point to /pay with full receiver params after lane creation:
   function laneShareUrl(lane) {
     const url = new URL("/pay", window.location.origin);
     url.searchParams.set("lane", lane.id);
+    url.searchParams.set("idx", lane.currentIndex || 0);
     for (const r of lane.receivers) {
       url.searchParams.append("r", `${r.chain}:${r.address}`);
     }
@@ -321,7 +338,7 @@
       const row = el("div", "receiver-row", `
         <span class="mini-icon">${chainIcons[lane.targetChain] || ""}</span>
         <span>
-          <div>${escapeHtml(short(lane.merchantAddress))}</div>
+          <div>${escapeHtml(short(lane.merchantAddress))} (Index #${lane.currentIndex || 0})</div>
           <div class="mono">settles on ${escapeHtml(chainLabel(lane.targetChain))} · ${lane.receivers.filter((r) => r.status === "active").length}/${lane.receivers.length} live</div>
         </span>
         <a class="receiver-link" href="${escapeAttr(laneUrl)}" target="_blank" rel="noreferrer">Pay page</a>
@@ -414,37 +431,6 @@
   let activeLane = null;
   let activeReceiver = null;
 
-  async function showResultFor(lane, receiver) {
-    activeLane = lane;
-    activeReceiver = receiver;
-    const addrEl = $("#address");
-    if (addrEl) addrEl.textContent = receiver.address;
-
-    const summaryEl = $("#routeSummary");
-    if (summaryEl) summaryEl.textContent = `USDC lands on ${chainLabel(lane.targetChain)}`;
-
-    const statusEl = $("#statusLine");
-    if (statusEl) statusEl.textContent = "Waiting for chain confirmation...";
-
-    $("#qrWrap")?.classList.add("pending");
-    $("#result")?.classList.add("visible");
-    $("#result")?.classList.remove("locked");
-    document.querySelector(".stage")?.classList.add("created");
-
-    const qrImg = $("#qr");
-    if (qrImg) await renderQr(qrImg, paymentUri(receiver.chain, receiver.address));
-
-    const qrLink = $("#qrLink");
-    if (qrLink) qrLink.href = paymentUri(receiver.chain, receiver.address);
-
-    const exists = await contractExists(receiver.chain, receiver.address).catch(() => false);
-    if (exists) {
-      setReceiverStatus(receiver.chain, receiver.address, "active");
-      if (statusEl) statusEl.textContent = "Ready to receive USDC.";
-      $("#qrWrap")?.classList.remove("pending");
-    }
-  }
-
   async function pollDeposits(chain, address) {
     let balance;
     try { balance = await tokenBalance(chain, address); } catch { return; }
@@ -505,7 +491,6 @@
     const btn = $("#createReceiverBtn") || $("#submitBtn");
     if (btn?.disabled) return;
 
-    // Safely extract inputs across differing markup structures
     const walletEl = $("#wallet") || $("#merchantAddress");
     const settlementEl = $("#settlementChain") || $("#targetChain");
     const webhookEl = $("#webhookUrl");
@@ -539,16 +524,17 @@
     }
 
     try {
-      const lanes = await createLane({
-        merchantAddress,
-        targetChain,
-        webhookUrl: webhookResult.value,
-      });
+      const all = getLanes();
+      const currentIndex = all.length;
+
+      // Predict lanes directly via RPC on client side
+      const lanes = await deriveLanes({ merchantAddress });
 
       const record = {
         id: `lane_${Date.now()}`,
         merchantAddress,
         targetChain,
+        currentIndex,
         webhookUrl: webhookResult.value,
         createdAt: Date.now(),
         receivers: lanes.map((l) => ({
@@ -559,13 +545,11 @@
         })),
       };
 
-      const all = getLanes();
       all.unshift(record);
       saveLanes(all);
 
-      // Immediately redirect to main page with lane parameters attached
       window.location.href = laneShareUrl(record);
-      pollAllLanes()
+      pollAllLanes();
     } catch (error) {
       console.error("[beanie] Submission error:", error);
       notify("Could not create payment lane", "error", error.message || "");
@@ -580,7 +564,6 @@
   $("#receiverForm")?.addEventListener("submit", handleSubmit);
   $("#laneForm")?.addEventListener("submit", handleSubmit);
 
-  // Bind click only if button isn't nested inside a handled form
   const createBtn = $("#createReceiverBtn") || $("#submitBtn");
   if (createBtn && !createBtn.closest("form")) {
     createBtn.addEventListener("click", handleSubmit);
@@ -648,7 +631,7 @@
 
   $("#openRelayBtn")?.addEventListener("click", () => notify("Gasless transfer", "info", "Coming soon."));
 
-  /* ---------- init ---------- */
+  /* ---------- Init ---------- */
   restrictChainSelect();
   renderLanes();
   refreshNotifyDot();

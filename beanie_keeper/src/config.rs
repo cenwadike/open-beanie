@@ -66,11 +66,8 @@ pub struct StarknetConfig {
     pub chain_name: String,
     pub token_address: Felt,
     pub factory_address: Felt,
-    pub webhook_registry_address: Felt,
     pub keeper_address: Felt,
     pub keeper_wallet: StarknetLocalWallet,
-    pub poll_interval: Duration,
-    pub start_block: u64,
     pub registry_start_block: u64,
     pub webhook_registry_start_block: u64,
     pub log_chunk_blocks: u64,
@@ -90,24 +87,14 @@ impl StarknetConfig {
             chain_name: "starknet".into(),
             token_address: parse_felt_env("STARKNET_TOKEN_ADDRESS")?,
             factory_address: parse_felt_env("STARKNET_FACTORY_ADDRESS")?,
-            webhook_registry_address: parse_felt_env("WEBHOOK_REGISTRY_ADDRESS")?,
             keeper_address: parse_felt_env("STARKNET_KEEPER_ADDRESS")?,
             keeper_wallet: wallet,
-            poll_interval: Duration::from_secs(
-                env("POLL_INTERVAL_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(12),
-            ),
-            start_block: env("STARKNET_START_BLOCK")?
+            registry_start_block: env("STARKNET_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid START_BLOCK")?,
-            registry_start_block: env("STARKNET_START_BLOCK")?
+            webhook_registry_start_block: env("STARKNET_WEBHOOK_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid REGISTRY_START_BLOCK")?,
-            webhook_registry_start_block: env("WEBHOOK_REGISTRY_START_BLOCK")?
-                .parse()
-                .context("invalid WEBHOOK_REGISTRY_START_BLOCK")?,
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -128,6 +115,7 @@ pub struct EvmConfig {
     pub token_address: Address, // the stablecoin ERC20 contract
     pub factory_address: Address, // Beanie's EVM MerchantFactory
     pub registry_start_block: u64, // block MerchantFactory was deployed at
+    pub deposit_start_block: u64, // deposit-scan watermark
     pub webhook_registry_address: Address, // MerchantWebhookRegistry
     pub webhook_registry_start_block: u64, // block MerchantWebhookRegistry was deployed at
     // Same keypair as sweep_private_key, parsed once here without a chain ID (message
@@ -137,7 +125,6 @@ pub struct EvmConfig {
     // the `from` on every sweep tx. One identity, nothing separate to publish.
     pub keeper_wallet: EvmLocalWallet,
     pub poll_interval: Duration,
-    pub start_block: u64,      // deposit-scan watermark
     pub log_chunk_blocks: u64, // most RPC providers cap eth_getLogs to a block range — confirm the real limit for your provider before trusting this
 }
 
@@ -162,7 +149,7 @@ impl EvmConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12), // ~1 EVM block on most L2s; tune per chain
             ),
-            start_block: env("BASE_START_BLOCK")?
+            deposit_start_block: env("BASE_DEPOSIT_START_BLOCK")?
                 .parse()
                 .context("BASE_START_BLOCK must be a valid u64")?,
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")

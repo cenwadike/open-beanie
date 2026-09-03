@@ -28,14 +28,21 @@
 mod config;
 mod models;
 mod rate_limiter;
-mod routes;
-mod scanner;
+mod stealth_routes;
+mod stealth_worker;
 mod worker;
 
+use crate::stealth_worker::start_stealth_workers;
 use axum::{
     Router,
     routing::{get, post},
 };
+use axum::{
+    extract::Request,
+    http::StatusCode,
+    response::{IntoResponse, Redirect, Response},
+};
+use beanie_keeper::config::StarknetConfig;
 use ethers::{
     middleware::{NonceManagerMiddleware, SignerMiddleware},
     providers::{Http as EvmHttp, Middleware, Provider as EvmProvider},
@@ -48,14 +55,81 @@ use starknet::{
 };
 use std::{sync::Arc, time::Duration};
 
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
+
+use crate::models::{DeployTask, StealthTask, mpsc};
 use crate::rate_limiter::DualRateLimiter;
-use crate::routes::{AppState, init_lane};
+use crate::stealth_routes::execute_stealth_claim;
 use crate::worker::run_deployment_worker;
-use crate::{config::Config, routes::serve_static};
-use crate::{
-    models::{DeployTask, HttpResponseCache, mpsc},
-    scanner::scan_stealth_payments,
-};
+use crate::{config::Config, models::AppState};
+
+/// Fallback route handler for serving static frontend files and pretty HTML URLs.
+pub async fn serve_static(req: Request) -> Response {
+    let path = req.uri().path().to_string();
+
+    // Serve root index page
+    if path == "/" {
+        return serve_file("public/beanie.html", Some("text/html"), req).await;
+    }
+
+    // Handle clean HTML URLs without .html extension
+    if let Some(clean) = path.strip_suffix(".html") {
+        let candidate = format!("public{clean}.html");
+        return if tokio::fs::metadata(&candidate).await.is_ok() {
+            Redirect::to(clean).into_response()
+        } else {
+            Redirect::to("/").into_response()
+        };
+    }
+
+    let is_asset_dir = path.starts_with("/scripts/")
+        || path.starts_with("/styles/")
+        || path.starts_with("/assets/");
+
+    let has_ext = path.rsplit('/').next().unwrap_or("").contains('.');
+
+    // Fall back to clean HTML file lookup if path doesn't contain a file extension or asset directory
+    if !has_ext && !is_asset_dir {
+        let candidate = format!("public{path}.html");
+        return if tokio::fs::metadata(&candidate).await.is_ok() {
+            serve_file(&candidate, Some("text/html"), req).await
+        } else {
+            Redirect::to("/").into_response()
+        };
+    }
+
+    // Serve raw static asset files
+    let candidate = format!("public{path}");
+    if tokio::fs::metadata(&candidate).await.is_ok() {
+        serve_file(&candidate, None, req).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Helper function to stream static files using `tower_http::services::ServeFile`.
+pub async fn serve_file(path: &str, forced_content_type: Option<&str>, req: Request) -> Response {
+    match ServeFile::new(path).oneshot(req).await {
+        Ok(mut res) => {
+            // Infer or enforce correct Content-Type header
+            let content_type = match forced_content_type {
+                Some(explicit_type) => explicit_type.to_string(),
+                None => mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string(),
+            };
+
+            res.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(&content_type).unwrap(),
+            );
+
+            res.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -85,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
         ExecutionEncoding::New,
     ));
 
-    // 3. Setup Bounded Channel and Background Deployment Worker
+    // 3. Setup Bounded Channels and Background Workers
     let (deploy_tx, deploy_rx) = mpsc::channel::<DeployTask>(2048);
     let deploy_tx = Arc::new(deploy_tx);
     tokio::spawn(run_deployment_worker(
@@ -98,23 +172,30 @@ async fn main() -> anyhow::Result<()> {
         deploy_tx.clone(),
     ));
 
-    // 4. Router & Server Setup
+    let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
+    let stealth_tx = Arc::new(stealth_tx);
+
     let state = AppState {
         limiter: Arc::new(DualRateLimiter::new(
             cfg.rate_limit_per_hour,
             2,
             Duration::from_secs(3600),
         )),
-        http_cache: Arc::new(HttpResponseCache::new(Duration::from_secs(86400))),
-        deploy_tx,
-        config: Arc::new(cfg.clone()),
+        deploy_tx: deploy_tx.clone(),
+        stealth_tx: stealth_tx.clone(),
+        app_config: Arc::new(cfg.clone()),
+        starknet_config: Arc::new(StarknetConfig::from_env()?),
+        evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env()?),
         evm_provider: Arc::new(evm_provider),
         starknet_provider: Arc::new(rpc_client),
+        reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
 
+    let worker_state = Arc::new(state.clone());
+    tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
+
     let app = Router::new()
-        .route("/api/v1/lanes/init", post(init_lane))
-        .route("/api/v1/stealth/scan", post(scan_stealth_payments))
+        .route("/api/v1/stealth/execute", post(execute_stealth_claim))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);

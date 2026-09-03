@@ -3,40 +3,33 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Beanie — Stealth Payment Claim</title>
+  <title>Beanie — Claim Private Payments</title>
   <link rel="stylesheet" href="/styles/stealth.css" />
 </head>
 <body>
   <main class="stealth-container">
-    <h1>Claim Stealth Payments</h1>
+    <h1>Claim Private Payments</h1>
     <p class="warning">
-      Your spending key is used only in this browser tab to compute
-      transaction signatures. It is never sent to Beanie or any server —
-      everything below runs client-side. Refreshing this page clears it
-      from memory.
+      Your keys are derived from your device's passkey (Face ID, Windows
+      Hello, or similar) and never leave this browser tab as raw values.
+      Beanie never receives them, in any form. This requires a browser
+      and device that support WebAuthn's PRF extension — you'll see a
+      clear error below if yours doesn't.
     </p>
 
     <section class="step">
       <h2>1. Scan for payments</h2>
       <label>
-        Merchant address
-        <input type="text" id="merchant-address" placeholder="0x..." />
+        Lane ID
+        <input type="text" id="lane-id" placeholder="your lane ID" />
       </label>
-      <label>
-        Viewing key (used only to detect payments — cannot spend)
-        <input type="text" id="viewing-key" placeholder="0x..." />
-      </label>
-      <button id="scan-btn">Scan</button>
+      <button id="scan-btn">Scan with passkey</button>
       <div id="scan-status"></div>
       <ul id="matches-list"></ul>
     </section>
 
     <section class="step">
       <h2>2. Claim / sweep to your wallet</h2>
-      <label>
-        Spending key (stays in this browser tab only)
-        <input type="password" id="spend-key" placeholder="0x..." />
-      </label>
       <label>
         Destination address to sweep claimed funds to
         <input type="text" id="destination-address" placeholder="0x..." />

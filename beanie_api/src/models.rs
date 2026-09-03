@@ -4,7 +4,7 @@ pub use axum::{
     response::{IntoResponse, Response},
 };
 pub use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+pub use std::sync::Arc;
 pub use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -12,6 +12,26 @@ pub use std::{
     time::{Duration, Instant},
 };
 pub use tokio::sync::mpsc;
+
+use crate::{
+    Config, DualRateLimiter,
+    stealth_routes::{CallDataPayload, ClientSignature},
+};
+
+/// Global application state shared across Axum route handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub app_config: Arc<Config>,
+    pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
+    pub evm_config: Arc<beanie_keeper::config::EvmConfig>,
+    pub limiter: Arc<DualRateLimiter>,
+    pub deploy_tx: Arc<mpsc::Sender<DeployTask>>,
+    pub stealth_tx: Arc<mpsc::Sender<StealthTask>>,
+    pub evm_provider: Arc<ethers::providers::Provider<ethers::providers::Http>>,
+    pub starknet_provider:
+        Arc<starknet::providers::JsonRpcClient<starknet::providers::jsonrpc::HttpTransport>>,
+    pub reqwest_client: Arc<reqwest::Client>,
+}
 
 // ── 1. Data Models & API Schemas ──────────────────────────────────────────────
 
@@ -33,25 +53,23 @@ pub struct DeployTask {
     pub attempts: u32,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct InitLaneRequest {
-    pub merchant_address: String,
-    pub target_chain: Chain,
-    pub source_chains: HashSet<Chain>,
-    #[serde(default)]
-    pub enable_privacy: bool,
-    pub webhook_url: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct LaneDeployment {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentTask {
     pub chain: Chain,
-    pub address: String,
+    pub merchant_address: String,
+    pub receiver_address: String,
+    pub webhook_url: Option<String>,
+    pub attempts: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct InitLaneResponse {
-    pub lanes: Vec<LaneDeployment>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StealthTask {
+    pub chain: Chain,
+    pub tx_hash: String,
+    pub derived_address: String,
+    pub client_sig: ClientSignature,
+    pub credential_id: String,
+    pub calls: Vec<CallDataPayload>,
 }
 
 #[derive(Serialize)]
@@ -67,50 +85,4 @@ pub fn err(status: StatusCode, msg: &str) -> Response {
         }),
     )
         .into_response()
-}
-
-// ── 2. HTTP Response Cache (Idempotency Engine) ──────────────────────────────
-
-#[derive(Clone)]
-pub struct CachedHttpResponse {
-    status: StatusCode,
-    body: InitLaneResponse,
-    created_at: Instant,
-}
-
-pub struct HttpResponseCache {
-    ttl: Duration,
-    responses: Mutex<HashMap<String, CachedHttpResponse>>,
-}
-
-impl HttpResponseCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            responses: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<(StatusCode, InitLaneResponse)> {
-        let mut cache = self.responses.lock().unwrap();
-        if let Some(entry) = cache.get(key) {
-            if entry.created_at.elapsed() < self.ttl {
-                return Some((entry.status, entry.body.clone()));
-            }
-            cache.remove(key); // Evict expired TTL entry
-        }
-        None
-    }
-
-    pub fn insert(&self, key: String, status: StatusCode, body: InitLaneResponse) {
-        let mut cache = self.responses.lock().unwrap();
-        cache.insert(
-            key,
-            CachedHttpResponse {
-                status,
-                body,
-                created_at: Instant::now(),
-            },
-        );
-    }
 }

@@ -3,6 +3,9 @@ name = "beanie_keeper"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"

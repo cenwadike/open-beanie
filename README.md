@@ -1,6 +1,6 @@
 # Beanie
 
-A multichain, non-custodial, permissionless stablecoin payment gateway. A merchant registers one destination address and chain and gets dedicated, non-custodial receiving instances; deposits settle to them without Beanie ever holding custody of merchant funds. Starknet is one of the receiving chains, and its STRK20 privacy pool is available to any customer paying a Beanie merchant: routing a payment through an unshielding transfer delinks the deposit a customer makes from the deposit the receiver contract sees. Payments can also land on a stealth address
+A multichain, non-custodial, permissionless stablecoin payment gateway. A merchant registers one destination address and chain and gets dedicated, non-custodial receiving instances; deposits settle to them without Beanie ever holding custody of merchant funds. Starknet is one of the receiving chains, and its privacy stack offers both an STRK20 privacy pool and deterministic **2-of-2 WebAuthn / Lit TEE Stealth Accounts**: routing a payment through stealth addresses delinks the customer from the claim while allowing gasless, passkey-secured claims with zero persistent state on the backend.
 
 ## What this is
 
@@ -12,27 +12,37 @@ Every supported chain gets its own receiver contract and its own factory, and bo
 - **`MerchantWebhookRegistry`** — the single webhook URL registry across **all** of Beanie, not just the EVM legs. Keyed by `address merchant`, permissionless (same trust model as `registerMerchant`, since it's called by Beanie's own sponsoring keeper wallet on the merchant's behalf, not by the merchant's own wallet).
 
 ### Contracts — Starknet
-- **`StarknetReceiver`** — the same contract as `ChainXReceiver`, in Cairo. Same fee split (0.50%, 90/10), same permissionless/idempotent/atomic `sweep()`, same same-chain-vs-CCTP-burn branch keyed off a zero/nonzero mint recipient. It calls `TokenTransmitter.send_message` directly 
+- **`StarknetReceiver`** — the same contract as `ChainXReceiver`, in Cairo. Same fee split (0.50%, 90/10), same permissionless/idempotent/atomic `sweep()`, same same-chain-vs-CCTP-burn branch keyed off a zero/nonzero mint recipient. It calls `TokenTransmitter.send_message` directly.
 - **`MerchantFactory`** — deploys one `StarknetReceiver` instance per merchant via `deploy_syscall`, same cap and same register/predict/count interface shape as the EVM factory.
+- **`StealthAccount`** — a counterfactual 2-of-2 Cairo account requiring both a client WebAuthn PRF signature $(r_1, s_1)$ and a Lit Protocol TEE Enclave co-signature $(r_2, s_2)$ to execute sweeping transfers.
 
-## STRK20 integration
+## Privacy & Stealth Account Architecture
 
-`StarknetReceiver` doesn't know or care how a deposit arrived. A customer can send USDC to a merchant's Starknet receiver address two ways:
-- **Transfer to Pool controlled address** — inbound privacy, funds land as an ordinary balance then get automatically shielded.
-- **An STRK20 unshielding transfer** — the customer spends a shielded pool note and withdraws directly to the receiver's address, using the pool's own standard withdrawal primitive. 
+In addition to standard payments, Beanie supports client-side deterministic stealth payments on Starknet.
 
-On-chain, these looks like any other shield or unshield transaction; nothing ties it back to which note or which prior shield-in funded it.
+### 1. Client-Side Key Derivation (Passkey + PRF)
+- A WebAuthn credential PRF extension derives a master secret directly inside the browser.
+- Payment lanes derive index-specific stealth keys deterministically:
+  $$\text{StealthPrivKey}_i = (\text{SpendMasterScalar} + \text{IndexScalar}_i) \pmod{\text{CurveOrder}}$$
+- The counterfactual account address is derived off-chain:
+  $$\text{Address} = H(\text{ClientPubKey}_i, \text{LitCosignerPubKey}, \text{ClassHash})$$
 
-Both land as the same plain ERC20-shaped balance, indistinguishable to `sweep()`. The privacy step, when the payer wants it, happens entirely client-side in the payer's own wallet before Beanie's contract ever sees the funds 
+### 2. Zero-State Index Recovery & Scanning
+- The browser scans ERC-20 `Transfer` events directly from Starknet RPC nodes using a **Gap Limit** algorithm.
+- No database or backend persistence tracks payment lanes, stealth indices, or balances.
 
-Beanie doesn't build, deploy, or maintain any privacy-specific logic to make this work, it composes directly with the pool's core deposit lifecycle (shield → private transfer → **withdraw to any public address** → shield) exactly as documented.
+### 3. 2-of-2 Co-signing & Gasless Paymaster Execution
+- To sweep funds, the client constructs the transaction and signs locally $(r_1, s_1)$.
+- The payload is posted to `POST /api/v1/stealth/execute`.
+- The backend routes the WebAuthn proof to the Lit Protocol TEE enclave to obtain the second signature $(r_2, s_2)$.
+- The backend appends $(r_2, s_2)$, sponsors the gas fee, and broadcasts the completed 2-of-2 transaction directly to Starknet.
 
 ## How a payment moves
 
 1. A customer pays into whichever chain's receiving instance is associated with the merchant — one predicted address per merchant per chain, returned by the factory's `predict*Address` view before deployment even happens.
 2. The instance takes a 0.50% fee, split 90% of fee to a single treasury address and 10% to whoever calls `sweep()` — identical math on every chain.
 3. The net amount settles either by burning out via CCTP V2 `deposit_for_burn` to a merchant-chosen destination chain, or transferring directly on-chain for same-chain settlement.
-4. If the customer chose the private path on Starknet, the delinking already happened before step 1 finished — it's not a separate step in this flow at all.
+4. If the customer chose the stealth payment path on Starknet, funds land in a counterfactual 2-of-2 `StealthAccount`, which the recipient recovers and sweeps gaslessly via passkey authentication.
 
 ## Access control
 
@@ -60,13 +70,18 @@ A single Rust daemon runs both chains' sweep loops concurrently from one process
 
 ## Off-chain: `beanie_api`
 
-The only HTTP surface in Beanie. One route, `POST /api/v1/lanes/init`: no signup, no login, no wallet connect, no signed message — a merchant address and a target chain in, a set of predicted receiver addresses back out immediately. Actual on-chain registration happens in the background, paid for by whoever runs this process, across however many chains the request's `source_chains` list names — Starknet and EVM registrations both go through the same deployment worker and the same webhook registry, uniformly, with no chain-specific branch beyond what each chain's own RPC/SDK requires.
+The HTTP layer serving API requests and static assets.
+- `POST /api/v1/lanes/init`: No signup, no login, no wallet connect — merchant address and target chain in, predicted receiver addresses back out immediately.
+- `POST /api/v1/stealth/execute`: Co-signing and gasless relay proxy. Accepts client signatures $(r_1, s_1)$, requests Lit Protocol TEE enclave co-signatures $(r_2, s_2)$, pays gas via Paymaster, and submits the transaction to Starknet RPC.
 
-Because `registerMerchant`/`register_merchant` are already permissionless on-chain, this API is a convenience layer, not a gatekeeper — anyone who doesn't trust a given operator's rate limits can call either factory directly with their own wallet and skip it entirely. This same process also serves the frontend as a static-file fallback route — starting `beanie_api` alone brings up the API, the deploy worker, and the customer/merchant-facing UI together.
+This process also serves the frontend as a static-file fallback route — starting `beanie_api` brings up the API, the deploy worker, the stealth claim engine, and the customer/merchant-facing UI together.
 
 ## Frontend
 
-Served from `beanie_api/public/`. `beanie.html` is the lane-creation flow (pick a settlement chain, get a receiver address, poll for deposits); `pay.html` is the customer-facing payment page for a shared lane link. Balance polling reads directly from public RPCs — a balance increase on a Starknet receiver is reported as "deposit detected" without distinguishing a plain transfer from an unshielding one, since the contract itself doesn't distinguish them either.
+Served from `beanie_api/public/`:
+- `beanie.html` — lane-creation flow (pick a settlement chain, get a receiver address, poll for deposits).
+- `pay.html` — customer-facing payment page for a shared lane link.
+- `claim.html` — stealth payment recovery dashboard (`stealth-claim.js`). Performs passkey PRF key derivation, scans RPC logs for payment indices, and triggers gasless 2-of-2 stealth sweeps.
 
 ## Local setup
 
@@ -81,8 +96,6 @@ scarb test
 
 ```
 
-No external pool-package dependency is required to build or test the Starknet contracts — `StarknetReceiver` and its factory only depend on `openzeppelin` (for the ERC20 dispatcher interface) and Starknet's own core library.
-
 ### EVM Smart Contracts
 
 ```bash
@@ -96,25 +109,25 @@ forge test
 
 ```bash
 cd beanie_keeper
-cp .env.example .env   # RPC URLs, factory/token/registry addresses for BOTH chains
+cp .env.example .env
 cargo check
 cargo run
 
 ```
 
-### API + frontend
+### API + Frontend
 
 ```bash
 cd beanie_api
-cp .env.example .env   # RPC URLs, factory addresses (both chains), keeper keys
+cp .env.example .env 
 cargo run
 
 ```
 
 ## Tests
 
-* **`test/ReceiverFactory.t.sol`** — Foundry tests covering clone deployment, both the CCTP-burn and same-chain settlement paths through `sweep()`, idempotency on a repeated sweep, duplicate-registration rejection, and the `initialize()` one-shot guard.
-* **`tests/test.cairo`** — snforge tests for `StarknetReceiver` and its `MerchantFactory`, covering the same shape of cases as the Solidity suite: fee split, CCTP-burn vs. same-chain settlement, idempotent re-sweep, the receiver cap, and the one-shot `initialize()` guard.
+* **`test/ReceiverFactory.t.sol`** — Foundry tests covering clone deployment, CCTP-burn vs. same-chain paths, idempotency, and registration limits.
+* **`tests/test.cairo`** — snforge tests for `StarknetReceiver`, `MerchantFactory`, and 2-of-2 `StealthAccount` signature validations.
 
 ## File map
 
@@ -122,19 +135,16 @@ cargo run
 | --- | --- |
 | `starknet_beanie/src/merchant_factory.cairo` | Deploys one `StarknetReceiver` instance per merchant |
 | `starknet_beanie/src/receiver.cairo` | Per-merchant Starknet receiver: fee split + CCTP burn or same-chain transfer |
-| `starknet_beanie/tests/test.cairo` | snforge tests for the Starknet factory + receiver |
-| `evm_beanie/src/MerchantFactory.sol` | Deploys a `ChainXReceiver` clone per merchant; resolves CCTP domain by chain name |
+| `starknet_beanie/src/stealth_account.cairo` | 2-of-2 multi-sig account validating client + Lit TEE signatures |
+| `starknet_beanie/tests/test.cairo` | snforge tests for factory, receiver, and stealth accounts |
+| `evm_beanie/src/MerchantFactory.sol` | Deploys a `ChainXReceiver` clone per merchant; resolves CCTP domain |
 | `evm_beanie/src/ChainXReceiver.sol` | Per-merchant EVM receiver: fee split + CCTP burn or same-chain transfer |
-| `evm_beanie/src/MerchantWebhookRegistry.sol` | The single, chain-agnostic webhook URL registry |
-| `evm_beanie/test/ReceiverFactory.t.sol` | Foundry tests for the EVM factory and receiver |
+| `evm_beanie/src/MerchantWebhookRegistry.sol` | Single, chain-agnostic webhook URL registry |
 | `beanie_keeper/src/main.rs` | Dual-chain sweep loops (Base + Starknet), run concurrently from one process |
-| `beanie_keeper/src/config.rs` | Per-chain environment/config schema |
-| `beanie_keeper/src/sweep_evm.rs` | Base-side log scanning, chunk loops, and Multicall3 sweep compilation |
-| `beanie_keeper/src/sweep_starknet.rs` | Starknet-side event scanning and multicall sweep compilation |
 | `beanie_keeper/src/webhook.rs` | Dual signature scheme (EIP-191 / Starknet-native) + signed webhook delivery |
-| `beanie_api/src/main.rs` | Boots the EVM + Starknet clients, the deploy worker, and the HTTP server |
-| `beanie_api/src/routes.rs` | `POST /api/v1/lanes/init` + static frontend fallback |
-| `beanie_api/src/worker.rs` | Background on-chain registration across both chains, plus webhook registration |
-| `beanie_api/public/` | Frontend — lane creation (`beanie.html`) and the customer payment page (`pay.html`) |
+| `beanie_api/src/main.rs` | Boots EVM + Starknet providers, deploy worker, and Axum HTTP routes |
+| `beanie_api/src/routes.rs` | `POST /api/v1/lanes/init`, `POST /api/v1/stealth/execute`, and static fallback |
+| `beanie_api/public/stealth-claim.js` | Client-side PRF key derivation, gap-limit scanner, and claim engine |
+| `beanie_api/public/` | Frontend — lane creation (`beanie.html`), payment (`pay.html`), and claim (`claim.html`) |
 
 ```
