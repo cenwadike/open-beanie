@@ -27,12 +27,15 @@
 
 mod config;
 mod models;
+mod payment_routes;
+mod payment_workers;
 mod rate_limiter;
 mod stealth_routes;
-mod stealth_worker;
-mod worker;
+mod stealth_workers;
+mod transfer_workers;
+mod webhook_worker;
 
-use crate::stealth_worker::start_stealth_workers;
+use crate::stealth_workers::start_stealth_workers;
 use axum::{
     Router,
     routing::{get, post},
@@ -58,10 +61,11 @@ use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
-use crate::models::{DeployTask, StealthTask, mpsc};
+use crate::models::PaymentTask;
+use crate::models::{StealthTask, mpsc};
+use crate::payment_workers::run_payment_worker;
 use crate::rate_limiter::DualRateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
-use crate::worker::run_deployment_worker;
 use crate::{config::Config, models::AppState};
 
 /// Fallback route handler for serving static frontend files and pretty HTML URLs.
@@ -160,20 +164,13 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 3. Setup Bounded Channels and Background Workers
-    let (deploy_tx, deploy_rx) = mpsc::channel::<DeployTask>(2048);
-    let deploy_tx = Arc::new(deploy_tx);
-    tokio::spawn(run_deployment_worker(
-        evm_client,
-        starknet_account,
-        cfg.evm_factory_address,
-        cfg.starknet_factory_address,
-        cfg.webhook_registry_address,
-        deploy_rx,
-        deploy_tx.clone(),
-    ));
-
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
     let stealth_tx = Arc::new(stealth_tx);
+
+    let (payment_tx, payment_rx) = mpsc::channel::<PaymentTask>(2048);
+    let payment_tx = Arc::new(payment_tx);
+    let (webhook_tx, webhook_rx) = mpsc::channel::<crate::models::WebhookJob>(4096);
+    let webhook_tx = Arc::new(webhook_tx);
 
     let state = AppState {
         limiter: Arc::new(DualRateLimiter::new(
@@ -181,21 +178,55 @@ async fn main() -> anyhow::Result<()> {
             2,
             Duration::from_secs(3600),
         )),
-        deploy_tx: deploy_tx.clone(),
         stealth_tx: stealth_tx.clone(),
+        payment_tx: payment_tx.clone(),
         app_config: Arc::new(cfg.clone()),
         starknet_config: Arc::new(StarknetConfig::from_env()?),
         evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env()?),
-        evm_provider: Arc::new(evm_provider),
-        starknet_provider: Arc::new(rpc_client),
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
 
     let worker_state = Arc::new(state.clone());
     tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
+    let evm_client_clone = evm_client.clone();
+    let starknet_account_clone = starknet_account.clone();
+    tokio::spawn(run_payment_worker(
+        evm_client_clone,
+        starknet_account_clone,
+        cfg.evm_factory_address,
+        cfg.starknet_factory_address,
+        state.evm_config.clone(),
+        state.starknet_config.clone(),
+        payment_rx,
+        webhook_tx.clone(),
+    ));
+
+    // Native transfer poller (sweeps and dispatches webhooks)
+    let evm_client_clone2 = evm_client.clone();
+    let evm_cfg_clone = state.evm_config.clone();
+    let starknet_cfg_clone = state.starknet_config.clone();
+    tokio::spawn(async move {
+        crate::transfer_workers::run_native_transfer_poller(
+            evm_client_clone2,
+            evm_cfg_clone,
+            starknet_cfg_clone,
+            webhook_tx.clone(),
+        )
+        .await;
+    });
+
+    // Spawn webhook delivery worker
+    let http_for_webhooks = state.reqwest_client.clone();
+    tokio::spawn(async move {
+        crate::webhook_worker::run_webhook_worker(http_for_webhooks, webhook_rx).await;
+    });
 
     let app = Router::new()
         .route("/api/v1/stealth/execute", post(execute_stealth_claim))
+        .route(
+            "/api/v1/payment/notify",
+            post(crate::payment_routes::receive_payment),
+        )
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);
