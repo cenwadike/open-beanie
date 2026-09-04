@@ -1,29 +1,13 @@
-//! Beanie Lanes API — the only HTTP endpoint in Beanie.
+//! Beanie API Server
 //!
-//! One route: POST /lanes/init. No signup, no login, no wallet connect, no
-//! signed message — paste a destination address and optional paramters
-//! to get a deterministically predicted receivers back immediately.
-//! Actual on-chain registration happens in the
-//! background, paid for by whoever runs this process.
+//! This is the main entry point for the Beanie API server.
+//! It provides HTTP endpoints for using with the Beanie.
+//! Supports payment and stealth systems.
 //!
-//! MerchantFactory.registerMerchant() has no caller restriction — it's
-//! already permissionless. This process is a convenience, not a gatekeeper:
-//! anyone who doesn't trust a given operator's rate limits can call the
-//! factory directly with their own wallet and skip this entirely. Because
-//! there's no fee or incentive for running this API, rate limiting per IP
-//! is the only thing standing between "free for everyone" and "free until
-//! someone drains the operator's gas."
+//! # Endpoints
 //!
-//! Starknet's shield-in leg requires the merchant
-//! to hold a real keypair to ever spend their shielded notes later, which
-//! is incompatible with "no crypto knowledge required."
-//!
-//! Hence privacy is opted-in by privacy seeking merchants
-//!
-//! Env vars: RPC_URL, FACTORY_ADDRESS, CHAIN_NAME (e.g. "BASE" — used only
-//! as the cctpMintChain label on the same-chain settlement path, see
-//! init_lane), KEEPER_PRIVATE_KEY, RATE_LIMIT_PER_HOUR (default 5),
-//! LISTEN_ADDR (default 0.0.0.0:8080).
+//! - `POST /api/v1/pay` - process gasless a payment request
+//! - `POST /api/v1/stealth/claim` - process a stateless stealth account claim
 
 mod config;
 mod models;
@@ -169,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (payment_tx, payment_rx) = mpsc::channel::<PaymentTask>(2048);
     let payment_tx = Arc::new(payment_tx);
+
     let (webhook_tx, webhook_rx) = mpsc::channel::<crate::models::WebhookJob>(4096);
     let webhook_tx = Arc::new(webhook_tx);
 
@@ -185,9 +170,12 @@ async fn main() -> anyhow::Result<()> {
         evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env()?),
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
-
     let worker_state = Arc::new(state.clone());
+
+    // Spawn stealth workers
     tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
+
+    // Spawn payment worker
     let evm_client_clone = evm_client.clone();
     let starknet_account_clone = starknet_account.clone();
     tokio::spawn(run_payment_worker(
@@ -201,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         webhook_tx.clone(),
     ));
 
-    // Native transfer poller (sweeps and dispatches webhooks)
+    // Spawn native transfer worker
     let evm_client_clone2 = evm_client.clone();
     let evm_cfg_clone = state.evm_config.clone();
     let starknet_cfg_clone = state.starknet_config.clone();
@@ -222,11 +210,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
-        .route("/api/v1/stealth/execute", post(execute_stealth_claim))
-        .route(
-            "/api/v1/payment/notify",
-            post(crate::payment_routes::receive_payment),
-        )
+        .route("/api/v1/stealth/claim", post(execute_stealth_claim))
+        .route("/api/v1/pay", post(crate::payment_routes::receive_payment))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);

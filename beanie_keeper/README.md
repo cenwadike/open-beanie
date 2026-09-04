@@ -22,7 +22,6 @@ The Keeper Service automates cross-chain deposit indexing, merchant registry pol
 ```text
 src/
 ├── config.rs          # Environment loading and unified runtime config
-├── main.rs            # Orchestration loops, async worker spawning, and state management
 ├── sweep_evm.rs       # EVM (Base) log filtering, contract bindings, and tx dispatch
 ├── sweep_starknet.rs  # Starknet provider/account abstraction and event indexers
 └── webhook.rs         # Async webhook delivery engine and payload handling
@@ -70,28 +69,34 @@ cargo build --release
 
 ```
 
-### Running the Service
-
-Execute the compiled binary:
-
-```bash
-cargo run --release
-
-```
-
-To enable detailed tracing and debug logs:
-
-```bash
-RUST_LOG=info cargo run
-
-```
-
 ---
 
 ## Testing
 
-Run binary:
+use library:
 
-```bash
-cargo run
+```toml
+[dependencies]
+beanie_keeper = { path = "../beanie_keeper" }
+
+```
+
+```rust
+use beanie_keeper::*;
+
+pub fn main() {
+    ...
+   let deposit = beanie_keeper::config::Deposit {
+        tx_hash: tx_hash.clone(),
+        from_address: task.from_address.clone(),
+        receiver: format!("{:?}", receiver_addr),
+        amount_raw: task.amount_raw.clone(),
+        block_number: receipt
+            .block_number
+            .map(|b| b.as_u64())
+            .unwrap_or(0),
+    };
+    ...
+}
+
 ```
