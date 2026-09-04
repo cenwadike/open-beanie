@@ -30,6 +30,11 @@ contract MerchantFactory {
     mapping(bytes32 => uint32) public destinationDomain; // keyed by chain name
 
     event MerchantRegistered(address indexed merchant, address receiver);
+    event ReceiverAnnounced(
+        address indexed merchant,
+        address indexed receiver,
+        uint256 nonce
+    );
 
     error MaximumReceiversExceeded();
     error InvalidDomain();
@@ -114,6 +119,19 @@ contract MerchantFactory {
 
         emit MerchantRegistered(merchant, clone);
         return clone;
+    }
+
+    /// @notice Cheap on-chain announcement of the next receiver address.
+    /// Does not deploy and does not consume the deployment nonce.
+    function announceReceiver(address merchant) external {
+        uint256 nonce = merchantNonces[merchant]; // current, not advanced
+        bytes32 salt = keccak256(abi.encodePacked(merchant, nonce));
+        address receiver = Clones.predictDeterministicAddress(
+            receiverImplementation,
+            salt,
+            address(this)
+        );
+        emit ReceiverAnnounced(merchant, receiver, nonce);
     }
 
     function predictReceiverAddress(

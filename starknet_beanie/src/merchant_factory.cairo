@@ -23,6 +23,7 @@ pub trait IMerchantFactory<T> {
     fn register_merchant(
         ref self: T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
     ) -> ContractAddress;
+    fn announce_receiver(ref self: T, merchant: ContractAddress);
     fn predict_receiver_address(self: @T, merchant: ContractAddress) -> ContractAddress;
     fn get_merchant_receivers(self: @T, merchant: ContractAddress) -> Array<ContractAddress>;
     fn get_merchant_receiver_at(self: @T, merchant: ContractAddress, index: u64) -> ContractAddress;
@@ -61,6 +62,14 @@ pub mod MerchantFactory {
     #[derive(Drop, starknet::Event)]
     pub enum Event {
         MerchantRegistered: MerchantRegistered,
+        ReceiverAnnounced: ReceiverAnnounced,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ReceiverAnnounced {
+        pub merchant: ContractAddress,
+        pub receiver: ContractAddress,
+        pub nonce: felt252,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -181,6 +190,22 @@ pub mod MerchantFactory {
                 empty_calldata.span(),
                 get_contract_address(),
             )
+        }
+
+        fn announce_receiver(ref self: ContractState, merchant: ContractAddress) {
+            let nonce = self.merchant_nonces.read(merchant);
+            let merchant_felt: felt252 = merchant.into();
+            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
+
+            let empty_calldata: Array<felt252> = array![];
+            let receiver = calculate_contract_address_from_deploy_syscall(
+                salt,
+                self.receiver_class_hash.read(),
+                empty_calldata.span(),
+                get_contract_address(),
+            );
+
+            self.emit(Event::ReceiverAnnounced(ReceiverAnnounced { merchant, receiver, nonce }));
         }
 
         fn get_merchant_receivers(

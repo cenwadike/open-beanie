@@ -31,8 +31,8 @@ pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccoun
 
     Ok(Arc::new(account))
 }
-
-/// Starknet event fetcher for MerchantRegistered(merchant, receiver)
+/// Discovers both deployed receivers (MerchantRegistered) and
+/// announced/predicted receivers (ReceiverAnnounced).
 pub async fn discover_merchants(
     account: &StarknetAccount,
     cfg: &StarknetConfig,
@@ -43,7 +43,9 @@ pub async fn discover_merchants(
         return Ok(Vec::new());
     }
 
-    let event_selector = get_selector_from_name("MerchantRegistered")?;
+    let registered_selector = get_selector_from_name("MerchantRegistered")?;
+    let announced_selector = get_selector_from_name("ReceiverAnnounced")?;
+
     let mut out = Vec::new();
     let step = cfg.log_chunk_blocks.max(1);
 
@@ -53,11 +55,14 @@ pub async fn discover_merchants(
         let mut continuation_token: Option<String> = None;
 
         loop {
+            // Fetch both event types in one filter (OR on the first key)
             let filter = EventFilter {
                 from_block: Some(BlockId::Number(current_from)),
                 to_block: Some(BlockId::Number(current_to)),
                 address: Some(cfg.factory_address),
-                keys: Some(vec![vec![event_selector]]),
+                keys: Some(vec![
+                    vec![registered_selector, announced_selector], // topic0 can be either
+                ]),
             };
 
             let events_page = account
@@ -66,8 +71,12 @@ pub async fn discover_merchants(
                 .await?;
 
             for event in events_page.events {
+                // Both events currently put (merchant, receiver) in data[0..2]
+                // (nonce is data[2] for ReceiverAnnounced – we ignore it here)
                 if event.data.len() >= 2 {
-                    out.push((event.data[0], event.data[1]));
+                    let merchant = event.data[0];
+                    let receiver = event.data[1];
+                    out.push((merchant, receiver));
                 }
             }
 
@@ -79,6 +88,10 @@ pub async fn discover_merchants(
 
         current_from = current_to + 1;
     }
+
+    // Optional: dedup in case the same address was both announced and later registered
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.dedup_by(|a, b| a.1 == b.1);
 
     Ok(out)
 }

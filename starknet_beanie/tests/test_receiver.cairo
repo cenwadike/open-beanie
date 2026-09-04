@@ -11,15 +11,17 @@
 use core::array::ArrayTrait;
 use core::traits::TryInto;
 use snforge_std::{
-    ContractClass, ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address,
-    stop_cheat_caller_address,
+    ContractClass, ContractClassTrait, DeclareResultTrait, EventSpyAssertionsTrait, declare,
+    spy_events, start_cheat_caller_address, stop_cheat_caller_address,
 };
 use starknet::{ContractAddress, SyscallResultTrait};
+use starknet_beanie::merchant_factory::MerchantFactory::{
+    Event as MerchantFactoryEvent, ReceiverAnnounced,
+};
 use starknet_beanie::merchant_factory::{
     IMerchantFactoryDispatcher, IMerchantFactoryDispatcherTrait,
 };
 use starknet_beanie::receiver::{IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
-
 #[starknet::interface]
 pub trait IToken<T> {
     fn mint(ref self: T, recipient: ContractAddress, amount: u256);
@@ -335,4 +337,45 @@ fn merchant_factory_rejects_exceeding_max_receivers() {
         factory.register_merchant(merchant, 'BASE', 0x777_u256);
         i += 1;
     };
+}
+#[test]
+fn merchant_factory_announces_receiver() {
+    let token = deploy_mock_token();
+    let treasury: ContractAddress = 0x888.try_into().unwrap();
+    let messenger = deploy_mock_messenger();
+    let merchant: ContractAddress = 0x777.try_into().unwrap();
+    let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
+
+    let factory_addr = deploy_factory(
+        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
+    );
+
+    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
+
+    // Predicted address (view call – no event yet)
+    let predicted_addr = factory.predict_receiver_address(merchant);
+
+    // Start spying *before* the state-changing call
+    let mut spy = spy_events();
+
+    // This should emit ReceiverAnnounced
+    factory.announce_receiver(merchant);
+
+    // Assert the event was emitted with the expected data
+    // (nonce is 0 on first announce because we never advanced merchant_nonces)
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    factory_addr,
+                    MerchantFactoryEvent::ReceiverAnnounced(
+                        ReceiverAnnounced { merchant, receiver: predicted_addr, nonce: 0 },
+                    ),
+                ),
+            ],
+        );
+
+    // Register actually deploys – should still match the announced address
+    let deployed_receiver = factory.register_merchant(merchant, 'BASE', 0x777_u256);
+    assert(predicted_addr == deployed_receiver, 'PREDICTION_MATCH_AFTER_ANNOUNCE');
 }

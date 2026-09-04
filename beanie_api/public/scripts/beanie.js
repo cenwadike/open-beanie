@@ -9,7 +9,7 @@
       chainId: 8453,
       rpc: "https://base-mainnet.g.alchemy.com/v2/alch_ElnVnrKipwLUIRlEuAmno",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      factory: "0x0000000000000000000000000000000000000000", // Deploy / Factory contract
+      factory: "0x0000000000000000000000000000000000000000",
       explorerAddress: "https://basescan.org/address/",
     },
     STARKNET: {
@@ -17,7 +17,7 @@
       kind: "starknet",
       rpc: "https://starknet-mainnet.public.blastapi.io",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-      factory: "0x0000000000000000000000000000000000000000", // MerchantFactory contract
+      factory: "0x0000000000000000000000000000000000000000",
       explorerAddress: "https://starkscan.co/contract/",
     },
   };
@@ -25,10 +25,18 @@
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
   const POLL_INTERVAL_MS = 20000;
+  const API_CREATE = "/api/v1/create";
+  const RP_ID = "beanie.io";
+  const WEBAUTHN_ORIGIN = "https://beanie.io";
 
-  const STARKNET_BALANCEOF_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
-  const STARKNET_PREDICT_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76"; // predict_receiver_address selector
-  const STARKNET_NONCE_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76"; // get_merchant_nonce selector
+  // Replace with real selectors from your deployed ABIs
+  const STARKNET_BALANCEOF_SELECTOR =
+    "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
+  // predict_receiver_address(merchant) — factory reads nonce internally
+  const STARKNET_PREDICT_SELECTOR =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
+  // predictReceiverAddress(address) — verify against deployed MerchantFactory
+  const EVM_PREDICT_SELECTOR = "0x0c40efef";
 
   const STORAGE_LANES = "beanie.lanes.v1";
   const STORAGE_HISTORY = "beanie.history.v1";
@@ -43,18 +51,27 @@
     if (html !== undefined) node.innerHTML = html;
     return node;
   };
-  const escapeHtml = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
-  }[c]));
+  const escapeHtml = (v) =>
+    String(v ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c])
+    );
   const short = (v) => (v && v.length > 16 ? `${v.slice(0, 8)}…${v.slice(-6)}` : v || "");
 
   /* ---------- Local storage ---------- */
   const readJson = (key, fallback) => {
-    try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
-    catch { return fallback; }
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
   };
   const writeJson = (key, value) => {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      /* storage unavailable */
+    }
   };
   const getLanes = () => readJson(STORAGE_LANES, []);
   const saveLanes = (lanes) => writeJson(STORAGE_LANES, lanes);
@@ -63,8 +80,160 @@
   const getBalances = () => readJson(STORAGE_BALANCES, {});
   const saveBalances = (balances) => writeJson(STORAGE_BALANCES, balances);
   const getSeenAt = () => Number(localStorage.getItem(STORAGE_SEEN) || 0);
-  const setSeenAt = (ts) => { try { localStorage.setItem(STORAGE_SEEN, String(ts)); } catch { /* noop */ } };
+  const setSeenAt = (ts) => {
+    try {
+      localStorage.setItem(STORAGE_SEEN, String(ts));
+    } catch {
+      /* noop */
+    }
+  };
   const receiverKey = (chain, address) => `${chain}:${address}`.toLowerCase();
+
+  /* ---------- Bytes / encoding (same as stealth-claim) ---------- */
+  function bytesToHex(bytes) {
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  function bufferToBase64Url(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let string = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+      string += String.fromCharCode(bytes[i]);
+    }
+    return btoa(string).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function sha256Utf8(str) {
+    const data = new TextEncoder().encode(str);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return new Uint8Array(digest);
+  }
+
+  /* ---------- Passkey (matches PasskeyAuth extractor) ---------- */
+  let cachedCredentialId = null; // ArrayBuffer / rawId
+
+  async function getOrRegisterCredential() {
+    if (cachedCredentialId) return cachedCredentialId;
+
+    try {
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rpId: RP_ID,
+          userVerification: "required",
+        },
+      });
+      cachedCredentialId = assertion.rawId;
+      return cachedCredentialId;
+    } catch {
+      // register
+    }
+
+    let credential;
+    try {
+      credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: "Beanie", id: RP_ID },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(16)),
+            name: "beanie-merchant",
+            displayName: "Beanie Merchant",
+          },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          authenticatorSelection: {
+            residentKey: "required",
+            userVerification: "required",
+          },
+        },
+      });
+    } catch (err) {
+      throw new Error(`Passkey initialization failed: ${err.message}`);
+    }
+
+    cachedCredentialId = credential.rawId;
+    return cachedCredentialId;
+  }
+
+  /**
+   * Produce headers + credential_id for PasskeyAuth.
+   * Challenge bound to txHash exactly as the server verifies:
+   *   challenge_b64url == base64url(sha256(txHash utf8 bytes))
+   */
+  async function buildPasskeyAuth(txHash) {
+    const credentialId = await getOrRegisterCredential();
+    const challengeBytes = await sha256Utf8(txHash);
+
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: challengeBytes,
+        rpId: RP_ID,
+        allowCredentials: [{ id: credentialId, type: "public-key" }],
+        userVerification: "required",
+      },
+    });
+
+    const credIdHex = bytesToHex(new Uint8Array(credentialId));
+    const clientDataB64 = bufferToBase64Url(assertion.response.clientDataJSON);
+    const authDataB64 = bufferToBase64Url(assertion.response.authenticatorData);
+
+    return {
+      credentialId: credIdHex,
+      headers: {
+        "X-Passkey-Credential-Id": credIdHex,
+        "X-Passkey-Client-Data": clientDataB64,
+        "X-Passkey-Auth-Data": authDataB64,
+        "X-Passkey-Tx-Hash": txHash,
+      },
+    };
+  }
+
+  /* ---------- Announce API ---------- */
+  function announceBindingHash(chain, merchantAddress) {
+    // Deterministic payload bound into WebAuthn challenge
+    return `beanie-announce-v1|${chain}|${merchantAddress.toLowerCase()}`;
+  }
+
+  async function announceReceiverOnChain(chain, merchantAddress) {
+    const txHash = announceBindingHash(chain, merchantAddress);
+    const passkey = await buildPasskeyAuth(txHash);
+
+    const res = await fetch(API_CREATE, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...passkey.headers,
+      },
+      body: JSON.stringify({
+        chain, // "BASE" | "STARKNET" (serde UPPERCASE)
+        merchant_address: merchantAddress,
+        credential_id: passkey.credentialId,
+      }),
+    });
+
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(body.error || body.message || `Announce failed (${res.status})`);
+    }
+    return body;
+  }
+
+  async function announceAllSourceChains(merchantAddress) {
+    const results = [];
+    for (const chain of SOURCE_CHAINS) {
+      try {
+        const out = await announceReceiverOnChain(chain, merchantAddress);
+        results.push({ chain, ok: true, out });
+        console.info(`[beanie] announce queued on ${chain}`, out);
+      } catch (e) {
+        console.error(`[beanie] announce failed on ${chain}`, e);
+        results.push({ chain, ok: false, error: e.message || String(e) });
+      }
+    }
+    return results;
+  }
 
   /* ---------- Public-RPC reads ---------- */
   async function rpcCall(url, method, params) {
@@ -72,7 +241,7 @@
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "Origin": window.location.origin,
+        Origin: window.location.origin,
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
     });
@@ -81,7 +250,8 @@
     return json.result;
   }
 
-  const encodeEvmBalanceOfCall = (address) => `0x70a08231${address.replace(/^0x/i, "").padStart(64, "0")}`;
+  const encodeEvmBalanceOfCall = (address) =>
+    `0x70a08231${address.replace(/^0x/i, "").padStart(64, "0")}`;
 
   async function evmContractExists(rpc, address) {
     const code = await rpcCall(rpc, "eth_getCode", [address, "latest"]);
@@ -90,19 +260,31 @@
 
   async function evmTokenBalance(rpc, token, address) {
     if (!token) return 0n;
-    const result = await rpcCall(rpc, "eth_call", [{ to: token, data: encodeEvmBalanceOfCall(address) }, "latest"]);
+    const result = await rpcCall(
+      rpc,
+      "eth_call",
+      [{ to: token, data: encodeEvmBalanceOfCall(address) }, "latest"]
+    );
     return BigInt(result || "0x0");
   }
 
   async function starknetContractExists(rpc, address) {
-    try { await rpcCall(rpc, "starknet_getClassHashAt", ["latest", address]); return true; }
-    catch { return false; }
+    try {
+      await rpcCall(rpc, "starknet_getClassHashAt", ["latest", address]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async function starknetTokenBalance(rpc, token, address) {
     if (!token) return 0n;
     const result = await rpcCall(rpc, "starknet_call", [
-      { contract_address: token, entry_point_selector: STARKNET_BALANCEOF_SELECTOR, calldata: [address] },
+      {
+        contract_address: token,
+        entry_point_selector: STARKNET_BALANCEOF_SELECTOR,
+        calldata: [address],
+      },
       "latest",
     ]);
     const low = BigInt(result?.[0] || "0x0");
@@ -117,7 +299,9 @@
       return chain.kind === "evm"
         ? await evmContractExists(chain.rpc, address)
         : await starknetContractExists(chain.rpc, address);
-    } catch { return false; }
+    } catch {
+      return false;
+    }
   }
 
   async function tokenBalance(chainKey, address) {
@@ -130,44 +314,46 @@
 
   function formatUsdc(atoms) {
     const value = Number(atoms) / 1_000_000;
-    return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+    return value.toLocaleString(undefined, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 6,
+    });
   }
 
-  /* ---------- Client-side Address Prediction ---------- */
+  /* ---------- Client-side prediction (pay-page addresses) ---------- */
   async function predictEvmReceiver(merchantAddress) {
     const chain = CHAINS.BASE;
-    // 1. Read current nonce from MerchantFactory: getMerchantNonce(merchant)
-    const nonceData = `0x7b11d9a2${merchantAddress.replace(/^0x/i, "").padStart(64, "0")}`;
-    const nonceHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data: nonceData }, "latest"]);
-
-    // 2. Predict address: predictReceiverAddress(merchant, nonce)
-    const predictData = `0x3a4b9c1d${merchantAddress.replace(/^0x/i, "").padStart(64, "0")}${BigInt(nonceHex || "0").toString(16).padStart(64, "0")}`;
-    const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data: predictData }, "latest"]);
-
-    const address = `0x${predictedAddrHex.slice(-40)}`;
+    const data =
+      EVM_PREDICT_SELECTOR +
+      merchantAddress.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+    const predictedAddrHex = await rpcCall(
+      chain.rpc,
+      "eth_call",
+      [{ to: chain.factory, data }, "latest"]
+    );
+    const address = `0x${String(predictedAddrHex).slice(-40)}`;
     return { chain: "BASE", address, is_privacy_lane: false };
   }
 
   async function predictStarknetReceiver(merchantAddress) {
     const chain = CHAINS.STARKNET;
-    // 1. Read current nonce from Cairo MerchantFactory contract
-    const nonceRes = await rpcCall(chain.rpc, "starknet_call", [
-      { contract_address: chain.factory, entry_point_selector: STARKNET_NONCE_SELECTOR, calldata: [merchantAddress] },
-      "latest",
-    ]);
-    const nonce = nonceRes?.[0] || "0x0";
-
-    // 2. Predict address from Cairo MerchantFactory contract
     const predictRes = await rpcCall(chain.rpc, "starknet_call", [
-      { contract_address: chain.factory, entry_point_selector: STARKNET_PREDICT_SELECTOR, calldata: [merchantAddress, nonce] },
+      {
+        contract_address: chain.factory,
+        entry_point_selector: STARKNET_PREDICT_SELECTOR,
+        calldata: [merchantAddress],
+      },
       "latest",
     ]);
-
-    return { chain: "STARKNET", address: predictRes?.[0] || "0x0", is_privacy_lane: true };
+    return {
+      chain: "STARKNET",
+      address: predictRes?.[0] || "0x0",
+      is_privacy_lane: true,
+    };
   }
 
   async function deriveLanes({ merchantAddress }) {
-    console.info("[beanie] Deriving payment lanes locally via RPC...");
+    console.info("[beanie] Deriving payment lanes via RPC...");
     const results = await Promise.all([
       predictEvmReceiver(merchantAddress).catch((e) => {
         console.error("Failed EVM prediction", e);
@@ -178,21 +364,19 @@
         return null;
       }),
     ]);
-
     return results.filter(Boolean);
   }
 
-  /* ---------- Wallet-address validation ---------- */
+  /* ---------- Wallet validation ---------- */
   const EVM_MAGNITUDE_LIMIT = 1n << 160n;
-  const STARK_PRIME = (1n << 251n) + (17n * (1n << 192n)) + 1n;
+  const STARK_PRIME = (1n << 251n) + 17n * (1n << 192n) + 1n;
 
   function isValidEvmAddress(v) {
     if (typeof v !== "string" || !v.startsWith("0x")) return false;
     const hex = v.slice(2);
     if (hex.length !== 40) return false;
     try {
-      const val = BigInt(`0x${hex}`);
-      return val < EVM_MAGNITUDE_LIMIT;
+      return BigInt(`0x${hex}`) < EVM_MAGNITUDE_LIMIT;
     } catch {
       return false;
     }
@@ -200,7 +384,7 @@
 
   function isValidStarknetAddress(v) {
     if (typeof v !== "string" || !v) return false;
-    const hex = (v.startsWith("0x") || v.startsWith("0X")) ? v.slice(2) : v;
+    const hex = v.startsWith("0x") || v.startsWith("0X") ? v.slice(2) : v;
     if (hex.length < 1 || hex.length > 64) return false;
     try {
       const val = BigInt(`0x${hex}`);
@@ -216,13 +400,16 @@
     return false;
   }
 
-  /* ---------- URL Sanitization ---------- */
+  /* ---------- URL sanitization ---------- */
   function sanitizeWebhookUrl(raw) {
     const trimmed = (raw || "").trim();
     if (!trimmed) return { ok: true, value: null };
     let parsed;
-    try { parsed = new URL(trimmed); }
-    catch { return { ok: false, error: "Webhook URL is not a valid URL." }; }
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return { ok: false, error: "Webhook URL is not a valid URL." };
+    }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return { ok: false, error: "Webhook URL must use http or https." };
     }
@@ -237,9 +424,16 @@
   async function renderQr(imgEl, text) {
     if (!imgEl || !window.QRCode?.toString) return;
     try {
-      const svg = await window.QRCode.toString(text, { type: "svg", errorCorrectionLevel: "H", margin: 1, width: 480 });
+      const svg = await window.QRCode.toString(text, {
+        type: "svg",
+        errorCorrectionLevel: "H",
+        margin: 1,
+        width: 480,
+      });
       imgEl.src = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-    } catch { imgEl.removeAttribute("src"); }
+    } catch {
+      imgEl.removeAttribute("src");
+    }
   }
 
   /* ---------- Toasts ---------- */
@@ -249,20 +443,24 @@
       console.warn(`[notify] ${tone.toUpperCase()}: ${title} - ${detail}`);
       return;
     }
-    const toast = el("div", `live-toast ${tone}`, `
+    const toast = el(
+      "div",
+      `live-toast ${tone}`,
+      `
       <span class="live-toast-icon">${tone === "success" ? "✓" : tone === "error" ? "!" : "i"}</span>
       <div>
         <p class="live-toast-title">${escapeHtml(title)}</p>
         ${detail ? `<p class="live-toast-body">${escapeHtml(detail)}</p>` : ""}
       </div>
       <button class="live-toast-close" type="button" aria-label="Dismiss">×</button>
-    `);
+    `
+    );
     toast.querySelector(".live-toast-close")?.addEventListener("click", () => toast.remove());
     stack.append(toast);
     setTimeout(() => toast.remove(), 7000);
   }
 
-  /* ---------- UI State & Execution ---------- */
+  /* ---------- UI state ---------- */
   function historyToggleBtn() {
     return document.querySelector(".history-btn:not(.receivers-btn)");
   }
@@ -282,7 +480,9 @@
 
   function pendingDepositCount() {
     const seenAt = getSeenAt();
-    return Object.values(getHistory()).flat().filter((entry) => entry.time > seenAt).length;
+    return Object.values(getHistory())
+      .flat()
+      .filter((entry) => entry.time > seenAt).length;
   }
 
   function refreshNotifyDot() {
@@ -313,7 +513,10 @@
         }
       }
     }
-    if (changed) { saveLanes(lanes); renderLanes(); }
+    if (changed) {
+      saveLanes(lanes);
+      renderLanes();
+    }
   }
 
   function laneShareUrl(lane) {
@@ -329,13 +532,21 @@
   function renderLanes() {
     const lanes = getLanes();
     const subtitle = $("#receiversSubtitle");
-    if (subtitle) subtitle.textContent = lanes.length ? `${lanes.length} lane${lanes.length > 1 ? "s" : ""}` : "No lanes yet";
+    if (subtitle)
+      subtitle.textContent = lanes.length
+        ? `${lanes.length} lane${lanes.length > 1 ? "s" : ""}`
+        : "No lanes yet";
     const list = $("#receiversList");
     if (!list) return;
-    list.innerHTML = lanes.length ? "" : `<p class="receiver-empty">No lanes yet — create a payment lane to see it here.</p>`;
+    list.innerHTML = lanes.length
+      ? ""
+      : `<p class="receiver-empty">No lanes yet — create a payment lane to see it here.</p>`;
     for (const lane of lanes) {
       const laneUrl = laneShareUrl(lane);
-      const row = el("div", "receiver-row", `
+      const row = el(
+        "div",
+        "receiver-row",
+        `
         <span class="mini-icon">${chainIcons[lane.targetChain] || ""}</span>
         <span>
           <div>${escapeHtml(short(lane.merchantAddress))} (Index #${lane.currentIndex || 0})</div>
@@ -343,45 +554,62 @@
         </span>
         <a class="receiver-link" href="${escapeAttr(laneUrl)}" target="_blank" rel="noreferrer">Pay page</a>
         <button class="receiver-copy" type="button" aria-label="Copy pay link">⧉</button>
-      `);
+      `
+      );
       row.style.gridTemplateColumns = "24px 1fr auto auto";
       row.querySelector(".receiver-copy")?.addEventListener("click", async () => {
-        try { await navigator.clipboard.writeText(laneUrl); notify("Pay link copied"); }
-        catch { notify("Copy failed", "error"); }
+        try {
+          await navigator.clipboard.writeText(laneUrl);
+          notify("Pay link copied");
+        } catch {
+          notify("Copy failed", "error");
+        }
       });
       list.append(row);
     }
   }
 
-  function escapeAttr(value) { return escapeHtml(value).replace(/`/g, "&#096;"); }
+  function escapeAttr(value) {
+    return escapeHtml(value).replace(/`/g, "&#096;");
+  }
 
   let historyFilterChain = "ALL";
 
   function renderHistoryChainMenu() {
     const menu = $("#historyChainMenu");
     if (!menu) return;
-    menu.innerHTML = ["ALL", ...Object.keys(CHAINS)].map((key) => `
+    menu.innerHTML = ["ALL", ...Object.keys(CHAINS)]
+      .map(
+        (key) => `
       <button class="history-chain-option" type="button" data-chain="${key}" aria-selected="${key === historyFilterChain}">
         <span class="mini-icon">${key === "ALL" ? "🔗" : chainIcons[key] || ""}</span>
         <span>${key === "ALL" ? "All chains" : escapeHtml(chainLabel(key))}</span>
       </button>
-    `).join("");
+    `
+      )
+      .join("");
   }
 
   function updateHistoryChainControl() {
     const icon = $("#historyChainIcon");
     const name = $("#historyChainName");
-    if (icon) icon.innerHTML = historyFilterChain === "ALL" ? "🔗" : (chainIcons[historyFilterChain] || "");
-    if (name) name.textContent = historyFilterChain === "ALL" ? "All chains" : chainLabel(historyFilterChain);
+    if (icon)
+      icon.innerHTML =
+        historyFilterChain === "ALL" ? "🔗" : chainIcons[historyFilterChain] || "";
+    if (name)
+      name.textContent =
+        historyFilterChain === "ALL" ? "All chains" : chainLabel(historyFilterChain);
   }
 
   function renderHistory() {
     const history = getHistory();
-    const rows = Object.values(history).flat()
+    const rows = Object.values(history)
+      .flat()
       .filter((row) => historyFilterChain === "ALL" || row.chain === historyFilterChain)
       .sort((a, b) => b.time - a.time);
 
-    const scopeLabel = historyFilterChain === "ALL" ? "all chains" : chainLabel(historyFilterChain);
+    const scopeLabel =
+      historyFilterChain === "ALL" ? "all chains" : chainLabel(historyFilterChain);
     const total = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
     const panel = $("#balancePanel");
     if (panel) {
@@ -398,21 +626,26 @@
     const list = $("#historyList");
     if (list) {
       list.innerHTML = rows.length
-        ? rows.map((row) => `
+        ? rows
+          .map(
+            (row) => `
           <div class="history-row">
             <span class="mini-icon">${chainIcons[row.chain] || ""}</span>
             <span class="mono">${escapeHtml(short(row.address))}</span>
             <strong>${escapeHtml(formatUsdc(row.amount))} USDC</strong>
             <span>${new Date(row.time).toLocaleString()}</span>
           </div>
-        `).join("")
+        `
+          )
+          .join("")
         : `<p class="history-empty">History is empty — no deposits detected yet on ${escapeHtml(scopeLabel)}.</p>`;
     }
 
     const subtitle = $("#historySubtitle");
-    if (subtitle) subtitle.textContent = rows.length
-      ? `${rows.length} deposit${rows.length === 1 ? "" : "s"} received`
-      : "Nothing yet";
+    if (subtitle)
+      subtitle.textContent = rows.length
+        ? `${rows.length} deposit${rows.length === 1 ? "" : "s"} received`
+        : "Nothing yet";
   }
 
   function openHistory() {
@@ -433,17 +666,30 @@
 
   async function pollDeposits(chain, address) {
     let balance;
-    try { balance = await tokenBalance(chain, address); } catch { return; }
+    try {
+      balance = await tokenBalance(chain, address);
+    } catch {
+      return;
+    }
     const balances = getBalances();
     const key = receiverKey(chain, address);
     const previous = BigInt(balances[key] || "0");
     if (balance > previous) {
       const history = getHistory();
       const entries = history[key] || [];
-      entries.unshift({ chain, address, amount: (balance - previous).toString(), time: Date.now() });
+      entries.unshift({
+        chain,
+        address,
+        amount: (balance - previous).toString(),
+        time: Date.now(),
+      });
       history[key] = entries.slice(0, 50);
       saveHistory(history);
-      notify("Deposit detected", "success", `${formatUsdc(balance - previous)} USDC on ${chainLabel(chain)}`);
+      notify(
+        "Deposit detected",
+        "success",
+        `${formatUsdc(balance - previous)} USDC on ${chainLabel(chain)}`
+      );
       refreshNotifyDot();
       if (activeReceiver?.chain === chain && activeReceiver?.address === address) {
         const statusEl = $("#statusLine");
@@ -453,7 +699,11 @@
       if (chain === "BASE") {
         notify("Funds settled", "success", `${chainLabel(chain)} lane swept to your wallet.`);
       } else {
-        notify("Deposit shielded", "info", "Moved into the Starknet privacy pool — payout follows via bridge-out.");
+        notify(
+          "Deposit shielded",
+          "info",
+          "Moved into the Starknet privacy pool — payout follows via bridge-out."
+        );
       }
     }
     balances[key] = balance.toString();
@@ -484,7 +734,7 @@
     }
   }
 
-  /* ---------- Unified Form Submission ---------- */
+  /* ---------- Create lane: predict → passkey announce → save ---------- */
   async function handleSubmit(event) {
     if (event) event.preventDefault();
 
@@ -508,7 +758,11 @@
 
     if (!merchantAddress || !walletMatchesChain(targetChain, merchantAddress)) {
       if (walletEl) walletEl.classList.add("invalid");
-      notify("Check your wallet address", "error", `Enter a valid ${chainLabel(targetChain)} address.`);
+      notify(
+        "Check your wallet address",
+        "error",
+        `Enter a valid ${chainLabel(targetChain)} address.`
+      );
       return;
     }
 
@@ -524,12 +778,33 @@
     }
 
     try {
+      // 1) Local predict for pay-page addresses
+      const lanes = await deriveLanes({ merchantAddress });
+      if (!lanes.length) {
+        throw new Error("Could not predict receiver addresses on Base or Starknet.");
+      }
+
+      // 2) Passkey-authenticated announce on each source chain
+      if (btn) btn.textContent = "Confirm passkey…";
+      const announceResults = await announceAllSourceChains(merchantAddress);
+      const failed = announceResults.filter((r) => !r.ok);
+      if (failed.length === announceResults.length) {
+        throw new Error(
+          failed.map((f) => `${f.chain}: ${f.error}`).join("; ") ||
+          "Announce failed on all chains"
+        );
+      }
+      if (failed.length) {
+        notify(
+          "Partial announce",
+          "info",
+          failed.map((f) => `${f.chain}: ${f.error}`).join("; ")
+        );
+      }
+
+      // 3) Persist + redirect
       const all = getLanes();
       const currentIndex = all.length;
-
-      // Predict lanes directly via RPC on client side
-      const lanes = await deriveLanes({ merchantAddress });
-
       const record = {
         id: `lane_${Date.now()}`,
         merchantAddress,
@@ -537,6 +812,7 @@
         currentIndex,
         webhookUrl: webhookResult.value,
         createdAt: Date.now(),
+        announced: announceResults.filter((r) => r.ok).map((r) => r.chain),
         receivers: lanes.map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
           address: l.address,
@@ -548,6 +824,11 @@
       all.unshift(record);
       saveLanes(all);
 
+      notify(
+        "Payment lane created",
+        "success",
+        "Receivers announced — native deposits will be detected."
+      );
       window.location.href = laneShareUrl(record);
       pollAllLanes();
     } catch (error) {
@@ -560,7 +841,7 @@
     }
   }
 
-  /* ---------- Event Listeners ---------- */
+  /* ---------- Event listeners ---------- */
   $("#receiverForm")?.addEventListener("submit", handleSubmit);
   $("#laneForm")?.addEventListener("submit", handleSubmit);
 
@@ -575,17 +856,26 @@
     const targetChain = OPTION_TO_CHAIN[rawVal] || rawVal?.toUpperCase();
     const summaryEl = $("#routeSummary");
     if (summaryEl) {
-      summaryEl.textContent = targetChain ? `USDC lands on ${chainLabel(targetChain)}` : "USDC lands on Starknet";
+      summaryEl.textContent = targetChain
+        ? `USDC lands on ${chainLabel(targetChain)}`
+        : "USDC lands on Starknet";
     }
     const walletEl = $("#wallet") || $("#merchantAddress");
     if (walletEl && walletEl.value.trim()) {
-      walletEl.classList.toggle("invalid", !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim()));
+      walletEl.classList.toggle(
+        "invalid",
+        !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim())
+      );
     }
   });
 
   historyToggleBtn()?.addEventListener("click", openHistory);
-  $("#closeHistoryModal")?.addEventListener("click", () => $("#historyModal")?.classList.remove("open"));
-  $("#historyModal")?.addEventListener("click", (e) => { if (e.target.id === "historyModal") $("#historyModal")?.classList.remove("open"); });
+  $("#closeHistoryModal")?.addEventListener("click", () =>
+    $("#historyModal")?.classList.remove("open")
+  );
+  $("#historyModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "historyModal") $("#historyModal")?.classList.remove("open");
+  });
 
   $("#historyChainSelect")?.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -607,9 +897,16 @@
     }
   });
 
-  $("#receiversBtn")?.addEventListener("click", () => { renderLanes(); $("#receiversModal")?.classList.add("open"); });
-  $("#closeReceiversModal")?.addEventListener("click", () => $("#receiversModal")?.classList.remove("open"));
-  $("#receiversModal")?.addEventListener("click", (e) => { if (e.target.id === "receiversModal") $("#receiversModal")?.classList.remove("open"); });
+  $("#receiversBtn")?.addEventListener("click", () => {
+    renderLanes();
+    $("#receiversModal")?.classList.add("open");
+  });
+  $("#closeReceiversModal")?.addEventListener("click", () =>
+    $("#receiversModal")?.classList.remove("open")
+  );
+  $("#receiversModal")?.addEventListener("click", (e) => {
+    if (e.target.id === "receiversModal") $("#receiversModal")?.classList.remove("open");
+  });
 
   $("#backBtn")?.addEventListener("click", () => {
     document.querySelector(".stage")?.classList.remove("created");
@@ -618,18 +915,31 @@
 
   $("#copyBtn")?.addEventListener("click", async () => {
     if (!activeReceiver) return;
-    try { await navigator.clipboard.writeText(activeReceiver.address); notify("Address copied"); }
-    catch { notify("Copy failed", "error"); }
+    try {
+      await navigator.clipboard.writeText(activeReceiver.address);
+      notify("Address copied");
+    } catch {
+      notify("Copy failed", "error");
+    }
   });
 
   $("#shareBtn")?.addEventListener("click", async () => {
-    if (!activeLane) { notify("Create a payment lane first", "info"); return; }
+    if (!activeLane) {
+      notify("Create a payment lane first", "info");
+      return;
+    }
     const link = laneShareUrl(activeLane);
-    try { await navigator.clipboard.writeText(link); notify("Pay link copied", "success", link); }
-    catch { notify("Copy failed", "error"); }
+    try {
+      await navigator.clipboard.writeText(link);
+      notify("Pay link copied", "success", link);
+    } catch {
+      notify("Copy failed", "error");
+    }
   });
 
-  $("#openRelayBtn")?.addEventListener("click", () => notify("Gasless transfer", "info", "Coming soon."));
+  $("#openRelayBtn")?.addEventListener("click", () =>
+    notify("Gasless transfer", "info", "Coming soon.")
+  );
 
   /* ---------- Init ---------- */
   restrictChainSelect();

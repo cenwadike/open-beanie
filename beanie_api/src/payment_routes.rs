@@ -25,6 +25,13 @@ pub struct IncomingPaymentRequest {
     pub credential_id: String,
 }
 
+#[allow(unused)]
+#[derive(Debug, Deserialize)]
+struct StarknetSignedPayload {
+    typed_data: serde_json::Value,
+    signature: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 struct PaymentResponse {
     status: String,
@@ -37,7 +44,7 @@ pub async fn receive_payment(
     auth: PasskeyAuth, // Stateless & Pre-Rate-Limited Passkey Auth
     Json(payload): Json<IncomingPaymentRequest>,
 ) -> Response {
-    //  Cross-validate Header Credential ID against JSON Payload
+    // Cross-validate Header Credential ID against JSON Payload
     if auth.credential_id != payload.credential_id {
         return err(
             StatusCode::FORBIDDEN,
@@ -111,7 +118,6 @@ pub async fn receive_payment(
             let merchant_addr = match payload.merchant_address.parse::<ethers::types::Address>() {
                 Ok(a) => a,
                 Err(_) => {
-                    // allow merchant_address to be an arbitrary string; derive address from keccak if not parseable
                     let hash = ethers::utils::keccak256(payload.merchant_address.as_bytes());
                     ethers::types::Address::from_slice(&hash[12..32])
                 }
@@ -124,6 +130,16 @@ pub async fn receive_payment(
                 );
             }
         }
+        Chain::Starknet => {
+            // Verify signed Starknet payload structure containing typedData & signature
+            let parsed: Result<StarknetSignedPayload, _> = serde_json::from_str(&sig);
+            if parsed.is_err() {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid Starknet signed payload JSON structure",
+                );
+            }
+        }
         _ => {
             return err(
                 StatusCode::BAD_REQUEST,
@@ -132,8 +148,8 @@ pub async fn receive_payment(
         }
     }
 
-    // Build task and enqueue for background processing. We set create_if_missing=true
-    // so the payment worker will attempt JIT receiver creation and sweep.
+    // Build task and enqueue for background processing.
+    // The signature field contains either EVM hex signature or Starknet signed payload JSON.
     let task = PaymentTask {
         source_chain: payload.chain,
         destination_chain: payload.destination_chain,

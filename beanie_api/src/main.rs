@@ -9,7 +9,9 @@
 //! - `POST /api/v1/pay` - process gasless a payment request
 //! - `POST /api/v1/stealth/claim` - process a stateless stealth account claim
 
+mod announce_worker;
 mod config;
+mod create_routes;
 mod models;
 mod payment_routes;
 mod payment_workers;
@@ -19,7 +21,6 @@ mod stealth_workers;
 mod transfer_workers;
 mod webhook_worker;
 
-use crate::stealth_workers::start_stealth_workers;
 use axum::{
     Router,
     routing::{get, post},
@@ -50,7 +51,9 @@ use crate::models::{StealthTask, mpsc};
 use crate::payment_workers::run_payment_worker;
 use crate::rate_limiter::RateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
+use crate::{announce_worker::run_announce_worker, create_routes::announce_receiver};
 use crate::{config::Config, models::AppState};
+use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
 
 /// Fallback route handler for serving static frontend files and pretty HTML URLs.
 pub async fn serve_static(req: Request) -> Response {
@@ -154,6 +157,9 @@ async fn main() -> anyhow::Result<()> {
     let (payment_tx, payment_rx) = mpsc::channel::<PaymentTask>(2048);
     let payment_tx = Arc::new(payment_tx);
 
+    let (announce_tx, announce_rx) = mpsc::channel::<AnnounceTask>(2048);
+    let announce_tx = Arc::new(announce_tx);
+
     let (webhook_tx, webhook_rx) = mpsc::channel::<crate::models::WebhookJob>(4096);
     let webhook_tx = Arc::new(webhook_tx);
 
@@ -164,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
             32,
             Duration::from_secs(3600),
         )),
+        announce_tx: announce_tx.clone(),
         stealth_tx: stealth_tx.clone(),
         payment_tx: payment_tx.clone(),
         app_config: Arc::new(cfg.clone()),
@@ -172,13 +179,22 @@ async fn main() -> anyhow::Result<()> {
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
     let worker_state = Arc::new(state.clone());
+    let evm_client_clone = evm_client.clone();
+    let starknet_account_clone = starknet_account.clone();
+
+    // Spawn announce workers
+    tokio::spawn(run_announce_worker(
+        evm_client.clone(),
+        starknet_account.clone(),
+        cfg.evm_factory_address,
+        cfg.starknet_factory_address,
+        announce_rx,
+    ));
 
     // Spawn stealth workers
     tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
 
     // Spawn payment worker
-    let evm_client_clone = evm_client.clone();
-    let starknet_account_clone = starknet_account.clone();
     tokio::spawn(run_payment_worker(
         evm_client_clone,
         starknet_account_clone,
@@ -212,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/v1/stealth/claim", post(execute_stealth_claim))
+        .route("/api/v1/create", post(announce_receiver))
         .route("/api/v1/pay", post(crate::payment_routes::receive_payment))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)

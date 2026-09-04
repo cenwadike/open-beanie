@@ -99,16 +99,20 @@ pub async fn discover_merchants(
         return Ok(Vec::new());
     }
 
+    let merchant_reg_topic = H256::from(keccak256("MerchantRegistered(address,address)"));
+    let receiver_announced_topic =
+        H256::from(keccak256("ReceiverAnnounced(address,address,uint256)"));
+
     let mut out = Vec::new();
     let mut chunk_start = from_block;
-    let merchant_reg_topic = H256::from(keccak256("MerchantRegistered(address,address)"));
 
     while chunk_start <= to_block {
         let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
 
+        // Fetch both event types in one eth_getLogs call
         let filter = Filter::new()
             .address(cfg.factory_address)
-            .topic0(merchant_reg_topic)
+            .topic0(vec![merchant_reg_topic, receiver_announced_topic]) // OR
             .from_block(BlockNumber::Number(chunk_start.into()))
             .to_block(BlockNumber::Number(chunk_end.into()));
 
@@ -117,19 +121,39 @@ pub async fn discover_merchants(
         })?;
 
         for log in logs {
-            if log.topics.len() < 2 {
+            if log.topics.is_empty() {
                 continue;
             }
-            let merchant = Address::from(log.topics[1]);
-            if log.data.len() < 32 {
-                continue;
+
+            let topic0 = log.topics[0];
+
+            if topic0 == merchant_reg_topic {
+                // MerchantRegistered(address indexed merchant, address receiver)
+                // topics[1] = merchant, data[12..32] = receiver
+                if log.topics.len() < 2 || log.data.len() < 32 {
+                    continue;
+                }
+                let merchant = Address::from(log.topics[1]);
+                let receiver = Address::from_slice(&log.data[12..32]);
+                out.push((merchant, receiver));
+            } else if topic0 == receiver_announced_topic {
+                // ReceiverAnnounced(address indexed merchant, address indexed receiver, uint256 nonce)
+                // topics[1] = merchant, topics[2] = receiver, data = nonce (ignored)
+                if log.topics.len() < 3 {
+                    continue;
+                }
+                let merchant = Address::from(log.topics[1]);
+                let receiver = Address::from(log.topics[2]);
+                out.push((merchant, receiver));
             }
-            let receiver = Address::from_slice(&log.data[12..32]);
-            out.push((merchant, receiver));
         }
 
         chunk_start = chunk_end + 1;
     }
+
+    // Optional: dedup (same address can appear first as Announced, later as Registered)
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.dedup_by(|a, b| a.1 == b.1);
 
     Ok(out)
 }

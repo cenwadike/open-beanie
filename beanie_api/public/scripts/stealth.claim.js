@@ -399,6 +399,19 @@ function renderMatches() {
   });
 }
 
+// ---- Base64URL Helper for Header Encoding ----
+function bufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let string = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    string += String.fromCharCode(bytes[i]);
+  }
+  return btoa(string)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
 // ---- Step 2: Atomic Execution Claim Dispatch ----
 
 $("claim-btn").addEventListener("click", async () => {
@@ -414,22 +427,38 @@ $("claim-btn").addEventListener("click", async () => {
   let stealthPrivScalar = selectedMatch.stealthPrivScalar;
 
   try {
-    status.textContent = "Constructing atomic transaction payload...";
+    status.textContent = "Authenticating WebAuthn session for backend headers...";
 
+    // 1. Perform WebAuthn assertion to produce the required auth headers
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
     const credentialId = await getOrRegisterCredential();
-    const credIdHex = bytesToHex(new Uint8Array(credentialId));
-    const stealthPrivKeyHex = "0x" + stealthPrivScalar.toString(16).padStart(64, "0");
 
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: challenge,
+        rpId: RP_ID,
+        allowCredentials: [{ id: credentialId, type: "public-key" }],
+        userVerification: "required",
+      },
+    });
+
+    const credIdHex = bytesToHex(new Uint8Array(credentialId));
+    const clientDataB64 = bufferToBase64Url(assertion.response.clientDataJSON);
+    const authDataB64 = bufferToBase64Url(assertion.response.authenticatorData);
+
+    status.textContent = "Constructing stealth transfer transaction...";
+
+    const stealthPrivKeyHex = "0x" + stealthPrivScalar.toString(16).padStart(64, "0");
     let callsPayload = [];
     let txHashToSign = "";
 
     if (chainConfig.type === "starknet") {
-      // Conditionally prepend UDC JIT deployment call directly in payload array
+      // Conditionally prepend UDC JIT deployment call
       if (!selectedMatch.isDeployed) {
         const udcCalldata = [
           selectedMatch.classHash,
           selectedMatch.clientPubKeyFelt,
-          "0x0", // unique = false
+          "0x0",
           selectedMatch.constructorCalldata.length.toString(),
           ...selectedMatch.constructorCalldata,
         ];
@@ -454,7 +483,7 @@ $("claim-btn").addEventListener("click", async () => {
         calldata: sweepCalldata,
       });
 
-      // Compute deterministic hash over the execution calls payload
+      // Compute deterministic hash over the execution calls
       const callHashes = callsPayload.map((c) =>
         hash.computeHashOnElements([
           c.contract_address,
@@ -464,15 +493,22 @@ $("claim-btn").addEventListener("click", async () => {
       );
       txHashToSign = hash.computeHashOnElements([selectedMatch.stealthAddress, ...callHashes]);
 
-      // Sign message hash locally using Stark key
+      // Sign locally using Stark key
       const clientSig = starkEc.starkCurve.sign(txHashToSign, stealthPrivKeyHex);
       const r1 = "0x" + clientSig.r.toString(16).padStart(64, "0");
       const s1 = "0x" + clientSig.s.toString(16).padStart(64, "0");
 
       status.textContent = "Queuing payload to Axum worker pipeline...";
 
+      // Map string key directly to exact Rust enum variant naming
+      const chainEnumMap = {
+        starknet: "Starknet",
+        base: "Base",
+        ethereum: "Ethereum",
+      };
+
       const requestBody = {
-        chain: selectedMatch.chainKey,
+        chain: chainEnumMap[selectedMatch.chainKey],
         tx_hash: txHashToSign,
         derived_address: selectedMatch.stealthAddress,
         client_sig: { r1, s1 },
@@ -482,7 +518,13 @@ $("claim-btn").addEventListener("click", async () => {
 
       const res = await fetch("/api/v1/stealth/execute", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Passkey-Credential-Id": credIdHex,
+          "X-Passkey-Client-Data": clientDataB64,
+          "X-Passkey-Auth-Data": authDataB64,
+          "X-Passkey-Tx-Hash": txHashToSign,
+        },
         body: JSON.stringify(requestBody),
       });
 
@@ -526,8 +568,14 @@ $("claim-btn").addEventListener("click", async () => {
 
       status.textContent = "Queuing payload to Axum worker pipeline...";
 
+      const chainEnumMap = {
+        starknet: "Starknet",
+        base: "Base",
+        ethereum: "Ethereum",
+      };
+
       const requestBody = {
-        chain: selectedMatch.chainKey,
+        chain: chainEnumMap[selectedMatch.chainKey],
         tx_hash: txHashToSign,
         derived_address: selectedMatch.stealthAddress,
         client_sig: { r1, s1 },
@@ -537,7 +585,13 @@ $("claim-btn").addEventListener("click", async () => {
 
       const res = await fetch("/api/v1/stealth/execute", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Passkey-Credential-Id": credIdHex,
+          "X-Passkey-Client-Data": clientDataB64,
+          "X-Passkey-Auth-Data": authDataB64,
+          "X-Passkey-Tx-Hash": txHashToSign,
+        },
         body: JSON.stringify(requestBody),
       });
 

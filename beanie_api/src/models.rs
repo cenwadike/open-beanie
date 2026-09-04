@@ -25,6 +25,7 @@ pub struct AppState {
     pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
     pub evm_config: Arc<beanie_keeper::config::EvmConfig>,
     pub limiter: Arc<RateLimiter>,
+    pub announce_tx: Arc<mpsc::Sender<AnnounceTask>>,
     pub stealth_tx: Arc<mpsc::Sender<StealthTask>>,
     pub payment_tx: Arc<mpsc::Sender<PaymentTask>>,
     pub reqwest_client: Arc<reqwest::Client>,
@@ -39,6 +40,13 @@ pub enum Chain {
     Starknet,
     Ethereum,
     Solana,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnounceTask {
+    pub chain: Chain,
+    pub merchant_address: String,
+    pub credential_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +131,7 @@ abigen!(
     r#"[
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)
         function getReceiverCount(address merchant) external view returns (uint256)
+        function announceReceiver(address merchant) external
     ]"#;
     MerchantWebhookRegistry,
     r#"[

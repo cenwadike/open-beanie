@@ -63,7 +63,7 @@ CCTP domains: Base = 6, Solana = 5, Starknet = 25, Ethereum = 0.
 ## Off-chain: the keeper
 
 A single Rust daemon runs both chains' sweep loops concurrently from one process (`tokio::spawn` per chain, joined at the top level):
-- **Registry discovery** — scans `MerchantRegistered` events on each chain's own factory (`eth_getLogs` on Base, the Starknet-native event query on Starknet) to build a receiver → merchant map per chain.
+- **Registry discovery** — scans `ReceiverAnnounced` events on each chain's own factory (`eth_getLogs` on Base, the Starknet-native event query on Starknet) to build a receiver → merchant map per chain.
 - **Webhook discovery** — scans the single, chain-agnostic `MerchantWebhookRegistry` (an EVM contract) for `WebhookUrlSet` events. Both chains' loops read from the same shared `merchant_webhook` map; only the Base loop needs to refresh it, since the registry only ever lives on one EVM chain regardless of which chain a given deposit originated on.
 - **Deposit detection + sweep** — watches for `Transfer` events into known receivers, batches every receiver that saw activity in a poll cycle into one multicall sweep per chain, and resolves each deposit back to its merchant's webhook URL.
 - **Webhook delivery** — signs every outbound payload before delivery, with a signature scheme that matches the origin chain: EIP-191 `personal_sign` for Base-originated deposits, Poseidon-hash + Starknet native signing for Starknet-originated ones. The receiving server gets `X-Signature-Scheme`, `X-Signature`, and `X-Signer-Address` headers to verify against, plus an `Idempotency-Key` set to the deposit's tx hash. Delivery retries with exponential backoff and treats 4xx responses as terminal (no retry) vs. everything else as retryable.

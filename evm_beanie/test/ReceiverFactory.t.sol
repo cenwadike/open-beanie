@@ -315,6 +315,33 @@ contract ReceiverFactoryTest is Test {
         factory.getMerchantReceiverAt(merchant, 1);
     }
 
+    // test announced receiver is the same as the one that will be deployed next
+    function test_announce_receiver_match_prediction_and_deployment() public {
+        address merchant = address(0xAAA);
+        bytes32 validRecipient = getMintRecipient(merchant);
+
+        // 1. Predict + announce (nonce still 0)
+        address predicted = factory.predictReceiverAddress(merchant);
+
+        vm.expectEmit(true, true, true, true);
+        emit MerchantFactory.ReceiverAnnounced(merchant, predicted, 0);
+        factory.announceReceiver(merchant);
+
+        // 2. Register actually deploys the same address and advances the nonce
+        address deployed = factory.registerMerchant(
+            merchant,
+            "STARKNET",
+            validRecipient
+        );
+
+        // 3. Deployed must equal the address we announced
+        assertEq(deployed, predicted);
+
+        // (optional) After register the *next* prediction is different
+        address nextPredicted = factory.predictReceiverAddress(merchant);
+        assertTrue(nextPredicted != deployed);
+    }
+
     function test_initialize_guard_and_storage() public {
         // Deploy clone manually from implementation to test initialize guards
         address merchant = address(0xABC);
