@@ -48,7 +48,7 @@ use tower_http::services::ServeFile;
 use crate::models::PaymentTask;
 use crate::models::{StealthTask, mpsc};
 use crate::payment_workers::run_payment_worker;
-use crate::rate_limiter::DualRateLimiter;
+use crate::rate_limiter::RateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
 use crate::{config::Config, models::AppState};
 
@@ -158,9 +158,10 @@ async fn main() -> anyhow::Result<()> {
     let webhook_tx = Arc::new(webhook_tx);
 
     let state = AppState {
-        limiter: Arc::new(DualRateLimiter::new(
+        limiter: Arc::new(RateLimiter::new(
             cfg.rate_limit_per_hour,
-            2,
+            8,
+            32,
             Duration::from_secs(3600),
         )),
         stealth_tx: stealth_tx.clone(),

@@ -7,8 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use starknet::core::types::Felt;
 
-use crate::models::Chain;
 use crate::models::{AppState, SocketAddr, StealthTask, err};
+use crate::{models::Chain, rate_limiter::PasskeyAuth};
 
 // --- Structural Constraints ---
 const MAX_CALLS: usize = 20;
@@ -90,12 +90,20 @@ fn sanitize_opaque_identifier(
 }
 
 // --- Handler ---
-
 pub async fn execute_stealth_claim(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: PasskeyAuth, // Stateless & Pre-Rate-Limited Passkey Auth
     Json(payload): Json<ExecuteClaimRequest>,
 ) -> Response {
+    // 0. Cross-validate Header Credential ID against JSON Payload
+    if auth.credential_id != payload.credential_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "Passkey credential header does not match task payload credential ID",
+        );
+    }
+
     // 1. Array Bound Validation (Anti-DoS)
     if payload.calls.is_empty() {
         return err(StatusCode::BAD_REQUEST, "The 'calls' array cannot be empty");
@@ -270,7 +278,10 @@ pub async fn execute_stealth_claim(
     }
 
     // 5. Rate Limiting Check (using canonical derived address)
-    if let Err(msg) = state.limiter.check(addr.ip(), &sanitized_derived_addr) {
+    if let Err(msg) = state
+        .limiter
+        .check(addr.ip(), &sanitized_derived_addr, &auth.credential_id)
+    {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 

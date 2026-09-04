@@ -6,7 +6,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::models::{AppState, Chain, PaymentTask, SocketAddr, err};
+use crate::{
+    models::{AppState, Chain, PaymentTask, SocketAddr, err},
+    rate_limiter::PasskeyAuth,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct IncomingPaymentRequest {
@@ -19,6 +22,7 @@ pub struct IncomingPaymentRequest {
     pub amount_raw: String,
     pub webhook_url: Option<String>,
     pub signature: Option<String>,
+    pub credential_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -30,8 +34,17 @@ struct PaymentResponse {
 pub async fn receive_payment(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: PasskeyAuth, // Stateless & Pre-Rate-Limited Passkey Auth
     Json(payload): Json<IncomingPaymentRequest>,
 ) -> Response {
+    //  Cross-validate Header Credential ID against JSON Payload
+    if auth.credential_id != payload.credential_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "Passkey credential header does not match task payload credential ID",
+        );
+    }
+
     // Basic validation
     if payload.tx_hash.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "tx_hash is required");
@@ -46,7 +59,10 @@ pub async fn receive_payment(
     }
 
     // Rate limiting per receiver/derived address
-    if let Err(msg) = state.limiter.check(addr.ip(), &payload.receiver_address) {
+    if let Err(msg) = state
+        .limiter
+        .check(addr.ip(), &payload.receiver_address, &auth.credential_id)
+    {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 

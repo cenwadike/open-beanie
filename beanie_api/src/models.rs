@@ -8,17 +8,13 @@ use ethers::utils::format_bytes32_string;
 use ethers::utils::keccak256;
 pub use serde::{Deserialize, Serialize};
 use starknet::core::types::Felt;
+pub use std::net::SocketAddr;
 pub use std::sync::Arc;
-pub use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
-    sync::Mutex,
-    time::{Duration, Instant},
-};
 pub use tokio::sync::mpsc;
 
 use crate::{
-    Config, DualRateLimiter,
+    Config,
+    rate_limiter::RateLimiter,
     stealth_routes::{CallDataPayload, ClientSignature},
 };
 
@@ -28,7 +24,7 @@ pub struct AppState {
     pub app_config: Arc<Config>,
     pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
     pub evm_config: Arc<beanie_keeper::config::EvmConfig>,
-    pub limiter: Arc<DualRateLimiter>,
+    pub limiter: Arc<RateLimiter>,
     pub stealth_tx: Arc<mpsc::Sender<StealthTask>>,
     pub payment_tx: Arc<mpsc::Sender<PaymentTask>>,
     pub reqwest_client: Arc<reqwest::Client>,
