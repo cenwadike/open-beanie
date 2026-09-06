@@ -70,6 +70,7 @@ pub struct StarknetConfig {
     pub keeper_wallet: StarknetLocalWallet,
     pub registry_start_block: u64,
     pub webhook_registry_start_block: u64,
+    pub poll_interval: Duration,
     pub log_chunk_blocks: u64,
 }
 
@@ -95,6 +96,12 @@ impl StarknetConfig {
             webhook_registry_start_block: env("STARKNET_WEBHOOK_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid REGISTRY_START_BLOCK")?,
+            poll_interval: Duration::from_secs(
+                env("STARKNET_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12),
+            ),
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -110,7 +117,7 @@ fn parse_felt_env(var_name: &str) -> Result<Felt> {
 
 #[derive(Debug, Clone)]
 pub struct EvmConfig {
-    pub rpc_url: String,
+    pub evm_rpc_url: String,
     pub chain_name: String, // "base" | "ethereum" — carried into the webhook payload
     pub token_address: Address, // the stablecoin ERC20 contract
     pub factory_address: Address, // Beanie's EVM MerchantFactory
@@ -131,27 +138,27 @@ pub struct EvmConfig {
 impl EvmConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            rpc_url: env("BASE_RPC_URL")?,
+            evm_rpc_url: env("BASE_RPC_URL")?,
             chain_name: "base".into(),
             token_address: addr(&env("BASE_TOKEN_ADDRESS")?)?,
             factory_address: addr(&env("BASE_FACTORY_ADDRESS")?)?,
-            registry_start_block: env("REGISTRY_START_BLOCK")?
+            registry_start_block: env("BASE_REGISTRY_START_BLOCK")?
                 .parse()
-                .context("REGISTRY_START_BLOCK must be a valid u64")?,
-            webhook_registry_address: addr(&env("WEBHOOK_REGISTRY_ADDRESS")?)?,
-            webhook_registry_start_block: env("WEBHOOK_REGISTRY_START_BLOCK")?
+                .context("BASE_REGISTRY_START_BLOCK must be a valid u64")?,
+            webhook_registry_address: addr(&env("BASE_WEBHOOK_REGISTRY_ADDRESS")?)?,
+            webhook_registry_start_block: env("BASE_WEBHOOK_REGISTRY_START_BLOCK")?
                 .parse()
-                .context("WEBHOOK_REGISTRY_START_BLOCK must be a valid u64")?,
+                .context("BASE_WEBHOOK_REGISTRY_START_BLOCK must be a valid u64")?,
             keeper_wallet: load_keeper_wallet(&env("BASE_SWEEP_PRIVATE_KEY")?)?,
             poll_interval: Duration::from_secs(
-                env("POLL_INTERVAL_SECS")
+                env("BASE_POLL_INTERVAL_SECS")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(12), // ~1 EVM block on most L2s; tune per chain
+                    .unwrap_or(12),
             ),
             deposit_start_block: env("BASE_DEPOSIT_START_BLOCK")?
                 .parse()
-                .context("BASE_START_BLOCK must be a valid u64")?,
+                .context("BASE_DEPOSIT_START_BLOCK must be a valid u64")?,
             log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
                 .ok()
                 .and_then(|s| s.parse().ok())

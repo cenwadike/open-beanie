@@ -73,7 +73,7 @@ pub type SignerProvider =
 
 pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> {
     // Retries 10 times max with 2000ms initial backoff on rate limits / 429s
-    let provider = Provider::<RetryClient<Http>>::new_client(cfg.rpc_url.as_str(), 10, 2000)
+    let provider = Provider::<RetryClient<Http>>::new_client(cfg.evm_rpc_url.as_str(), 10, 2000)
         .context("invalid RPC URL or failed initializing retry client")?;
 
     let chain_id = provider

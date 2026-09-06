@@ -8,13 +8,13 @@ use starknet::core::utils::get_selector_from_name;
 use tokio::sync::mpsc;
 
 use crate::models::{AnnounceTask, Chain, MerchantFactory, derive_felt_from_foreign_address};
-use crate::payment_workers::{EvmSignerProvider, StarknetAccount};
+use crate::payment_workers::StarknetAccount;
 
 /// Background worker: receives AnnounceTask and calls on-chain
 /// `announceReceiver` / `announce_receiver` so the native poller can
 /// start watching the predicted address.
 pub async fn run_announce_worker(
-    evm_client: Arc<EvmSignerProvider>,
+    evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
     starknet_account: Arc<StarknetAccount>,
     evm_factory_addr: Address,
     starknet_factory_addr: Felt,

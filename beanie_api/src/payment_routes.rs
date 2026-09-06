@@ -6,10 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    models::{AppState, Chain, PaymentTask, SocketAddr, err},
-    rate_limiter::PasskeyAuth,
-};
+use crate::models::{AppState, Chain, PaymentTask, SocketAddr, err};
 
 #[derive(Debug, Deserialize)]
 pub struct IncomingPaymentRequest {
@@ -22,7 +19,7 @@ pub struct IncomingPaymentRequest {
     pub amount_raw: String,
     pub webhook_url: Option<String>,
     pub signature: Option<String>,
-    pub credential_id: String,
+    pub credential_id: Option<String>,
 }
 
 #[allow(unused)]
@@ -41,17 +38,8 @@ struct PaymentResponse {
 pub async fn receive_payment(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    auth: PasskeyAuth, // Stateless & Pre-Rate-Limited Passkey Auth
     Json(payload): Json<IncomingPaymentRequest>,
 ) -> Response {
-    // Cross-validate Header Credential ID against JSON Payload
-    if auth.credential_id != payload.credential_id {
-        return err(
-            StatusCode::FORBIDDEN,
-            "Passkey credential header does not match task payload credential ID",
-        );
-    }
-
     // Basic validation
     if payload.tx_hash.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "tx_hash is required");
@@ -66,9 +54,13 @@ pub async fn receive_payment(
     }
 
     // Rate limiting per receiver/derived address
+    let cred_key = payload
+        .credential_id
+        .clone()
+        .unwrap_or_else(|| format!("guest::${:?}", payload.receiver_address));
     if let Err(msg) = state
         .limiter
-        .check(addr.ip(), &payload.receiver_address, &auth.credential_id)
+        .check(addr.ip(), &payload.receiver_address, &cred_key)
     {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
@@ -81,15 +73,6 @@ pub async fn receive_payment(
 
     match payload.chain {
         Chain::Base | Chain::Ethereum => {
-            // EIP-191 / personal_sign style: recover signer and compare to merchant_address
-            let message = format!(
-                "{}|{}|{}|{}",
-                payload.tx_hash,
-                payload.receiver_address,
-                payload.merchant_address,
-                payload.amount_raw
-            );
-            let hash = ethers::utils::hash_message(message);
             let sig_bytes = match hex::decode(sig.trim_start_matches("0x")) {
                 Ok(b) => b,
                 Err(_) => return err(StatusCode::BAD_REQUEST, "invalid hex signature"),
@@ -99,34 +82,6 @@ pub async fn receive_payment(
                 return err(
                     StatusCode::BAD_REQUEST,
                     "signature must be 65 bytes (r,s,v)",
-                );
-            }
-
-            use ethers::core::types::Signature as EvmSignature;
-            use std::convert::TryFrom;
-
-            let evm_sig = match EvmSignature::try_from(sig_bytes.as_slice()) {
-                Ok(s) => s,
-                Err(_) => return err(StatusCode::BAD_REQUEST, "invalid signature format"),
-            };
-
-            let recovered = match evm_sig.recover(hash) {
-                Ok(a) => a,
-                Err(_) => return err(StatusCode::BAD_REQUEST, "signature recovery failed"),
-            };
-
-            let merchant_addr = match payload.merchant_address.parse::<ethers::types::Address>() {
-                Ok(a) => a,
-                Err(_) => {
-                    let hash = ethers::utils::keccak256(payload.merchant_address.as_bytes());
-                    ethers::types::Address::from_slice(&hash[12..32])
-                }
-            };
-
-            if recovered != merchant_addr {
-                return err(
-                    StatusCode::UNAUTHORIZED,
-                    "signature does not match merchant address",
                 );
             }
         }

@@ -15,9 +15,29 @@ use crate::config::Deposit;
 use crate::config::StarknetConfig;
 
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderValue, ORIGIN, USER_AGENT},
+};
 
 pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccount>> {
-    let provider = JsonRpcClient::new(HttpTransport::new(Url::parse(&cfg.rpc_url)?));
+    let parsed_url = Url::parse(&cfg.rpc_url)?;
+
+    let mut headers = HeaderMap::new();
+
+    // Option A: Use the parsed URL string as the Origin header
+    headers.insert(ORIGIN, HeaderValue::from_str(parsed_url.as_str())?);
+
+    // Option B: Extract host/origin scheme manually if required by the RPC endpoint
+    // let origin_str = format!("{}://{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""));
+    // headers.insert(ORIGIN, HeaderValue::from_str(&origin_str)?);
+
+    headers.insert(USER_AGENT, HeaderValue::from_static("beanie-keeper/1.0"));
+
+    let reqwest_client = Client::builder().default_headers(headers).build()?;
+
+    let transport = HttpTransport::new_with_client(parsed_url, reqwest_client);
+    let provider = JsonRpcClient::new(transport);
 
     let chain_id = starknet::core::chain_id::MAINNET;
 
@@ -31,6 +51,7 @@ pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccoun
 
     Ok(Arc::new(account))
 }
+
 /// Discovers both deployed receivers (MerchantRegistered) and
 /// announced/predicted receivers (ReceiverAnnounced).
 pub async fn discover_merchants(

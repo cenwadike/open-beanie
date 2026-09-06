@@ -35,17 +35,29 @@ a {
   min-height: 100vh;
   isolation: isolate;
   overflow: hidden;
+  background: #0a0a0a;
 }
 
 .doodle-field {
   position: fixed;
   inset: 0;
   z-index: 0;
+  overflow: hidden;
   background:
-    radial-gradient(circle at 72% 18%, rgba(184, 201, 154, 0.18), transparent 24rem),
-    radial-gradient(circle at 18% 24%, rgba(0, 82, 255, 0.15), transparent 22rem),
-    linear-gradient(rgba(4, 4, 4, 0.84), rgba(4, 4, 4, 0.92)),
-    #0a0a0a;
+    radial-gradient(circle at 70% 14%, rgba(184, 201, 154, 0.16), transparent 22%),
+    radial-gradient(circle at 22% 22%, rgba(98, 72, 176, 0.16), transparent 28%),
+    linear-gradient(rgba(4, 4, 4, 0.82), rgba(4, 4, 4, 0.91)),
+}
+
+/* Positions the <img> under the .doodle-field gradient overlay */
+.background-art {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.18;
+  pointer-events: none;
 }
 
 .veil {
@@ -54,8 +66,20 @@ a {
   z-index: 1;
   pointer-events: none;
   background:
-    radial-gradient(circle at 50% 48%, rgba(10, 10, 10, 0.18) 0 18rem, rgba(10, 10, 10, 0.74) 44rem),
-    linear-gradient(90deg, rgba(10, 10, 10, 0.48), transparent 28%, transparent 72%, rgba(10, 10, 10, 0.48));
+    radial-gradient(circle at 50% 50%, rgba(10, 10, 10, 0.34) 0 18rem, rgba(10, 10, 10, 0.58) 31rem, rgba(10, 10, 10, 0.82) 100%),
+    linear-gradient(90deg, rgba(10, 10, 10, 0.34), rgba(10, 10, 10, 0.18) 24%, rgba(10, 10, 10, 0.18) 76%, rgba(10, 10, 10, 0.34));
+}
+
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.014) 1px, transparent 1px);
+  background-size: 42px 42px;
 }
 
 .topbar {
@@ -234,7 +258,8 @@ a {
 .live-toast {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  text-align: center;
+  justify-content: center;
   width: 100%;
   min-height: 48px;
   border-radius: 14px;
@@ -257,8 +282,6 @@ a {
   color: #fff;
 }
 
-
-
 .pay-route-meta {
   display: flex;
   flex-direction: column;
@@ -272,4 +295,24 @@ a {
 
 .pay-route.active .pay-route-arrow {
   color: #fff;
+}
+
+.qr-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+
+.qr-code-img {
+  width: 240px;
+  height: 240px;
+  max-width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 12px;
+  background: #ffffff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }

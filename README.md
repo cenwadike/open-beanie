@@ -109,9 +109,8 @@ forge test
 
 ```bash
 cd beanie_keeper
-cp .env.example .env
 cargo check
-cargo run
+cargo build
 
 ```
 

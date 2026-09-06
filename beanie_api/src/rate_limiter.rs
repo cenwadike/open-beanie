@@ -230,7 +230,7 @@ impl RateLimiter {
     }
 
     /// Standalone passkey check for middleware extraction phase
-    pub fn check_credential(&self, credential_id: &str) -> Result<(), &'static str> {
+    fn check_credential(&self, credential_id: &str) -> Result<(), &'static str> {
         let now = Instant::now();
         let mut credentials = self.credential_hits.lock().unwrap();
         let entry = credentials

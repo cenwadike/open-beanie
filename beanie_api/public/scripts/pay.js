@@ -152,54 +152,85 @@
     return [];
   }
 
-  // Obtain signed AVNU Paymaster execution payload without broadcasting from client
-  async function prepareStarknetSignedCall(userAddress, receiverAddress, amountRaw) {
-    const starknetWindow = window.starknet || window.starknet_argentX || window.starknet_braavos;
-    if (!starknetWindow) {
-      throw new Error("Starknet wallet extension not detected.");
-    }
+  // --- Base (EIP-3009 transferWithAuthorization) -----------------------------
+  const USDC_DOMAIN_BASE = {
+    name: "USD Coin",
+    version: "2",
+    chainId: 8453,
+    verifyingContract: CHAINS.BASE.usdc,
+  };
 
-    if (!starknetWindow.isConnected) {
-      await starknetWindow.enable();
-    }
+  async function prepareEvmSignedTransfer(receiverAddress, amountRaw) {
+    if (!window.ethereum) throw new Error("Web3 wallet required for EVM.");
+    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+    const fromAddress = accounts[0];
+
+    const nonce = "0x" + bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+    const validAfter = 0;
+    const validBefore = Math.floor(Date.now() / 1000) + 600; // 10 min window
+
+    const message = { from: fromAddress, to: receiverAddress, value: amountRaw, validAfter, validBefore, nonce };
+
+    const typedData = {
+      types: {
+        EIP712Domain: [
+          { name: "name", type: "string" },
+          { name: "version", type: "string" },
+          { name: "chainId", type: "uint256" },
+          { name: "verifyingContract", type: "address" },
+        ],
+        TransferWithAuthorization: [
+          { name: "from", type: "address" },
+          { name: "to", type: "address" },
+          { name: "value", type: "uint256" },
+          { name: "validAfter", type: "uint256" },
+          { name: "validBefore", type: "uint256" },
+          { name: "nonce", type: "bytes32" },
+        ],
+      },
+      domain: USDC_DOMAIN_BASE,
+      primaryType: "TransferWithAuthorization",
+      message,
+    };
+
+    const signature = await window.ethereum.request({
+      method: "eth_signTypedData_v4",
+      params: [fromAddress, JSON.stringify(typedData)],
+    });
+
+    return { ...message, signature };
+  }
+
+  // --- Starknet: build typed data via OUR backend, not AVNU directly ---------
+  async function prepareStarknetSignedCall(receiverAddress, amountRaw) {
+    const starknetWindow = window.starknet || window.starknet_argentX || window.starknet_braavos;
+    if (!starknetWindow) throw new Error("Starknet wallet extension not detected.");
+    if (!starknetWindow.isConnected) await starknetWindow.enable();
 
     const amountUint256 = BigInt(amountRaw);
     const amountLow = (amountUint256 & BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")).toString();
     const amountHigh = (amountUint256 >> BigInt(128)).toString();
-
-    const userAccountAddress = starknetWindow.selectedAddress || userAddress;
+    const userAccountAddress = starknetWindow.selectedAddress;
 
     const calls = [{
       contractAddress: CHAINS.STARKNET.usdc,
       entrypoint: "transfer",
-      calldata: [receiverAddress, amountLow, amountHigh]
+      calldata: [receiverAddress, amountLow, amountHigh],
     }];
 
-    // 1. Get AVNU Typed Data message structure
-    const typedDataRes = await fetch(AVNU_BUILD_TYPED_DATA_URL, {
+    // Ask OUR server to build the typed data. The AVNU API key never touches the browser.
+    const typedDataRes = await fetch("/api/v1/paymaster/build-typed-data", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        userAddress: userAccountAddress,
-        calls: calls
-      })
+      body: JSON.stringify({ userAddress: userAccountAddress, calls }),
     });
-
-    if (!typedDataRes.ok) {
-      throw new Error("Failed to fetch AVNU Paymaster typed data");
-    }
-
+    if (!typedDataRes.ok) throw new Error("Failed to build paymaster typed data");
     const typedData = await typedDataRes.json();
 
-    // 2. Sign typed data message via wallet (SNIP-12)
     const signature = await starknetWindow.account.signMessage(typedData);
     const formattedSignature = Array.isArray(signature) ? signature : [signature.r, signature.s];
 
-    return {
-      typedData,
-      signature: JSON.stringify(formattedSignature),
-      userAddress: userAccountAddress
-    };
+    return { typedData, signature: formattedSignature, userAddress: userAccountAddress };
   }
 
   function renderCard(routes) {
@@ -243,7 +274,7 @@
       if (!isGaslessMode) {
         const scheme = chainConfig.kind === "evm" ? "ethereum" : "starknet";
         qrContent = `${scheme}:${currentRoute.address}`;
-        qrLabel = `Scan to copy address / deposit via wallet on ${escapeHtml(chainName)}`;
+        qrLabel = `Scan to Pay on ${escapeHtml(chainName)}`;
       } else {
         const params = new URLSearchParams(window.location.search);
         const txHash = params.get("tx") || "0x0";
@@ -258,7 +289,7 @@
         passkeyPayUrl.searchParams.set("amount", amount);
 
         qrContent = passkeyPayUrl.toString();
-        qrLabel = "Scan with your phone to authorize and pay via Passkey API";
+        qrLabel = "Scan to Authorize Payment";
       }
 
       const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrContent)}`;
@@ -280,23 +311,21 @@
       <div class="address-display-card">
         <div class="address-val" id="depositAddr">${escapeHtml(currentRoute.address)}</div>
         <button class="copy-btn" id="actionBtn" type="button">
-          ${isGaslessMode ? "Pay via Gasless API" : "Copy Address"}
+          ${isGaslessMode ? "Pay with Beanie" : "Copy Address"}
         </button>
       </div>
 
-      <div style="margin-top: 0.5rem; text-align: right;">
-        <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8;">
-          <input type="checkbox" id="modeToggle" ${isGaslessMode ? "checked" : ""}> Opt-in Gasless API
+      <div style="margin-top: 0.5rem; display: flex; justify-content: flex-end;">
+        <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8; display: inline-flex; align-items: center; gap: 6px;">
+          <input type="checkbox" id="modeToggle" ${isGaslessMode ? "checked" : ""} style="margin: 0; cursor: pointer;">
+          <span>Gasless Transfer</span>
         </label>
       </div>
 
       <div class="qr-container" style="margin-top: 1.25rem; text-align: center;">
-        <img src="${qrApiUrl}" alt="Scan to Pay QR Code" style="border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); padding: 8px; background: #fff;" width="160" height="160" />
-        <p style="font-size: 0.75rem; margin-top: 0.5rem; opacity: 0.7;">${qrLabel}</p>
+        <img src="${qrApiUrl}" alt="Scan to Pay QR Code" class="qr-code-img" width="240" height="240" />
+        <p style="font-size: 0.85rem; margin-top: 0.75rem; opacity: 0.8;">${qrLabel}</p>
       </div>
-
-      <p class="fee-notice" style="margin-top: 1rem;">Beanie keeps 0.5% fee on every deposit</p>
-      <p class="status-hint" id="payHint">Ready to receive USDC on ${escapeHtml(chainName)}</p>
     `;
 
       laneCard.querySelectorAll(".pay-route").forEach((btn) => {
@@ -327,48 +356,23 @@
           const amountRaw = params.get("amount") || "1000000";
 
           try {
-            if (hint) hint.textContent = "Authenticating WebAuthn passkey...";
-            const challenge = crypto.getRandomValues(new Uint8Array(32));
-            const credentialId = await getOrRegisterCredential();
-
-            const assertion = await navigator.credentials.get({
-              publicKey: {
-                challenge: challenge,
-                rpId: RP_ID,
-                allowCredentials: [{ id: credentialId, type: "public-key" }],
-                userVerification: "required",
-              },
-            });
-
-            const credIdHex = bytesToHex(new Uint8Array(credentialId));
-            const clientDataB64 = bufferToBase64Url(assertion.response.clientDataJSON);
-            const authDataB64 = bufferToBase64Url(assertion.response.authenticatorData);
-
             let signatureHex = "";
             let senderAddress = merchantAddr;
 
+            let signaturePayload;
             if (chainConfig.kind === "evm") {
-              if (hint) hint.textContent = "Signing EVM payment authorization...";
-              const messageToSign = `${txHash}|${currentRoute.address}|${merchantAddr}|${amountRaw}`;
-              if (!window.ethereum) throw new Error("Web3 wallet required for EVM.");
-              signatureHex = await window.ethereum.request({
-                method: "personal_sign",
-                params: [messageToSign, merchantAddr],
-              });
+              if (hint) hint.textContent = "Sign the transfer authorization in your wallet...";
+              const auth = await prepareEvmSignedTransfer(currentRoute.address, amountRaw);
+              senderAddress = auth.from;
+              signaturePayload = { kind: "evm", ...auth };
             } else if (chainConfig.kind === "starknet") {
-              if (hint) hint.textContent = "Signing Starknet gasless transfer message...";
-              const starknetSigned = await prepareStarknetSignedCall(merchantAddr, currentRoute.address, amountRaw);
-
-              // Package signed execution payload into signature field for backend worker execution
-              signatureHex = JSON.stringify({
-                typedData: starknetSigned.typedData,
-                signature: starknetSigned.signature,
-              });
-              senderAddress = starknetSigned.userAddress;
+              if (hint) hint.textContent = "Sign the sponsored transfer in your wallet...";
+              const sn = await prepareStarknetSignedCall(currentRoute.address, amountRaw);
+              senderAddress = sn.userAddress;
+              signaturePayload = { kind: "starknet", typedData: sn.typedData, signature: sn.signature };
             }
 
-            if (hint) hint.textContent = "Relaying request to Gasless Pay API...";
-
+            if (hint) hint.textContent = "Relaying request...";
             const payload = {
               chain: chainConfig.chainEnum,
               merchant_address: merchantAddr,
@@ -378,19 +382,12 @@
               from_address: senderAddress,
               amount_raw: amountRaw,
               webhook_url: null,
-              signature: signatureHex,
-              credential_id: credIdHex,
+              signature: JSON.stringify(signaturePayload),
             };
 
-            const res = await fetch("/api/v1/payment/receive", {
+            const res = await fetch("/api/v1/pay", {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Passkey-Credential-Id": credIdHex,
-                "X-Passkey-Client-Data": clientDataB64,
-                "X-Passkey-Auth-Data": authDataB64,
-                "X-Passkey-Tx-Hash": txHash,
-              },
+              headers: { "Content-Type": "application/json" },
               body: JSON.stringify(payload),
             });
 
@@ -400,7 +397,7 @@
             }
 
             const data = await res.json();
-            notify("Gasless payment task successfully queued!");
+            notify("Pay with Beanie Authorized Successfully✅");
             if (hint) hint.textContent = `Queued: ${data.message}`;
           } catch (err) {
             notify(`Payment execution failed: ${err.message}`);

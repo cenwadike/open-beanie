@@ -44,11 +44,11 @@
           <form class="composer" id="receiverForm">
             <div class="hero-copy">
               <h1><span>One payment lane</span><span>for every chain</span></h1>
-              <p>USDC from <strong>any</strong> chain lands straight to your wallet. <br \><span>No middleman.</span>
+              <p>USDC from <strong>any</strong> chain lands straight to your wallet. <br /><span>No middleman.</span>
               </p>
             </div>
             <div class="utility-stack">
-              <button class="history-btn" type="button"><span class="action-icon"
+              <button class="history-btn" id="historyBtn" type="button"><span class="action-icon"
                   aria-hidden="true">↶</span><span>History</span></button>
               <button class="history-btn receivers-btn" id="receiversBtn" type="button"><span class="action-icon"
                   aria-hidden="true">⇄</span><span>Lanes</span></button>
@@ -69,7 +69,7 @@
                   <option value="" selected disabled hidden>-- choose your address network --</option>
                   <option value="starknet">Starknet</option>
                   <option value="base">Base</option>
-                  <option value="solana">Solana</option>
+                  <option value="solana" disabled>Solana (coming soon)</option>
                 </select>
               </span>
             </label>
@@ -81,8 +81,35 @@
                 placeholder="https://example.com/webhook" />
             </label>
 
-            <button class="create-btn" id="createReceiverBtn" type="submit">Create Payment Lane</button>
+            <div class="field-wrap">
+              <div class="privacy-segmented" role="radiogroup" aria-label="Privacy mode">
+                <button type="button" class="privacy-option" data-mode="open" id="privacyOpen" aria-pressed="true">
+                  <svg class="privacy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10z"></path>
+                  </svg>
+                  <span>Standard</span>
+                </button>
+
+                <button type="button" class="privacy-option" data-mode="stealth" id="privacyStealth"
+                  aria-pressed="false">
+                  <svg class="privacy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                  </svg>
+                  <span>Stealth</span>
+                </button>
+
+                <!-- Hidden checkbox kept for JS compatibility -->
+                <input type="checkbox" id="privacyToggle" class="sr-only" />
+              </div>
+            </div>
+
+            <button class="create-btn" id="createReceiverBtn" type="submit">Create Payment Link</button>
             <div class="inline-config">
+              <span class="fee-badge">0.5% Beanie fee</span>
               <div class="route-summary" id="routeSummary">USDC lands on Starknet</div>
             </div>
           </form>

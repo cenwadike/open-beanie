@@ -9,7 +9,7 @@
 //! - `POST /api/v1/pay` - process gasless a payment request
 //! - `POST /api/v1/stealth/claim` - process a stateless stealth account claim
 
-mod announce_worker;
+mod announce_workers;
 mod config;
 mod create_routes;
 mod models;
@@ -19,7 +19,7 @@ mod rate_limiter;
 mod stealth_routes;
 mod stealth_workers;
 mod transfer_workers;
-mod webhook_worker;
+mod webhook_workers;
 
 use axum::{
     Router,
@@ -30,17 +30,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
-use beanie_keeper::config::StarknetConfig;
-use ethers::{
-    middleware::{NonceManagerMiddleware, SignerMiddleware},
-    providers::{Http as EvmHttp, Middleware, Provider as EvmProvider},
-    signers::{LocalWallet, Signer},
-};
-use starknet::{
-    accounts::{ExecutionEncoding, SingleOwnerAccount},
-    providers::jsonrpc::{HttpTransport, JsonRpcClient},
-    signers::{LocalWallet as StarknetWallet, SigningKey},
-};
+use beanie_keeper::config::{EvmConfig, StarknetConfig};
 use std::{sync::Arc, time::Duration};
 
 use tower::ServiceExt;
@@ -51,7 +41,7 @@ use crate::models::{StealthTask, mpsc};
 use crate::payment_workers::run_payment_worker;
 use crate::rate_limiter::RateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
-use crate::{announce_worker::run_announce_worker, create_routes::announce_receiver};
+use crate::{announce_workers::run_announce_worker, create_routes::announce_receiver};
 use crate::{config::Config, models::AppState};
 use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
 
@@ -127,28 +117,14 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+    let starknet_cfg = StarknetConfig::from_env()?;
+    let evm_cfg = EvmConfig::from_env()?;
 
     // 1. Initialize EVM Provider & Signer Client
-    let evm_provider = EvmProvider::<EvmHttp>::try_from(cfg.evm_rpc_url.as_str())?;
-    let wallet: LocalWallet = cfg.evm_keeper_private_key.parse()?;
-    let chain_id = evm_provider.get_chainid().await?.as_u64();
-    let wallet = wallet.with_chain_id(chain_id);
-
-    let nonce_managed = NonceManagerMiddleware::new(evm_provider.clone(), wallet.address());
-    let evm_client = Arc::new(SignerMiddleware::new(nonce_managed, wallet));
+    let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
 
     // 2. Initialize Starknet Account Client
-    let rpc_client = JsonRpcClient::new(HttpTransport::new(cfg.starknet_rpc_url.clone()));
-    let starknet_signer =
-        StarknetWallet::from(SigningKey::from_secret_scalar(cfg.starknet_private_key));
-
-    let starknet_account = Arc::new(SingleOwnerAccount::new(
-        rpc_client.clone(),
-        starknet_signer,
-        cfg.starknet_account_address,
-        cfg.starknet_chain_id,
-        ExecutionEncoding::New,
-    ));
+    let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
 
     // 3. Setup Bounded Channels and Background Workers
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
@@ -179,15 +155,19 @@ async fn main() -> anyhow::Result<()> {
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
     let worker_state = Arc::new(state.clone());
-    let evm_client_clone = evm_client.clone();
-    let starknet_account_clone = starknet_account.clone();
+    let announce_evm_client_clone = evm_client.clone();
+    let payment_evm_client_clone = evm_client.clone();
+    let transfer_evm_client_clone = evm_client.clone();
+    let announce_starknet_account_clone = starknet_account.clone();
+    let payment_starknet_account_clone = starknet_account.clone();
+    let transfer_starknet_account_clone = starknet_account.clone();
 
     // Spawn announce workers
     tokio::spawn(run_announce_worker(
-        evm_client.clone(),
-        starknet_account.clone(),
-        cfg.evm_factory_address,
-        cfg.starknet_factory_address,
+        announce_evm_client_clone,
+        announce_starknet_account_clone,
+        evm_cfg.factory_address,
+        starknet_cfg.factory_address,
         announce_rx,
     ));
 
@@ -196,10 +176,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn payment worker
     tokio::spawn(run_payment_worker(
-        evm_client_clone,
-        starknet_account_clone,
-        cfg.evm_factory_address,
-        cfg.starknet_factory_address,
+        payment_evm_client_clone,
+        payment_starknet_account_clone,
         state.evm_config.clone(),
         state.starknet_config.clone(),
         payment_rx,
@@ -207,12 +185,12 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Spawn native transfer worker
-    let evm_client_clone2 = evm_client.clone();
     let evm_cfg_clone = state.evm_config.clone();
     let starknet_cfg_clone = state.starknet_config.clone();
     tokio::spawn(async move {
         crate::transfer_workers::run_native_transfer_poller(
-            evm_client_clone2,
+            transfer_evm_client_clone,
+            transfer_starknet_account_clone,
             evm_cfg_clone,
             starknet_cfg_clone,
             webhook_tx.clone(),
@@ -223,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn webhook delivery worker
     let http_for_webhooks = state.reqwest_client.clone();
     tokio::spawn(async move {
-        crate::webhook_worker::run_webhook_worker(http_for_webhooks, webhook_rx).await;
+        crate::webhook_workers::run_webhook_worker(http_for_webhooks, webhook_rx).await;
     });
 
     let app = Router::new()

@@ -21,8 +21,6 @@ use ethers::{
 };
 use ethers::{types::Address, utils::keccak256};
 
-pub type EvmSignerProvider =
-    SignerMiddleware<NonceManagerMiddleware<EvmProvider<EvmHttp>>, LocalWallet>;
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, StarknetWallet>;
 
 use crate::models::{ChainXReceiverLocal, MerchantFactory};
@@ -70,16 +68,17 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 /// Payment worker: processes incoming payment notifications, performs JIT
 /// receiver creation if missing, and triggers `sweep()` on the receiver.
 pub async fn run_payment_worker(
-    evm_client: Arc<EvmSignerProvider>,
+    evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
     starknet_account: Arc<StarknetAccount>,
-    evm_factory_addr: Address,
-    starknet_factory_addr: Felt,
     evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
     mut rx: mpsc::Receiver<crate::models::PaymentTask>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
 ) {
     println!("Payment worker active...");
+
+    let starknet_factory_addr = starknet_cfg.factory_address;
+    let evm_factory_addr = evm_cfg.factory_address;
 
     // Local abigen is declared at top-level
 

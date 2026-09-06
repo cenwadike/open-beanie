@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 beanie_keeper = { path = "../beanie_keeper" }
-reqwest = { version = "0.13.4", features = ["json"] }
+reqwest = { version = "0.12.28", features = ["json"] }
 serde = { version = "1.0.151", features = ["derive"] }
 anyhow = "1.0.104"
 axum = "0.8.9"

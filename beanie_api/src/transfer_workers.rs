@@ -1,6 +1,8 @@
+use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use beanie_keeper::starknet_keeper::StarknetAccount;
 use ethers::contract::abigen;
 use ethers::providers::Middleware;
 use ethers::types::{Address, U256};
@@ -13,7 +15,6 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 use crate::models::{ChainXReceiverLocal, MerchantFactory};
-use crate::payment_workers::EvmSignerProvider;
 
 abigen!(
     Multicall3,
@@ -55,7 +56,8 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 /// When funds are found on a still-undeployed receiver it JIT-deploys via
 /// `registerMerchant` and sweeps in a single atomic multicall / execute_v3.
 pub async fn run_native_transfer_poller(
-    evm_client: Arc<EvmSignerProvider>,
+    evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    starknet_account: Arc<StarknetAccount>,
     evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
@@ -78,20 +80,11 @@ pub async fn run_native_transfer_poller(
         }
     };
 
-    let mut registry_watermark = evm_cfg.registry_start_block;
     let mut webhook_watermark = evm_cfg.webhook_registry_start_block;
-    let mut deposit_watermark = evm_cfg.deposit_start_block;
+    let mut base_registry_watermark = evm_cfg.registry_start_block;
+    let mut base_deposit_watermark = evm_cfg.deposit_start_block;
     let mut sn_registry_watermark = starknet_cfg.registry_start_block;
     let mut sn_deposit_watermark = starknet_cfg.registry_start_block;
-
-    let starknet_account =
-        match beanie_keeper::starknet_keeper::build_starknet_account(&*starknet_cfg) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("failed building starknet keeper account for native poller: {e}");
-                return;
-            }
-        };
 
     loop {
         // ------------------------------------------------------------------
@@ -110,11 +103,11 @@ pub async fn run_native_transfer_poller(
         // Refresh EVM merchant registry (now includes ReceiverAnnounced)
         // ------------------------------------------------------------------
         let mut evm_merchant_map: HashMap<Address, Address> = HashMap::new();
-        if registry_watermark <= tip_bn {
+        if base_registry_watermark <= tip_bn {
             match beanie_keeper::evm_keeper::discover_merchants(
                 &keeper_client,
                 &*evm_cfg,
-                registry_watermark,
+                base_registry_watermark,
                 tip_bn,
             )
             .await
@@ -123,7 +116,7 @@ pub async fn run_native_transfer_poller(
                     for (merchant, receiver) in found {
                         evm_merchant_map.insert(receiver, merchant);
                     }
-                    registry_watermark = tip_bn + 1;
+                    base_registry_watermark = tip_bn + 1;
                 }
                 Err(e) => eprintln!("discover_merchants failed: {e}"),
             }
@@ -157,19 +150,19 @@ pub async fn run_native_transfer_poller(
         // ------------------------------------------------------------------
         let receivers: Vec<Address> = evm_merchant_map.keys().copied().collect();
 
-        if deposit_watermark <= tip_bn && !receivers.is_empty() {
+        if base_deposit_watermark <= tip_bn && !receivers.is_empty() {
             match beanie_keeper::evm_keeper::fetch_deposits_since_block(
                 &keeper_client,
                 &*evm_cfg,
                 &receivers,
-                deposit_watermark,
+                base_deposit_watermark,
                 tip_bn,
             )
             .await
             {
                 Ok(deposits) => {
                     if deposits.is_empty() {
-                        deposit_watermark = tip_bn + 1;
+                        base_deposit_watermark = tip_bn + 1;
                     } else {
                         // Unique receivers that received funds
                         let mut unique: Vec<Address> = deposits
@@ -336,7 +329,7 @@ pub async fn run_native_transfer_poller(
                             }
                         }
 
-                        deposit_watermark = tip_bn + 1;
+                        base_deposit_watermark = tip_bn + 1;
                     }
                 }
                 Err(e) => eprintln!("fetch_deposits_since_block failed: {e}"),
@@ -524,6 +517,6 @@ pub async fn run_native_transfer_poller(
             }
         }
 
-        sleep(evm_cfg.poll_interval).await;
+        sleep(max(evm_cfg.poll_interval, starknet_cfg.poll_interval)).await;
     }
 }

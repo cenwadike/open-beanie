@@ -1,4 +1,4 @@
-pub(crate) mod announce_worker;
+pub(crate) mod announce_workers;
 pub(crate) mod config;
 pub(crate) mod create_routes;
 pub(crate) mod models;
@@ -7,7 +7,7 @@ pub(crate) mod rate_limiter;
 pub(crate) mod stealth_routes;
 pub(crate) mod stealth_workers;
 
-pub use announce_worker::*;
+pub use announce_workers::*;
 pub use config::*;
 pub use create_routes::*;
 pub use payment_workers::*;
