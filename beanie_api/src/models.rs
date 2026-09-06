@@ -3,9 +3,9 @@ pub use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use ethers::contract::abigen;
 use ethers::utils::format_bytes32_string;
 use ethers::utils::keccak256;
+use ethers::{contract::abigen, types::H256};
 pub use serde::{Deserialize, Serialize};
 use starknet::core::types::Felt;
 pub use std::net::SocketAddr;
@@ -43,6 +43,38 @@ pub enum Chain {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmAuth {
+    pub nonce: H256,
+    pub valid_after: u64,
+    pub valid_before: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StarknetAuth {
+    pub outside_execution: OutsideExecutionDto,
+    pub signature: Vec<String>,
+    pub user_address: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OutsideExecutionDto {
+    pub caller: String,
+    pub nonce: String,
+    pub execute_after: u64,
+    pub execute_before: u64,
+    pub calls: Vec<CallDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CallDto {
+    #[serde(rename = "contractAddress")]
+    pub contract_address: String,
+    pub entrypoint: String,
+    pub calldata: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceTask {
     pub chain: Chain,
     pub merchant_address: String,
@@ -61,6 +93,8 @@ pub struct PaymentTask {
     pub webhook_url: Option<String>,
     pub attempts: u32,
     pub create_if_missing: bool,
+    pub evm_auth: Option<EvmAuth>,
+    pub starknet_auth: Option<StarknetAuth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

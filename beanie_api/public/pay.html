@@ -1,15 +1,19 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
-  <title>Beanie — Claim Private Payments</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Slackey&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/styles/stealth.css" />
+  <title>Pay with Beanie</title>
+  <link rel="icon" href="/assets/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="/styles/pay.css">
 </head>
 
 <body>
@@ -26,44 +30,18 @@
       </a>
     </header>
 
-    <main class="stealth-shell">
-      <div class="stealth-panel">
-        <h1>Claim Private Payments</h1>
-
-        <p class="warning">
-          Your keys are derived from your device's passkey (Face ID, Windows
-          Hello, or similar) and never leave this browser tab as raw values.
-          Beanie never receives them, in any form. This requires a browser
-          and device that support WebAuthn's PRF extension — you'll see a
-          clear error below if yours doesn't.
-        </p>
-
-        <section class="step">
-          <h2>1. Scan for payments</h2>
-          <label>
-            Lane ID
-            <input type="text" id="lane-id" placeholder="your lane ID" autocomplete="off" />
-          </label>
-          <button id="scan-btn" type="button">Scan with passkey</button>
-          <div id="scan-status" class="status"></div>
-          <ul id="matches-list"></ul>
-        </section>
-
-        <section class="step">
-          <h2>2. Claim / sweep to your wallet</h2>
-          <label>
-            Destination address to sweep claimed funds to
-            <input type="text" id="destination-address" placeholder="0x..." autocomplete="off" />
-          </label>
-          <button id="claim-btn" type="button" disabled>Claim selected payment</button>
-          <div id="claim-status" class="status"></div>
-        </section>
-      </div>
+    <main class="pay-shell">
+      <section class="pay-panel" aria-labelledby="payTitle">
+        <div class="lane-card" id="laneCard" aria-live="polite">
+          <div class="loading">Loading payment details...</div>
+        </div>
+      </section>
     </main>
+
+    <div class="toast-stack" id="payToastStack"></div>
   </div>
 
-  <script type="module" src="/scripts/stealth.claim.js"></script>
-  <script type="module" src="/scripts/stealth.setup.js"></script>
+  <script type="module" src="/scripts/pay.js" defer></script>
 </body>
 
 </html>

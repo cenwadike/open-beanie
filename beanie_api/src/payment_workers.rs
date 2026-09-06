@@ -26,6 +26,14 @@ pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, Star
 use crate::models::{ChainXReceiverLocal, MerchantFactory};
 use crate::models::{chain_to_bytes32, chain_to_felt, derive_felt_from_foreign_address};
 
+use std::str::FromStr;
+abigen!(
+    Erc3009Usdc,
+    r#"[
+        "function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)"
+    ]"#
+);
+
 abigen!(
     Multicall3,
     r#"[
@@ -171,6 +179,65 @@ pub async fn run_payment_worker(
                             }
                         }
 
+                        let auth = match &task.evm_auth {
+                            Some(a) => a,
+                            None => {
+                                eprintln!(
+                                    "EVM payment task missing verified authorization, dropping"
+                                );
+                                continue;
+                            }
+                        };
+                        let sig = match ethers::types::Signature::from_str(
+                            auth.signature.trim_start_matches("0x"),
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("bad signature stored on task: {e}");
+                                continue;
+                            }
+                        };
+                        let value = match U256::from_dec_str(&task.amount_raw) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("bad amount on task: {e}");
+                                continue;
+                            }
+                        };
+                        let from_addr: Address = match task.from_address.parse() {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!("bad from_address on task: {e}");
+                                continue;
+                            }
+                        };
+
+                        let usdc_addr: Address = evm_cfg.token_address;
+                        let transfer_call = Erc3009Usdc::new(usdc_addr, evm_client.clone())
+                            .transfer_with_authorization(
+                                from_addr,
+                                receiver_addr,
+                                value,
+                                auth.valid_after.into(),
+                                auth.valid_before.into(),
+                                auth.nonce.into(),
+                                sig.v as u8,
+                                sig.r.into(),
+                                sig.s.into(),
+                            );
+                        let transfer_calldata = match transfer_call.calldata() {
+                            Some(c) => c,
+                            None => {
+                                eprintln!("failed to encode transferWithAuthorization");
+                                continue;
+                            }
+                        };
+                        calls.push(Call3 {
+                            target: usdc_addr,
+                            allow_failure: false,
+                            call_data: transfer_calldata,
+                        });
+
                         // sweep calldata
                         let receiver_contract =
                             ChainXReceiverLocal::new(receiver_addr, evm_client.clone());
@@ -261,16 +328,13 @@ pub async fn run_payment_worker(
                 }
             }
             crate::models::Chain::Starknet => {
-                // Starknet flow — bundle register_merchant (if missing) + sweep in one execute_v3
                 match Felt::from_hex(&task.receiver_address) {
                     Ok(_receiver_felt) => {
-                        // Compute merchant felt for predict call
                         let merchant_felt =
                             Felt::from_hex(&task.merchant_address).unwrap_or_else(|_| {
                                 derive_felt_from_foreign_address(&task.merchant_address)
                             });
 
-                        // Predict receiver address using factory view
                         let predict_selector =
                             match get_selector_from_name("predict_receiver_address") {
                                 Ok(s) => s,
@@ -318,7 +382,6 @@ pub async fn run_payment_worker(
                                     }
                                 };
 
-                            // Determine CCTP params based on requested target_chain/destination_address
                             let (cctp_mint_chain_felt, cctp_recipient_low, cctp_recipient_high) =
                                 if task.destination_chain == task.source_chain {
                                     (Felt::ZERO, Felt::ZERO, Felt::ZERO)
@@ -377,7 +440,62 @@ pub async fn run_payment_worker(
                             calls.push(register_call);
                         }
 
-                        // sweep call to predicted receiver
+                        let auth = match &task.starknet_auth {
+                            Some(a) => a,
+                            None => {
+                                eprintln!(
+                                    "Starknet payment task missing verified authorization, dropping"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let user_account_felt = match Felt::from_hex(&auth.user_address) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("bad user address on task: {e}");
+                                continue;
+                            }
+                        };
+
+                        let execute_from_outside_selector =
+                            match get_selector_from_name("execute_from_outside_v2") {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("selector lookup failed: {e}");
+                                    continue;
+                                }
+                            };
+
+                        // Serialize OutsideExecution + signature per Cairo Serde: struct fields flattened,
+                        // Span<Call>/Array<felt252> length-prefixed.
+                        let mut oe_calldata = vec![
+                            Felt::from_hex(&auth.outside_execution.caller).unwrap(),
+                            Felt::from_hex(&auth.outside_execution.nonce).unwrap(),
+                            Felt::from(auth.outside_execution.execute_after),
+                            Felt::from(auth.outside_execution.execute_before),
+                            Felt::from(auth.outside_execution.calls.len() as u64),
+                        ];
+                        for c in &auth.outside_execution.calls {
+                            oe_calldata.push(Felt::from_hex(&c.contract_address).unwrap());
+                            oe_calldata.push(get_selector_from_name(&c.entrypoint).unwrap());
+                            oe_calldata.push(Felt::from(c.calldata.len() as u64));
+                            for cd in &c.calldata {
+                                oe_calldata.push(Felt::from_hex(cd).unwrap());
+                            }
+                        }
+                        oe_calldata.push(Felt::from(auth.signature.len() as u64));
+                        for s in &auth.signature {
+                            oe_calldata.push(Felt::from_hex(s).unwrap());
+                        }
+
+                        calls.push(Call {
+                            to: user_account_felt,
+                            selector: execute_from_outside_selector,
+                            calldata: oe_calldata,
+                        });
+
+                        // sweep call to predicted receiver — now sweeping real funds that actually arrived
                         let sweep_selector = match get_selector_from_name("sweep") {
                             Ok(s) => s,
                             Err(e) => {
@@ -391,14 +509,13 @@ pub async fn run_payment_worker(
                             selector: sweep_selector,
                             calldata: vec![],
                         };
-
                         calls.push(sweep_call);
 
                         match starknet_account.execute_v3(calls).send().await {
                             Ok(pending) => {
                                 let tx_hash_felt = pending.transaction_hash;
                                 let tx_hash = format!("{:#x}", tx_hash_felt);
-                                println!("Starknet atomic register+swap invoked tx {}", tx_hash);
+                                println!("Starknet sweep invoked tx {}", tx_hash);
 
                                 if let Some(url) = &task.webhook_url {
                                     let deposit = beanie_keeper::config::Deposit {
@@ -426,7 +543,7 @@ pub async fn run_payment_worker(
                                     }
                                 }
                             }
-                            Err(e) => eprintln!("Starknet atomic invoke failed: {}", e),
+                            Err(e) => eprintln!("Starknet sweep failed: {}", e),
                         }
                     }
                     Err(e) => eprintln!("Invalid Starknet receiver felt: {}", e),

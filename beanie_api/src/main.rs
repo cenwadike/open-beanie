@@ -38,6 +38,7 @@ use tower_http::services::ServeFile;
 
 use crate::models::PaymentTask;
 use crate::models::{StealthTask, mpsc};
+use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
 use crate::rate_limiter::RateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
@@ -207,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/v1/stealth/claim", post(execute_stealth_claim))
         .route("/api/v1/create", post(announce_receiver))
-        .route("/api/v1/pay", post(crate::payment_routes::receive_payment))
+        .route("/api/v1/pay", post(receive_payment))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
         .fallback(serve_static);
