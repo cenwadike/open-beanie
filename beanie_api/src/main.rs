@@ -6,16 +6,20 @@
 //!
 //! # Endpoints
 //!
-//! - `POST /api/v1/pay` - process gasless a payment request
+//! - `POST /api/v1/auth/register/start` - initiate passkey registration
+//! - `POST /api/v1/auth/register/finish` - complete passkey registration
+//! - `POST /api/v1/auth/start` - initiate WebAuthn authentication ceremony
+//! - `POST /api/v1/auth/finish` - complete WebAuthn authentication ceremony
+//! - `POST /api/v1/pay` - process gasless payment request
 //! - `POST /api/v1/stealth/claim` - process a stateless stealth account claim
 
-mod announce_workers;
+mod auth;
 mod config;
 mod create_routes;
+mod create_workers;
 mod models;
 mod payment_routes;
 mod payment_workers;
-mod rate_limiter;
 mod stealth_routes;
 mod stealth_workers;
 mod transfer_workers;
@@ -36,14 +40,16 @@ use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use crate::auth::{
+    AuthState, RateLimiter, auth_finish, auth_start, register_finish, register_start,
+};
 use crate::models::PaymentTask;
 use crate::models::{StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
-use crate::rate_limiter::RateLimiter;
 use crate::stealth_routes::execute_stealth_claim;
-use crate::{announce_workers::run_announce_worker, create_routes::announce_receiver};
 use crate::{config::Config, models::AppState};
+use crate::{create_routes::announce_receiver, create_workers::run_announce_worker};
 use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
 
 /// Fallback route handler for serving static frontend files and pretty HTML URLs.
@@ -141,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let webhook_tx = Arc::new(webhook_tx);
 
     let state = AppState {
+        auth: Arc::new(AuthState::new(&cfg.rp_id, &cfg.rp_origin)),
         limiter: Arc::new(RateLimiter::new(
             cfg.rate_limit_per_hour,
             8,
@@ -206,6 +213,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
+        .route("/api/v1/auth/register/start", post(register_start))
+        .route("/api/v1/auth/register/finish", post(register_finish))
+        .route("/api/v1/auth/start", post(auth_start))
+        .route("/api/v1/auth/finish", post(auth_finish))
         .route("/api/v1/stealth/claim", post(execute_stealth_claim))
         .route("/api/v1/create", post(announce_receiver))
         .route("/api/v1/pay", post(receive_payment))

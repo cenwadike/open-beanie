@@ -3,7 +3,7 @@
 // Client-Side Deterministic Index Recovery & Claim for Starknet & EVM (Base / Ethereum)
 // Zero-State Recovery: Scans USDC Transfer logs and counterfactual 2-of-2 account addresses
 // using WebAuthn PRF master seed + index loop.
-// Co-signing & Gasless Paymaster execution delegated to /api/v1/stealth/execute backend route.
+// Co-signing & Gasless Paymaster execution delegated to /api/v1/stealth/claim backend route.
 
 import {
   ec as starkEc,
@@ -51,7 +51,7 @@ const CHAINS = {
   },
 };
 
-const RP_ID = "beanie.io";
+const RP_ID = window.location.hostname;
 const UDC_ADDRESS = starknetConstants.UDC.ADDRESS;
 const UDC_ENTRYPOINT = starknetConstants.UDC.ENTRYPOINT; // "deployContract"
 
@@ -77,74 +77,150 @@ function bytesToScalar(bytes, curveOrder) {
   return n % curveOrder;
 }
 
-// ---- WebAuthn PRF Key Derivation ----
+function bufferToBase64Url(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  let s = "";
+  for (let i = 0; i < bytes.byteLength; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlToBuffer(base64url) {
+  const base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function prepareCreationOptions(o) {
+  return {
+    ...o,
+    challenge: base64UrlToBuffer(o.challenge),
+    user: { ...o.user, id: base64UrlToBuffer(o.user.id) },
+    excludeCredentials: (o.excludeCredentials || []).map((c) => ({
+      ...c,
+      id: base64UrlToBuffer(c.id),
+    })),
+  };
+}
+
+function prepareRequestOptions(o) {
+  return {
+    ...o,
+    challenge: base64UrlToBuffer(o.challenge),
+    allowCredentials: (o.allowCredentials || []).map((c) => ({
+      ...c,
+      id: base64UrlToBuffer(c.id),
+    })),
+  };
+}
+
+function credentialToJSON(cred) {
+  const json = {
+    id: cred.id,
+    rawId: bufferToBase64Url(cred.rawId),
+    type: cred.type,
+    response: { clientDataJSON: bufferToBase64Url(cred.response.clientDataJSON) },
+  };
+  if (cred.response.attestationObject) {
+    json.response.attestationObject = bufferToBase64Url(cred.response.attestationObject);
+  }
+  if (cred.response.authenticatorData) {
+    json.response.authenticatorData = bufferToBase64Url(cred.response.authenticatorData);
+    json.response.signature = bufferToBase64Url(cred.response.signature);
+    if (cred.response.userHandle) {
+      json.response.userHandle = bufferToBase64Url(cred.response.userHandle);
+    }
+  }
+  return json;
+}
+
+// ---- WebAuthn PRF Key Derivation & Ceremonies ----
 
 async function getOrRegisterCredential() {
   if (cachedCredentialId) return cachedCredentialId;
 
-  try {
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge: crypto.getRandomValues(new Uint8Array(32)),
-        rpId: RP_ID,
-        userVerification: "required",
-      },
-    });
-    cachedCredentialId = assertion.rawId;
+  const storageKey = "beanie.passkey.cred.v1";
+  const storedId = localStorage.getItem(storageKey);
+  if (storedId) {
+    cachedCredentialId = storedId;
     return cachedCredentialId;
-  } catch {
-    // Fall through to registration
   }
 
   let credential;
   try {
+    const startRes = await fetch("/api/v1/auth/register/start", { method: "POST" });
+    if (!startRes.ok) throw new Error("Could not start passkey registration");
+    const { session_token, options } = await startRes.json();
+
+    const requestOptions = prepareCreationOptions(options);
+    requestOptions.extensions = { prf: {} };
+
     credential = await navigator.credentials.create({
-      publicKey: {
-        challenge: crypto.getRandomValues(new Uint8Array(32)),
-        rp: { name: "Beanie", id: RP_ID },
-        user: {
-          id: crypto.getRandomValues(new Uint8Array(16)),
-          name: "beanie-privacy-claim",
-          displayName: "Beanie Privacy Key",
-        },
-        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-        authenticatorSelection: { residentKey: "required", userVerification: "required" },
-        extensions: { prf: {} },
-      },
+      publicKey: requestOptions,
     });
+
+    const finishRes = await fetch("/api/v1/auth/register/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_token, credential: credentialToJSON(credential) }),
+    });
+    if (!finishRes.ok) throw new Error("Passkey registration was rejected by the server");
+    const { credential_id } = await finishRes.json();
+
+    localStorage.setItem(storageKey, credential_id);
+    cachedCredentialId = credential_id;
   } catch (err) {
     throw new Error(`Passkey initialization failed: ${err.message}`);
   }
 
+  // Single point PRF support check
   const prfResults = credential.getClientExtensionResults()?.prf;
   if (!prfResults?.enabled) {
     throw new Error("This device's passkey does not support the PRF extension.");
   }
 
-  cachedCredentialId = credential.rawId;
   return cachedCredentialId;
+}
+
+async function getVerifiedToken(binding, { salt } = {}) {
+  const credentialId = await getOrRegisterCredential();
+
+  const startRes = await fetch("/api/v1/auth/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credential_id: credentialId, binding }),
+  });
+  if (!startRes.ok) throw new Error("Could not start passkey verification");
+  const { session_token, options } = await startRes.json();
+
+  const requestOptions = prepareRequestOptions(options);
+  if (salt) {
+    requestOptions.extensions = { prf: { eval: { first: salt } } };
+  }
+
+  const assertion = await navigator.credentials.get({ publicKey: requestOptions });
+
+  const finishRes = await fetch("/api/v1/auth/finish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_token, credential: credentialToJSON(assertion) }),
+  });
+  if (!finishRes.ok) throw new Error("Passkey verification was rejected by the server");
+  const { verified_token } = await finishRes.json();
+
+  const prfOutput = assertion.getClientExtensionResults()?.prf?.results?.first;
+  return {
+    verifiedToken: verified_token,
+    prfOutput: prfOutput ? new Uint8Array(prfOutput) : null,
+  };
 }
 
 async function deriveLaneSalt(laneId) {
   const data = new TextEncoder().encode(`beanie-stealth-salt-v1:${laneId}`);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return new Uint8Array(digest);
-}
-
-async function evaluatePRF(credentialId, salt) {
-  const assertion = await navigator.credentials.get({
-    publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      rpId: RP_ID,
-      allowCredentials: [{ id: credentialId, type: "public-key" }],
-      userVerification: "required",
-      extensions: { prf: { eval: { first: salt } } },
-    },
-  });
-
-  const result = assertion.getClientExtensionResults()?.prf?.results?.first;
-  if (!result) throw new Error("Key derivation failed — no PRF output returned.");
-  return new Uint8Array(result);
 }
 
 async function hkdf(ikm, info) {
@@ -159,17 +235,18 @@ async function hkdf(ikm, info) {
 
 // ---- Key & Address Derivation ----
 
-async function deriveDeterministicStealthKey(beanMasterSecret, laneId, index, chainType) {
-  const curveOrder = chainType === "starknet" ? STARK_CURVE_ORDER : SECP256K1_ORDER;
-  const spendMasterPriv = await hkdf(beanMasterSecret, `spend-v1:${chainType}`);
+async function deriveDeterministicStealthKey(beanMasterSecret, laneId, index, chainKey) {
+  const chainConfig = CHAINS[chainKey];
+  const curveOrder = chainConfig.type === "starknet" ? STARK_CURVE_ORDER : SECP256K1_ORDER;
+  const spendMasterPriv = await hkdf(beanMasterSecret, `spend-v1:${chainKey}`);
   const spendMasterScalar = bytesToScalar(spendMasterPriv, curveOrder);
-  const indexBytes = await hkdf(beanMasterSecret, `beanie-lane-index-v1:${laneId}:${chainType}:${index}`);
+  const indexBytes = await hkdf(beanMasterSecret, `beanie-lane-index-v1:${laneId}:${chainKey}:${index}`);
   const indexScalar = bytesToScalar(indexBytes, curveOrder);
   return (spendMasterScalar + indexScalar) % curveOrder;
 }
 
-async function deriveEvmCreate2Salt(beanMasterSecret, laneId, index) {
-  const saltBytes = await hkdf(beanMasterSecret, `evm-create2-salt-v1:${laneId}:${index}`);
+async function deriveEvmCreate2Salt(beanMasterSecret, laneId, index, chainKey) {
+  const saltBytes = await hkdf(beanMasterSecret, `evm-create2-salt-v1:${laneId}:${chainKey}:${index}`);
   return "0x" + bytesToHex(saltBytes);
 }
 
@@ -213,9 +290,9 @@ $("scan-btn").addEventListener("click", async () => {
   status.textContent = "Authenticating passkey...";
 
   try {
-    const credentialId = await getOrRegisterCredential();
     const salt = await deriveLaneSalt(laneId);
-    const beanMasterSecret = await evaluatePRF(credentialId, salt);
+    const { prfOutput: beanMasterSecret } = await getVerifiedToken(`scan:${laneId}`, { salt });
+    if (!beanMasterSecret) throw new Error("Key derivation failed — no PRF output returned.");
 
     status.textContent = `Scanning logs on ${chainKey.toUpperCase()}...`;
 
@@ -265,7 +342,7 @@ $("scan-btn").addEventListener("click", async () => {
         beanMasterSecret,
         laneId,
         index,
-        chainConfig.type
+        chainKey
       );
 
       let stealthAddress = "";
@@ -332,7 +409,7 @@ $("scan-btn").addEventListener("click", async () => {
         const wallet = new ethers.Wallet(privKeyHex);
         clientAddress = wallet.address;
 
-        const saltHex = await deriveEvmCreate2Salt(beanMasterSecret, laneId, index);
+        const saltHex = await deriveEvmCreate2Salt(beanMasterSecret, laneId, index, chainKey);
         stealthAddress = deriveEvmStealthAddress(
           clientAddress,
           chainConfig.litCosignerPubKey,
@@ -399,19 +476,6 @@ function renderMatches() {
   });
 }
 
-// ---- Base64URL Helper for Header Encoding ----
-function bufferToBase64Url(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let string = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    string += String.fromCharCode(bytes[i]);
-  }
-  return btoa(string)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
 // ---- Step 2: Atomic Execution Claim Dispatch ----
 
 $("claim-btn").addEventListener("click", async () => {
@@ -427,24 +491,17 @@ $("claim-btn").addEventListener("click", async () => {
   let stealthPrivScalar = selectedMatch.stealthPrivScalar;
 
   try {
-    status.textContent = "Authenticating WebAuthn session for backend headers...";
+    status.textContent = "Authenticating WebAuthn session...";
 
-    // 1. Perform WebAuthn assertion to produce the required auth headers
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const credentialId = await getOrRegisterCredential();
+    const chainEnumMap = {
+      starknet: "Starknet",
+      base: "Base",
+      ethereum: "Ethereum",
+    };
+    const wireChain = chainEnumMap[selectedMatch.chainKey];
 
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge: challenge,
-        rpId: RP_ID,
-        allowCredentials: [{ id: credentialId, type: "public-key" }],
-        userVerification: "required",
-      },
-    });
-
-    const credIdHex = bytesToHex(new Uint8Array(credentialId));
-    const clientDataB64 = bufferToBase64Url(assertion.response.clientDataJSON);
-    const authDataB64 = bufferToBase64Url(assertion.response.authenticatorData);
+    const binding = `claim:${wireChain}:${selectedMatch.stealthAddress}:${destination}`;
+    const { verifiedToken } = await getVerifiedToken(binding);
 
     status.textContent = "Constructing stealth transfer transaction...";
 
@@ -483,15 +540,15 @@ $("claim-btn").addEventListener("click", async () => {
         calldata: sweepCalldata,
       });
 
-      // Compute deterministic hash over the execution calls
-      const callHashes = callsPayload.map((c) =>
-        hash.computeHashOnElements([
-          c.contract_address,
-          hash.getSelectorFromName(c.entrypoint),
-          hash.computeHashOnElements(c.calldata),
-        ])
-      );
-      txHashToSign = hash.computeHashOnElements([selectedMatch.stealthAddress, ...callHashes]);
+      // Standard Starknet Invoke Transaction Hash
+      txHashToSign = hash.calculateInvokeTransactionHash({
+        senderAddress: selectedMatch.stealthAddress,
+        calls: callsPayload,
+        version: "0x1",
+        maxFee: 0,
+        chainId: starknetConstants.StarknetChainId.SN_MAIN,
+        nonce: 0,
+      });
 
       // Sign locally using Stark key
       const clientSig = starkEc.starkCurve.sign(txHashToSign, stealthPrivKeyHex);
@@ -500,30 +557,19 @@ $("claim-btn").addEventListener("click", async () => {
 
       status.textContent = "Queuing payload to Axum worker pipeline...";
 
-      // Map string key directly to exact Rust enum variant naming
-      const chainEnumMap = {
-        starknet: "Starknet",
-        base: "Base",
-        ethereum: "Ethereum",
-      };
-
       const requestBody = {
-        chain: chainEnumMap[selectedMatch.chainKey],
+        chain: wireChain,
         tx_hash: txHashToSign,
         derived_address: selectedMatch.stealthAddress,
         client_sig: { r1, s1 },
-        credential_id: credIdHex,
+        verified_token: verifiedToken,
         calls: callsPayload,
       };
 
-      const res = await fetch("/api/v1/stealth/execute", {
+      const res = await fetch("/api/v1/stealth/claim", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Passkey-Credential-Id": credIdHex,
-          "X-Passkey-Client-Data": clientDataB64,
-          "X-Passkey-Auth-Data": authDataB64,
-          "X-Passkey-Tx-Hash": txHashToSign,
         },
         body: JSON.stringify(requestBody),
       });
@@ -553,10 +599,16 @@ $("claim-btn").addEventListener("click", async () => {
         calldata: [formattedCalldata],
       });
 
+      // Included chainId in the EVM signed-hash construction
       txHashToSign = ethers.keccak256(
         ethers.SolidityPack(
-          ["address", "address", "bytes"],
-          [selectedMatch.stealthAddress, chainConfig.tokenAddress, formattedCalldata]
+          ["address", "address", "uint256", "bytes"],
+          [
+            selectedMatch.stealthAddress,
+            chainConfig.tokenAddress,
+            chainConfig.chainId,
+            formattedCalldata,
+          ]
         )
       );
 
@@ -568,29 +620,19 @@ $("claim-btn").addEventListener("click", async () => {
 
       status.textContent = "Queuing payload to Axum worker pipeline...";
 
-      const chainEnumMap = {
-        starknet: "Starknet",
-        base: "Base",
-        ethereum: "Ethereum",
-      };
-
       const requestBody = {
-        chain: chainEnumMap[selectedMatch.chainKey],
+        chain: wireChain,
         tx_hash: txHashToSign,
         derived_address: selectedMatch.stealthAddress,
         client_sig: { r1, s1 },
-        credential_id: credIdHex,
+        verified_token: verifiedToken,
         calls: callsPayload,
       };
 
-      const res = await fetch("/api/v1/stealth/execute", {
+      const res = await fetch("/api/v1/stealth/claim", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Passkey-Credential-Id": credIdHex,
-          "X-Passkey-Client-Data": clientDataB64,
-          "X-Passkey-Auth-Data": authDataB64,
-          "X-Passkey-Tx-Hash": txHashToSign,
         },
         body: JSON.stringify(requestBody),
       });

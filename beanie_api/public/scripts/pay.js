@@ -365,7 +365,7 @@
       validateAndParseAddress,
       cairo,
       hash, // getSelectorFromName lives here in starknet.js
-    } = await import("/scripts/starknet.bundle.js");
+    } = await import("/scripts/starknet.js");
     const starknetWindow =
       window.starknet || window.starknet_argentX || window.starknet_braavos;
     if (!starknetWindow) throw new Error("No Starknet wallet detected.");

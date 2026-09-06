@@ -1,3 +1,12 @@
+// create_route.rs
+//
+// One route. It doesn't care whether `address` is the merchant's own wallet
+// (standard mode) or a client-derived stealth address (privacy mode) — in
+// both cases the job is identical: prove a passkey authorized announcing
+// *this* address on *this* chain, then enqueue the on-chain announce.
+// The distinction between standard/stealth lives entirely on the client;
+// this handler has no reason to know which one it's looking at.
+
 use axum::{
     Json,
     extract::{ConnectInfo, State},
@@ -6,20 +15,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    models::{AppState, Chain, SocketAddr, err},
-    rate_limiter::PasskeyAuth,
-};
+use crate::models::{AppState, Chain, SocketAddr, err};
 
 #[derive(Debug, Deserialize)]
-pub struct AnnounceReceiverRequest {
+pub struct AnnounceRequest {
     pub chain: Chain,
-    pub merchant_address: String,
-    pub credential_id: String,
+    pub address: String,
+    pub verified_token: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct AnnounceReceiverResponse {
+pub struct AnnounceResponse {
     pub status: String,
     pub message: String,
 }
@@ -45,69 +51,49 @@ fn parse_and_sanitize_felt(input: &str) -> Result<String, &'static str> {
     Ok(format!("{:#064x}", felt))
 }
 
-fn sanitize_opaque_identifier(
-    input: &str,
-    min_len: usize,
-    max_len: usize,
-) -> Result<String, &'static str> {
-    let trimmed = input.trim();
-    if trimmed.len() < min_len || trimmed.len() > max_len {
-        return Err("Identifier string out of acceptable length bounds");
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=' || c == '+')
-    {
-        return Err("Identifier contains invalid characters");
-    }
-    Ok(trimmed.to_string())
+/// Same wire representation the client sent, whatever your `Chain` enum's
+/// serde casing convention is — avoids assuming PascalCase/UPPERCASE/etc.
+fn chain_tag(chain: &Chain) -> String {
+    serde_json::to_value(chain)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Auth + validate, then enqueue an announce task. Nothing else.
 pub async fn announce_receiver(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    auth: PasskeyAuth,
-    Json(payload): Json<AnnounceReceiverRequest>,
+    Json(payload): Json<AnnounceRequest>,
 ) -> Response {
-    // Passkey header must match body
-    if auth.credential_id != payload.credential_id {
-        return err(
-            StatusCode::FORBIDDEN,
-            "Passkey credential header does not match request credential ID",
-        );
-    }
-
-    let credential_id = match sanitize_opaque_identifier(&payload.credential_id, 1, 512) {
-        Ok(v) => v,
-        Err(e) => {
+    // 1. Passkey verification — proves a real, verified passkey session
+    //    authorized announcing exactly this chain+address, nothing else.
+    let binding = format!(
+        "announce:{}:{}",
+        chain_tag(&payload.chain),
+        payload.address.trim()
+    );
+    let credential_id = match state
+        .auth
+        .consume_verified(&payload.verified_token, &binding)
+    {
+        Some(id) => id,
+        None => {
             return err(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid credential_id: {e}"),
+                StatusCode::UNAUTHORIZED,
+                "Passkey verification missing, expired, or bound to a different chain/address",
             );
         }
     };
 
-    let merchant_address = match payload.chain {
-        Chain::Base | Chain::Ethereum => {
-            match parse_and_sanitize_evm_addr(&payload.merchant_address) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid merchant_address: {e}"),
-                    );
-                }
-            }
-        }
-        Chain::Starknet => match parse_and_sanitize_felt(&payload.merchant_address) {
+    // 2. Canonicalize the address per chain.
+    let address = match payload.chain {
+        Chain::Base | Chain::Ethereum => match parse_and_sanitize_evm_addr(&payload.address) {
             Ok(v) => v,
-            Err(e) => {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Invalid merchant_address: {e}"),
-                );
-            }
+            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid address: {e}")),
+        },
+        Chain::Starknet => match parse_and_sanitize_felt(&payload.address) {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid address: {e}")),
         },
         _ => {
             return err(
@@ -117,16 +103,15 @@ pub async fn announce_receiver(
         }
     };
 
-    if let Err(msg) = state
-        .limiter
-        .check(addr.ip(), &merchant_address, &credential_id)
-    {
+    // 3. Single rate-limit call site, now against a proven credential_id.
+    if let Err(msg) = state.limiter.check(addr.ip(), &address, &credential_id) {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
+    // 4. Enqueue. Nothing else — worker does the actual on-chain announce.
     let task = crate::models::AnnounceTask {
         chain: payload.chain,
-        merchant_address,
+        merchant_address: address,
         credential_id,
     };
 
@@ -139,7 +124,7 @@ pub async fn announce_receiver(
 
     (
         StatusCode::ACCEPTED,
-        Json(AnnounceReceiverResponse {
+        Json(AnnounceResponse {
             status: "accepted".to_string(),
             message: "Receiver announcement queued".to_string(),
         }),

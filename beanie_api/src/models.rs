@@ -14,13 +14,14 @@ pub use tokio::sync::mpsc;
 
 use crate::{
     Config,
-    rate_limiter::RateLimiter,
+    auth::{AuthState, RateLimiter},
     stealth_routes::{CallDataPayload, ClientSignature},
 };
 
 /// Global application state shared across Axum route handlers.
 #[derive(Clone)]
 pub struct AppState {
+    pub auth: Arc<AuthState>,
     pub app_config: Arc<Config>,
     pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
     pub evm_config: Arc<beanie_keeper::config::EvmConfig>,

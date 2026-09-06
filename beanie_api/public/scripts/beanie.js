@@ -25,10 +25,18 @@
     },
   };
 
+  // Wire format the backend's `Chain` enum expects. This mapping already
+  // existed in stealth-claim.js ("Map string key directly to exact Rust
+  // enum variant naming") but was missing here — announce calls were
+  // sending raw "BASE"/"STARKNET" straight through, which likely never
+  // matched what `Chain` deserializes. Fixed by reusing the same map.
+  const CHAIN_WIRE = { BASE: "Base", STARKNET: "Starknet" };
+
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
   const POLL_INTERVAL_MS = 20000;
   const API_CREATE = "/api/v1/create";
+  const API_STATUS = "/api/v1/status";
   const RP_ID = window.location.hostname;
 
   const STARKNET_BALANCEOF_SELECTOR =
@@ -87,12 +95,6 @@
   };
   const receiverKey = (chain, address) => `${chain}:${address}`.toLowerCase();
 
-  function bytesToHex(bytes) {
-    return Array.from(bytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  }
-
   function bufferToBase64Url(buffer) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     let s = "";
@@ -107,11 +109,6 @@
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes.buffer;
-  }
-
-  async function sha256Utf8(str) {
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
-    return new Uint8Array(digest);
   }
 
   function privacyOptedIn() {
@@ -131,101 +128,117 @@
     $("#shareBtn")?.classList.remove("is-hidden");
   }
 
-  /* ---------- Passkeys ---------- */
-  let cachedRawId = null;
+  /* ---------- WebAuthn ceremony helpers ----------
+   * Real server-verified ceremony (webauthn-rs backend), not the old
+   * self-picked-challenge/custom-header scheme. `getVerifiedToken` runs a
+   * full authentication ceremony bound to a specific server-checked
+   * `binding` string and hands back a short-lived, single-use token that
+   * announce/claim requests attach instead of X-Passkey-* headers.
+   */
 
-  async function getOrRegisterCredential({ requirePrf = false } = {}) {
-    if (cachedRawId) return cachedRawId;
-
-    const stored = localStorage.getItem(STORAGE_CRED);
-    if (stored) {
-      try {
-        const assertion = await navigator.credentials.get({
-          publicKey: {
-            challenge: crypto.getRandomValues(new Uint8Array(32)),
-            rpId: RP_ID,
-            allowCredentials: [{ id: base64UrlToBuffer(stored), type: "public-key" }],
-            userVerification: "required",
-            extensions: requirePrf ? { prf: {} } : undefined,
-          },
-        });
-        cachedRawId = assertion.rawId;
-        return cachedRawId;
-      } catch {
-        /* fall through to create */
-      }
-    }
-
-    try {
-      const assertion = await navigator.credentials.get({
-        publicKey: {
-          challenge: crypto.getRandomValues(new Uint8Array(32)),
-          rpId: RP_ID,
-          userVerification: "required",
-          extensions: requirePrf ? { prf: {} } : undefined,
-        },
-      });
-      cachedRawId = assertion.rawId;
-      localStorage.setItem(STORAGE_CRED, bufferToBase64Url(assertion.rawId));
-      return cachedRawId;
-    } catch {
-      /* register */
-    }
-
-    const credential = await navigator.credentials.create({
-      publicKey: {
-        challenge: crypto.getRandomValues(new Uint8Array(32)),
-        rp: { name: "Beanie", id: RP_ID },
-        user: {
-          id: crypto.getRandomValues(new Uint8Array(16)),
-          name: "beanie-user",
-          displayName: "Beanie",
-        },
-        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-        authenticatorSelection: {
-          residentKey: "required",
-          userVerification: "required",
-        },
-        extensions: { prf: {} },
-      },
-    });
-
-    if (requirePrf) {
-      const prf = credential.getClientExtensionResults()?.prf;
-      if (!prf?.enabled) {
-        throw new Error(
-          "Private lanes need a passkey with PRF support. Try another device or turn privacy off."
-        );
-      }
-    }
-
-    cachedRawId = credential.rawId;
-    localStorage.setItem(STORAGE_CRED, bufferToBase64Url(credential.rawId));
-    return cachedRawId;
+  function prepareCreationOptions(o) {
+    return {
+      ...o,
+      challenge: base64UrlToBuffer(o.challenge),
+      user: { ...o.user, id: base64UrlToBuffer(o.user.id) },
+      excludeCredentials: (o.excludeCredentials || []).map((c) => ({
+        ...c,
+        id: base64UrlToBuffer(c.id),
+      })),
+    };
   }
 
-  async function buildPasskeyAuth(txHash) {
-    const credentialId = await getOrRegisterCredential({ requirePrf: false });
-    const challengeBytes = await sha256Utf8(txHash);
+  function prepareRequestOptions(o) {
+    return {
+      ...o,
+      challenge: base64UrlToBuffer(o.challenge),
+      allowCredentials: (o.allowCredentials || []).map((c) => ({
+        ...c,
+        id: base64UrlToBuffer(c.id),
+      })),
+    };
+  }
 
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge: challengeBytes,
-        rpId: RP_ID,
-        allowCredentials: [{ id: credentialId, type: "public-key" }],
-        userVerification: "required",
-      },
+  function credentialToJSON(cred) {
+    const json = {
+      id: cred.id,
+      rawId: bufferToBase64Url(cred.rawId),
+      type: cred.type,
+      response: { clientDataJSON: bufferToBase64Url(cred.response.clientDataJSON) },
+    };
+    if (cred.response.attestationObject) {
+      json.response.attestationObject = bufferToBase64Url(cred.response.attestationObject);
+    }
+    if (cred.response.authenticatorData) {
+      json.response.authenticatorData = bufferToBase64Url(cred.response.authenticatorData);
+      json.response.signature = bufferToBase64Url(cred.response.signature);
+      if (cred.response.userHandle) {
+        json.response.userHandle = bufferToBase64Url(cred.response.userHandle);
+      }
+    }
+    return json;
+  }
+
+  async function ensureRegistered() {
+    const existing = localStorage.getItem(STORAGE_CRED);
+    if (existing) return existing;
+
+    const startRes = await fetch("/api/v1/webauthn/register/start", { method: "POST" });
+    if (!startRes.ok) throw new Error("Could not start passkey registration");
+    const { session_token, options } = await startRes.json();
+
+    const credential = await navigator.credentials.create({
+      publicKey: prepareCreationOptions(options),
     });
 
-    const credIdHex = bytesToHex(new Uint8Array(credentialId));
+    const finishRes = await fetch("/api/v1/webauthn/register/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_token, credential: credentialToJSON(credential) }),
+    });
+    if (!finishRes.ok) throw new Error("Passkey registration was rejected by the server");
+    const { credential_id } = await finishRes.json();
+    localStorage.setItem(STORAGE_CRED, credential_id);
+    return credential_id;
+  }
+
+  /**
+   * Runs a full verification ceremony bound to `binding`, returns a
+   * single-use verified_token the server will check matches. If `salt` is
+   * passed, evaluates PRF in the same user gesture and returns the derived
+   * secret too — one passkey tap covers both identity proof and key
+   * derivation for privacy-mode lanes, instead of two separate prompts.
+   */
+  async function getVerifiedToken(binding, { salt } = {}) {
+    const credentialId = await ensureRegistered();
+
+    const startRes = await fetch("/api/v1/webauthn/auth/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential_id: credentialId, binding }),
+    });
+    if (!startRes.ok) throw new Error("Could not start passkey verification");
+    const { session_token, options } = await startRes.json();
+
+    const requestOptions = prepareRequestOptions(options);
+    if (salt) {
+      requestOptions.extensions = { prf: { eval: { first: salt } } };
+    }
+
+    const assertion = await navigator.credentials.get({ publicKey: requestOptions });
+
+    const finishRes = await fetch("/api/v1/webauthn/auth/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_token, credential: credentialToJSON(assertion) }),
+    });
+    if (!finishRes.ok) throw new Error("Passkey verification was rejected by the server");
+    const { verified_token } = await finishRes.json();
+
+    const prfOutput = assertion.getClientExtensionResults()?.prf?.results?.first;
     return {
-      credentialId: credIdHex,
-      headers: {
-        "X-Passkey-Credential-Id": credIdHex,
-        "X-Passkey-Client-Data": bufferToBase64Url(assertion.response.clientDataJSON),
-        "X-Passkey-Auth-Data": bufferToBase64Url(assertion.response.authenticatorData),
-        "X-Passkey-Tx-Hash": txHash,
-      },
+      verifiedToken: verified_token,
+      prfOutput: prfOutput ? new Uint8Array(prfOutput) : null,
     };
   }
 
@@ -238,35 +251,27 @@
     return new Uint8Array(digest);
   }
 
-  async function evaluatePRF(credentialRawId, salt) {
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge: crypto.getRandomValues(new Uint8Array(32)),
-        rpId: RP_ID,
-        allowCredentials: [{ id: credentialRawId, type: "public-key" }],
-        userVerification: "required",
-        extensions: { prf: { eval: { first: salt } } },
-      },
-    });
-    const out = assertion.getClientExtensionResults()?.prf?.results?.first;
-    if (!out) throw new Error("PRF derivation failed — no key material returned.");
-    return new Uint8Array(out);
-  }
-
   async function derivePrivacyReceivers({ laneId, index = 0 }) {
     const helper = window.beanieStealth;
     if (!helper?.deriveReceivers) {
       throw new Error(
-        "Privacy module not loaded. Include stealth helpers and set window.beanieStealth.deriveReceivers."
+        "Privacy module not loaded. Include stealth.js and set window.beanieStealth.deriveReceivers."
       );
     }
 
-    const credentialId = await getOrRegisterCredential({ requirePrf: true });
     const salt = await deriveLaneSalt(laneId);
-    const master = await evaluatePRF(credentialId, salt);
+    // No backend action is being authorized here — deriving addresses is a
+    // pure local computation — so this is a bare PRF eval, not a
+    // verified-token ceremony. Only announcing/claiming touches the backend.
+    const { prfOutput } = await getVerifiedToken(`derive:${laneId}:${index}`, { salt });
+    if (!prfOutput) {
+      throw new Error(
+        "Private lanes need a passkey with PRF support. Try another device or turn privacy off."
+      );
+    }
 
     return helper.deriveReceivers({
-      masterSecret: master,
+      masterSecret: prfOutput,
       laneId,
       index,
       chains: SOURCE_CHAINS.map((k) => ({ key: k, ...CHAINS[k] })),
@@ -290,64 +295,36 @@
     const data =
       EVM_PREDICT_SELECTOR +
       merchantAddress.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
-    const predictedAddrHex = await rpcCall(
-      chain.rpc,
-      "eth_call",
-      [{ to: chain.factory, data }, "latest"]
-    );
-    return {
-      chain: "BASE",
-      address: `0x${String(predictedAddrHex).slice(-40)}`,
-      is_privacy_lane: false,
-    };
+    const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data }, "latest"]);
+    return { chain: "BASE", address: `0x${String(predictedAddrHex).slice(-40)}`, is_privacy_lane: false };
   }
 
   async function predictStarknetReceiver(merchantAddress) {
     const chain = CHAINS.STARKNET;
     const predictRes = await rpcCall(chain.rpc, "starknet_call", [
-      {
-        contract_address: chain.factory,
-        entry_point_selector: STARKNET_PREDICT_SELECTOR,
-        calldata: [merchantAddress],
-      },
+      { contract_address: chain.factory, entry_point_selector: STARKNET_PREDICT_SELECTOR, calldata: [merchantAddress] },
       "latest",
     ]);
-    return {
-      chain: "STARKNET",
-      address: predictRes?.[0] || "0x0",
-      is_privacy_lane: false,
-    };
+    return { chain: "STARKNET", address: predictRes?.[0] || "0x0", is_privacy_lane: false };
   }
 
   async function derivePublicReceivers(merchantAddress) {
     const results = await Promise.all([
-      predictEvmReceiver(merchantAddress).catch((e) => {
-        console.error(e);
-        return null;
-      }),
-      predictStarknetReceiver(merchantAddress).catch((e) => {
-        console.error(e);
-        return null;
-      }),
+      predictEvmReceiver(merchantAddress).catch((e) => { console.error(e); return null; }),
+      predictStarknetReceiver(merchantAddress).catch((e) => { console.error(e); return null; }),
     ]);
     return results.filter(Boolean);
   }
 
-  function announceBindingHash(chain, merchantAddress) {
-    return `beanie-announce-v1|${chain}|${merchantAddress.toLowerCase()}`;
-  }
+  async function announceReceiverOnChain(chain, address) {
+    const wireChain = CHAIN_WIRE[chain] || chain;
+    const binding = `announce:${wireChain}:${address.trim()}`;
+    const { verifiedToken } = await getVerifiedToken(binding);
 
-  async function announceReceiverOnChain(chain, merchantAddress) {
-    const txHash = announceBindingHash(chain, merchantAddress);
-    const passkey = await buildPasskeyAuth(txHash);
     const res = await fetch(API_CREATE, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...passkey.headers },
-      body: JSON.stringify({
-        chain,
-        merchant_address: merchantAddress,
-        credential_id: passkey.credentialId,
-      }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chain: wireChain, address, verified_token: verifiedToken }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || body.message || `Announce failed (${res.status})`);
@@ -368,26 +345,17 @@
   }
 
   /* ---------- Balances / UI Helpers ---------- */
-  const encodeEvmBalanceOfCall = (address) =>
-    `0x70a08231${address.replace(/^0x/i, "").padStart(64, "0")}`;
+  const encodeEvmBalanceOfCall = (address) => `0x70a08231${address.replace(/^0x/i, "").padStart(64, "0")}`;
 
   async function tokenBalance(chainKey, address) {
     const chain = CHAINS[chainKey];
     if (!chain) return 0n;
     if (chain.kind === "evm") {
-      const result = await rpcCall(
-        chain.rpc,
-        "eth_call",
-        [{ to: chain.usdc, data: encodeEvmBalanceOfCall(address) }, "latest"]
-      );
+      const result = await rpcCall(chain.rpc, "eth_call", [{ to: chain.usdc, data: encodeEvmBalanceOfCall(address) }, "latest"]);
       return BigInt(result || "0x0");
     }
     const result = await rpcCall(chain.rpc, "starknet_call", [
-      {
-        contract_address: chain.usdc,
-        entry_point_selector: STARKNET_BALANCEOF_SELECTOR,
-        calldata: [address],
-      },
+      { contract_address: chain.usdc, entry_point_selector: STARKNET_BALANCEOF_SELECTOR, calldata: [address] },
       "latest",
     ]);
     return (BigInt(result?.[1] || "0") << 128n) + BigInt(result?.[0] || "0");
@@ -409,10 +377,7 @@
   }
 
   function formatUsdc(atoms) {
-    return (Number(atoms) / 1e6).toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 6,
-    });
+    return (Number(atoms) / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
   }
 
   const EVM_MAGNITUDE_LIMIT = 1n << 160n;
@@ -420,11 +385,7 @@
 
   function isValidEvmAddress(v) {
     if (typeof v !== "string" || !v.startsWith("0x") || v.length !== 42) return false;
-    try {
-      return BigInt(v) < EVM_MAGNITUDE_LIMIT;
-    } catch {
-      return false;
-    }
+    try { return BigInt(v) < EVM_MAGNITUDE_LIMIT; } catch { return false; }
   }
 
   function isValidStarknetAddress(v) {
@@ -434,15 +395,11 @@
     try {
       const val = BigInt("0x" + hex);
       return val >= EVM_MAGNITUDE_LIMIT && val < STARK_PRIME;
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
   function walletMatchesChain(chainKey, value) {
-    return CHAINS[chainKey]?.kind === "evm"
-      ? isValidEvmAddress(value)
-      : isValidStarknetAddress(value);
+    return CHAINS[chainKey]?.kind === "evm" ? isValidEvmAddress(value) : isValidStarknetAddress(value);
   }
 
   function sanitizeWebhookUrl(raw) {
@@ -461,10 +418,7 @@
 
   function notify(title, tone = "info", detail = "") {
     const stack = $("#toastStack");
-    if (!stack) {
-      console.warn(`[notify] ${title}`, detail);
-      return;
-    }
+    if (!stack) { console.warn(`[notify] ${title}`, detail); return; }
     const toast = el(
       "div",
       `live-toast ${tone}`,
@@ -489,9 +443,7 @@
     url.searchParams.set("lane", lane.id);
     url.searchParams.set("idx", lane.currentIndex || 0);
     if (lane.privacy) url.searchParams.set("privacy", "1");
-    for (const r of lane.receivers) {
-      url.searchParams.append("r", `${r.chain}:${r.address}`);
-    }
+    for (const r of lane.receivers) url.searchParams.append("r", `${r.chain}:${r.address}`);
     return url.toString();
   }
 
@@ -502,17 +454,12 @@
   function renderLanes() {
     const lanes = getLanes();
     const subtitle = $("#receiversSubtitle");
-    if (subtitle)
-      subtitle.textContent = lanes.length
-        ? `${lanes.length} lane${lanes.length > 1 ? "s" : ""}`
-        : "No lanes yet";
+    if (subtitle) subtitle.textContent = lanes.length ? `${lanes.length} lane${lanes.length > 1 ? "s" : ""}` : "No lanes yet";
 
     const list = $("#receiversList");
     if (!list) return;
 
-    list.innerHTML = lanes.length
-      ? ""
-      : `<p class="receiver-empty">No lanes yet — create a payment lane to see it here.</p>`;
+    list.innerHTML = lanes.length ? "" : `<p class="receiver-empty">No lanes yet — create a payment lane to see it here.</p>`;
 
     for (const lane of lanes) {
       const laneUrl = laneShareUrl(lane);
@@ -530,12 +477,8 @@
       );
       row.style.gridTemplateColumns = "24px 1fr auto auto";
       row.querySelector(".receiver-copy")?.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(laneUrl);
-          notify("Pay link copied");
-        } catch {
-          notify("Copy failed", "error");
-        }
+        try { await navigator.clipboard.writeText(laneUrl); notify("Pay link copied"); }
+        catch { notify("Copy failed", "error"); }
       });
       list.append(row);
     }
@@ -552,10 +495,7 @@
         }
       }
     }
-    if (changed) {
-      saveLanes(lanes);
-      renderLanes();
-    }
+    if (changed) { saveLanes(lanes); renderLanes(); }
   }
 
   /* ---------- History Panel ---------- */
@@ -615,9 +555,7 @@
     }
 
     const subtitle = $("#historySubtitle");
-    if (subtitle) subtitle.textContent = rows.length
-      ? `${rows.length} deposit${rows.length === 1 ? "" : "s"} received`
-      : "Nothing yet";
+    if (subtitle) subtitle.textContent = rows.length ? `${rows.length} deposit${rows.length === 1 ? "" : "s"} received` : "Nothing yet";
   }
 
   function openHistory() {
@@ -629,49 +567,57 @@
     refreshNotifyDot();
   }
 
+  /* ---------- Status (replaces client-side balance-delta guessing) ---------- */
+
+  /**
+   * The worker knows definitively whether a sweep/settle succeeded. Poll it
+   * instead of inferring "Funds settled" / "Deposit shielded" from a raw
+   * balance drop, which could just as easily be an unauthorized drain.
+   */
+  async function fetchReceiverStatus(chain, address) {
+    try {
+      const res = await fetch(`${API_STATUS}?chain=${encodeURIComponent(chain)}&address=${encodeURIComponent(address)}`);
+      if (!res.ok) return null;
+      return await res.json(); // expected: { state: "pending" | "active" | "swept" | "shielded", detail?: string }
+    } catch {
+      return null;
+    }
+  }
+
   /* ---------- Polling ---------- */
   async function pollDeposits(chain, address) {
     let balance;
-    try {
-      balance = await tokenBalance(chain, address);
-    } catch {
-      return;
-    }
+    try { balance = await tokenBalance(chain, address); } catch { return; }
+
     const balances = getBalances();
     const key = receiverKey(chain, address);
     const previous = BigInt(balances[key] || "0");
+
     if (balance > previous) {
       const history = getHistory();
       const entries = history[key] || [];
-      entries.unshift({
-        chain,
-        address,
-        amount: (balance - previous).toString(),
-        time: Date.now(),
-      });
+      entries.unshift({ chain, address, amount: (balance - previous).toString(), time: Date.now() });
       history[key] = entries.slice(0, 50);
       saveHistory(history);
-      notify(
-        "Deposit detected",
-        "success",
-        `${formatUsdc(balance - previous)} USDC on ${chainLabel(chain)}`
-      );
+      notify("Deposit detected", "success", `${formatUsdc(balance - previous)} USDC on ${chainLabel(chain)}`);
       refreshNotifyDot();
       if (activeReceiver?.chain === chain && activeReceiver?.address === address) {
         const statusEl = $("#statusLine");
         if (statusEl) statusEl.textContent = "Payment received.";
       }
     } else if (balance < previous) {
-      if (chain === "BASE") {
-        notify("Funds settled", "success", `${chainLabel(chain)} lane swept to your wallet.`);
+      // Don't guess what a balance drop means — ask the backend, which
+      // actually dispatched (or didn't dispatch) the sweep/bridge-out.
+      const status = await fetchReceiverStatus(chain, address);
+      if (status?.state === "swept") {
+        notify("Funds settled", "success", status.detail || `${chainLabel(chain)} lane swept to your wallet.`);
+      } else if (status?.state === "shielded") {
+        notify("Deposit shielded", "info", status.detail || "Moved into the privacy pool — payout follows via bridge-out.");
       } else {
-        notify(
-          "Deposit shielded",
-          "info",
-          "Moved into the Starknet privacy pool — payout follows via bridge-out."
-        );
+        notify("Balance decreased", "info", `${chainLabel(chain)} balance dropped and the backend didn't confirm an expected settlement — check history.`);
       }
     }
+
     balances[key] = balance.toString();
     saveBalances(balances);
   }
@@ -713,11 +659,7 @@
     }
     if (!merchantAddress || !walletMatchesChain(targetChain, merchantAddress)) {
       if (walletEl) walletEl.classList.add("invalid");
-      notify(
-        "Check your wallet address",
-        "error",
-        `Enter a valid ${chainLabel(targetChain)} address.`
-      );
+      notify("Check your wallet address", "error", `Enter a valid ${chainLabel(targetChain)} address.`);
       return;
     }
 
@@ -744,9 +686,7 @@
         if (btn) btn.textContent = "Confirm passkey…";
         const stealth = await derivePrivacyReceivers({ laneId, index: 0 });
 
-        if (!stealth?.length) {
-          throw new Error("Could not derive stealth merchant identities.");
-        }
+        if (!stealth?.length) throw new Error("Could not derive stealth merchant identities.");
 
         for (const s of stealth) {
           const chain = String(s.chain || "").toUpperCase();
@@ -755,26 +695,16 @@
 
           let predicted;
           try {
-            if (chain === "BASE") {
-              predicted = await predictEvmReceiver(stealthMerchant);
-            } else if (chain === "STARKNET") {
-              predicted = await predictStarknetReceiver(stealthMerchant);
-            } else {
-              continue;
-            }
+            if (chain === "BASE") predicted = await predictEvmReceiver(stealthMerchant);
+            else if (chain === "STARKNET") predicted = await predictStarknetReceiver(stealthMerchant);
+            else continue;
           } catch (e) {
             console.error(`predict failed ${chain}`, e);
             notify("Predict failed", "info", `${chain}: ${e.message}`);
             continue;
           }
 
-          receivers.push({
-            chain,
-            address: predicted.address,
-            isPrivacy: true,
-            stealthMerchant,
-            status: "pending",
-          });
+          receivers.push({ chain, address: predicted.address, isPrivacy: true, stealthMerchant, status: "pending" });
 
           if (btn) btn.textContent = `Announcing ${chain}…`;
           try {
@@ -786,9 +716,7 @@
           }
         }
 
-        if (!receivers.length) {
-          throw new Error("Could not derive private factory receivers.");
-        }
+        if (!receivers.length) throw new Error("Could not derive private factory receivers.");
       } else {
         receivers = (await derivePublicReceivers(merchantAddress)).map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
@@ -797,26 +725,17 @@
           status: "pending",
         }));
 
-        if (!receivers.length) {
-          throw new Error("Could not predict receiver addresses.");
-        }
+        if (!receivers.length) throw new Error("Could not predict receiver addresses.");
 
         if (btn) btn.textContent = "Confirm passkey…";
         const announceResults = await announceAllSourceChains(merchantAddress);
         const failed = announceResults.filter((r) => !r.ok);
 
         if (failed.length === announceResults.length) {
-          throw new Error(
-            failed.map((f) => `${f.chain}: ${f.error}`).join("; ") ||
-            "Announce failed on all chains"
-          );
+          throw new Error(failed.map((f) => `${f.chain}: ${f.error}`).join("; ") || "Announce failed on all chains");
         }
         if (failed.length) {
-          notify(
-            "Partial announce",
-            "info",
-            failed.map((f) => `${f.chain}: ${f.error}`).join("; ")
-          );
+          notify("Partial announce", "info", failed.map((f) => `${f.chain}: ${f.error}`).join("; "));
         }
 
         announced = announceResults.filter((r) => r.ok).map((r) => r.chain);
@@ -850,10 +769,7 @@
     } catch (error) {
       console.error("[beanie] create failed:", error);
       notify("Could not create payment lane", "error", error.message || "");
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "Create Payment Link";
-      }
+      if (btn) { btn.disabled = false; btn.textContent = "Create Payment Link"; }
     }
   }
 
@@ -909,49 +825,23 @@
     renderLanes();
     $("#receiversModal")?.classList.add("open");
   });
-  $("#closeReceiversModal")?.addEventListener("click", () =>
-    $("#receiversModal")?.classList.remove("open")
-  );
+  $("#closeReceiversModal")?.addEventListener("click", () => $("#receiversModal")?.classList.remove("open"));
   $("#receiversModal")?.addEventListener("click", (e) => {
     if (e.target.id === "receiversModal") $("#receiversModal")?.classList.remove("open");
   });
 
+  // Was registered twice with identical bodies in the original file — kept once.
   const selectEl = $("#settlementChain");
   selectEl?.addEventListener("change", () => {
     const rawVal = selectEl.value;
     const targetChain = OPTION_TO_CHAIN[rawVal] || rawVal?.toUpperCase();
     const summaryEl = $("#routeSummary");
     if (summaryEl) {
-      summaryEl.textContent = targetChain
-        ? `USDC lands on ${chainLabel(targetChain)}`
-        : "USDC lands on Starknet";
+      summaryEl.textContent = targetChain ? `USDC lands on ${chainLabel(targetChain)}` : "USDC lands on xxxxx";
     }
     const walletEl = $("#wallet");
     if (walletEl && walletEl.value.trim()) {
-      walletEl.classList.toggle(
-        "invalid",
-        !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim())
-      );
-    }
-  });
-
-  selectEl?.addEventListener("change", () => {
-    const rawVal = selectEl.value;
-    const targetChain = OPTION_TO_CHAIN[rawVal] || rawVal?.toUpperCase();
-
-    const summaryEl = $("#routeSummary");
-    if (summaryEl) {
-      summaryEl.textContent = targetChain
-        ? `USDC lands on ${chainLabel(targetChain)}`
-        : "USDC lands on Starknet";
-    }
-
-    const walletEl = $("#wallet");
-    if (walletEl && walletEl.value.trim()) {
-      walletEl.classList.toggle(
-        "invalid",
-        !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim())
-      );
+      walletEl.classList.toggle("invalid", !!targetChain && !walletMatchesChain(targetChain, walletEl.value.trim()));
     }
   });
 
