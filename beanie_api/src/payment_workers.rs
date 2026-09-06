@@ -265,7 +265,7 @@ pub async fn run_payment_worker(
                             .estimate_eip1559_fees(None)
                             .await
                             .unwrap_or((U256::zero(), U256::zero()));
-                        let max_allowed_priority = ethers::utils::parse_units("0.05", "gwei")
+                        let max_allowed_priority = ethers::utils::parse_units("0.005", "gwei")
                             .expect("failed parsing priority fee ceiling");
                         let priority_fee =
                             std::cmp::min(suggested_priority_fee, max_allowed_priority.into());

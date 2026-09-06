@@ -12,10 +12,14 @@
   box-sizing: border-box;
 }
 
+/* Layout Lock - Strict No Scrolling */
 html,
 body {
   margin: 0;
-  min-height: 100%;
+  padding: 0;
+  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
   background: var(--bg);
   color: var(--ink);
 }
@@ -32,10 +36,99 @@ a {
 
 .page {
   position: relative;
-  min-height: 100vh;
-  isolation: isolate;
+  width: 100vw;
+  height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(8px, 2vh, 16px);
+  box-sizing: border-box;
   overflow: hidden;
+  isolation: isolate;
   background: #0a0a0a;
+}
+
+/* Container Shell */
+.pay-shell {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 440px;
+  max-height: calc(100dvh - 16px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  margin: 0 auto;
+}
+
+.pay-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Single Unified Main Card (Double Border Removed) */
+#laneCard {
+  background: rgba(13, 13, 13, 0.94);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 20px;
+  padding: clamp(12px, 2.5vh, 20px);
+  width: 100%;
+  max-width: 440px;
+  margin: 0 auto;
+  color: #fff;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: clamp(8px, 1.5vh, 14px);
+}
+
+/* Tag Container - Placed directly inside card */
+.powered-tag-wrapper {
+  display: flex;
+  justify-content: end;
+  margin-top: clamp(2px, 0.8vh, 8px);
+  padding-top: clamp(2px, 0.6vh, 6px);
+}
+
+/* Privy-style Pill Tag */
+.powered-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  text-decoration: none;
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 0.7rem;
+  transition: all 0.2s ease;
+}
+
+.powered-tag:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.powered-tag .tag-label {
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+.powered-tag .wordmark {
+  font-family: 'Slackey', cursive, sans-serif;
+  font-size: 0.75rem;
+  color: #fff;
+}
+
+.powered-tag .colon {
+  color: #a855f7;
+}
+
+.powered-tag .tag-label {
+  font-family: 'Slackey', cursive, sans-serif;
+  font-size: 0.6rem;
 }
 
 .doodle-field {
@@ -46,7 +139,7 @@ a {
   background:
     radial-gradient(circle at 70% 14%, rgba(184, 201, 154, 0.16), transparent 22%),
     radial-gradient(circle at 22% 22%, rgba(98, 72, 176, 0.16), transparent 28%),
-    linear-gradient(rgba(4, 4, 4, 0.82), rgba(4, 4, 4, 0.91)),
+    linear-gradient(rgba(4, 4, 4, 0.82), rgba(4, 4, 4, 0.91));
 }
 
 /* Positions the <img> under the .doodle-field gradient overlay */
@@ -103,27 +196,14 @@ a {
   color: #d84fff;
 }
 
-.pay-shell {
-  position: relative;
-  z-index: 2;
-  min-height: calc(100vh - 124px);
-  display: grid;
-  place-items: center;
-  padding: 20px;
-}
-
-.pay-panel {
-  width: min(480px, 100%);
-}
-
 .lane-card {
-  display: grid;
-  gap: 16px;
+  display: flex;
+  flex-direction: column;
 }
 
 .loading,
 .error {
-  min-height: 140px;
+  min-height: 120px;
   display: grid;
   place-items: center;
   color: var(--muted);
@@ -132,8 +212,9 @@ a {
 }
 
 .pay-routes {
-  display: grid;
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(6px, 1.2vh, 10px);
 }
 
 .pay-route {
@@ -142,7 +223,7 @@ a {
   display: grid;
   grid-template-columns: 36px 1fr 24px;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   border: 1px solid rgba(247, 247, 242, 0.1);
   border-radius: 12px;
   padding: 0 16px;
@@ -163,60 +244,71 @@ a {
 }
 
 .pay-route-icon {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
 }
 
 .pay-route-icon svg {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
+}
+
+.pay-route-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
 }
 
 .pay-route-meta strong {
   display: block;
-  font-size: 0.95rem;
+  font-size: 0.88rem;
   font-weight: 700;
 }
 
 .pay-route-meta span {
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   color: var(--muted);
 }
 
 .pay-route-arrow {
-  color: rgba(247, 247, 242, 0.4);
-  font-size: 1.1rem;
+  color: #666;
+  font-size: 16px;
+}
+
+.pay-route.active .pay-route-arrow {
+  color: #fff;
 }
 
 .address-display-card {
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(8, 8, 7, 0.6);
   border: 1px solid rgba(184, 201, 154, 0.25);
-  padding: 16px;
-  display: grid;
-  gap: 10px;
+  padding: clamp(10px, 1.8vh, 14px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .address-val {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   color: rgba(247, 247, 242, 0.92);
   word-break: break-all;
   user-select: all;
   text-align: center;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 
 .copy-btn {
-  min-height: 44px;
+  min-height: 38px;
   border: 1px solid rgba(184, 201, 154, 0.4);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(184, 201, 154, 0.12);
   color: var(--ink);
   cursor: pointer;
-  font-size: 0.86rem;
+  font-size: 0.82rem;
   font-weight: 700;
   transition: background 160ms ease, transform 160ms ease;
 }
@@ -243,10 +335,10 @@ a {
 
 .toast-stack {
   position: fixed;
-  top: 22px;
+  top: 16px;
   left: 50%;
   z-index: 40;
-  width: min(420px, calc(100vw - 28px));
+  width: min(380px, calc(100vw - 28px));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -261,42 +353,18 @@ a {
   text-align: center;
   justify-content: center;
   width: 100%;
-  min-height: 48px;
-  border-radius: 14px;
+  min-height: 42px;
+  border-radius: 12px;
   background: #f7f7f2;
   color: #050505;
-  padding: 10px 16px;
+  padding: 8px 14px;
   pointer-events: auto;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-  font-size: 0.84rem;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
-#laneCard {
-  background: #0d0d0d;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 16px;
-  padding: 24px;
-  max-width: 440px;
-  margin: 0 auto;
-  color: #fff;
-}
-
-.pay-route-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-}
-
-.pay-route-arrow {
-  font-size: 18px;
-  color: #666;
-}
-
-.pay-route.active .pay-route-arrow {
-  color: #fff;
-}
-
+/* QR Code Display Fit */
 .qr-container {
   display: flex;
   flex-direction: column;

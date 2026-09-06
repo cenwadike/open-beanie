@@ -30,6 +30,15 @@
     STARKNET: `<svg viewBox="0 0 42 42" aria-hidden="true"><circle cx="21" cy="21" r="21" fill="#0c0c4d"/><path d="M21 8 32 21 21 34 10 21 21 8Z" fill="#ec796b"/></svg>`,
   };
 
+  const poweredTagHtml = `
+    <footer class="powered-tag-wrapper">
+      <a class="powered-tag" href="/" aria-label="Powered by Beanie">
+        <span class="tag-label">powered by</span>
+        <span class="wordmark">bean<span class="colon">:</span>ie</span>
+      </a>
+    </footer>
+  `;
+
   function bytesToHex(bytes) {
     return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
@@ -459,6 +468,7 @@
           `).join("")}
         </div>
         <p class="status-hint">Select a payment network above to continue.</p>  
+        ${poweredTagHtml}
         `;
         laneCard.querySelectorAll(".pay-route").forEach((btn) => {
           btn.addEventListener("click", () => { activeIndex = Number(btn.dataset.index); buildHtml(); });
@@ -496,16 +506,17 @@
       <div class="address-val" id="depositAddr">${escapeHtml(currentRoute.address)}</div>
       <button class="copy-btn" id="copyBtn" type="button">Copy Address</button>
     </div>
-    <div style="margin-top: 0.5rem; display: flex; justify-content: flex-end;">
+    <div style="margin-top: 0.25rem; display: flex; justify-content: flex-end;">
       <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8; display: inline-flex; align-items: center; gap: 6px;">
         <input type="checkbox" id="modeToggle" style="margin: 0; cursor: pointer;">
         <span>Gasless Transfer</span>
       </label>
     </div>
-    <div class="qr-container" style="margin-top: 1.25rem; text-align: center;">
+    <div class="qr-container">
       <img src="${qrApiUrl}" alt="Scan to Pay QR Code" class="qr-code-img" width="240" height="240" />
-      <p style="font-size: 0.85rem; margin-top: 0.75rem; opacity: 0.8;">Scan and Pay on ${escapeHtml(chainName)}</p>
+      <p style="font-size: 0.82rem; margin-top: 0.5rem; opacity: 0.8;">Scan and Pay on ${escapeHtml(chainName)}</p>
     </div>
+    ${poweredTagHtml}
   `;
 
         laneCard.querySelector("#copyBtn")?.addEventListener("click", async () => {
@@ -532,24 +543,25 @@
           id="amountInput"
           placeholder="0.00"
           autocomplete="off"
-          style="display:block; width:100%; margin-top:4px; padding:10px; border-radius:6px; border:1px solid rgba(255,255,255,0.25); background:transparent; color:inherit; font-size:1rem; box-sizing:border-box;"
+          style="display:block; width:100%; margin-top:4px; padding:8px 10px; border-radius:6px; border:1px solid rgba(255,255,255,0.25); background:transparent; color:inherit; font-size:0.95rem; box-sizing:border-box;"
         />
       </label>
-      <button class="copy-btn" id="actionBtn" type="button" style="margin-top: 0.85rem;">Pay with Beanie</button>
+      <button class="copy-btn" id="actionBtn" type="button" style="margin-top: 0.5rem;">Pay with Beanie</button>
       <p id="payHint" style="font-size:0.8rem; opacity:0.75; margin-top:0; min-height:0;"></p>
     </div>
-    <div style="margin-top: 0.5rem; display: flex; justify-content: flex-end;">
+    <div style="margin-top: 0.25rem; display: flex; justify-content: flex-end;">
       <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8; display: inline-flex; align-items: center; gap: 6px;">
         <input type="checkbox" id="modeToggle" checked style="margin: 0; cursor: pointer;">
         <span>Gasless Transfer</span>
       </label>
     </div>
-    <div class="qr-container" style="margin-top: 1.25rem; text-align: center;">
+    <div class="qr-container">
       <img src="${qrApiUrl}" alt="Open in wallet browser" class="qr-code-img" width="240" height="240" />
-      <p style="font-size: 0.85rem; margin-top: 0.75rem; opacity: 0.8;">
+      <p style="font-size: 0.82rem; margin-top: 0.5rem; opacity: 0.8;">
         Scan and Authorize Transfer
       </p>
     </div>
+    ${poweredTagHtml}
   `;
 
         laneCard.querySelector("#amountInput")?.addEventListener("input", (e) => {
@@ -665,13 +677,19 @@
     try {
       const routes = await resolveRoutes();
       if (!routes.length) {
-        laneCard.innerHTML = `<div class="error">This payment link is missing a destination address.</div>`;
+        laneCard.innerHTML = `
+          <div class="error">This payment link is missing a destination address.</div>
+          ${poweredTagHtml}
+        `;
         return;
       }
       renderCard(routes);
     } catch (err) {
       console.error("Failed to load payment routes:", err);
-      laneCard.innerHTML = `<div class="error">Something went wrong loading this payment link. Please refresh.</div>`;
+      laneCard.innerHTML = `
+        <div class="error">Something went wrong loading this payment link. Please refresh.</div>
+        ${poweredTagHtml}
+      `;
     }
   }
 
