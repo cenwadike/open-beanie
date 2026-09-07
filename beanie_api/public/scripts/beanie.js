@@ -248,33 +248,6 @@
     return new Uint8Array(digest);
   }
 
-  async function derivePrivacyReceivers({ laneId, index = 0 }) {
-    const helper = window.beanieStealth;
-    if (!helper?.deriveReceivers) {
-      throw new Error(
-        "Privacy module not loaded. Include stealth.js and set window.beanieStealth.deriveReceivers."
-      );
-    }
-
-    const salt = await deriveLaneSalt(laneId);
-    // No backend action is being authorized here — deriving addresses is a
-    // pure local computation — so this is a bare PRF eval, not a
-    // verified-token ceremony. Only announcing/claiming touches the backend.
-    const { prfOutput } = await getVerifiedToken(`derive:${laneId}:${index}`, { salt });
-    if (!prfOutput) {
-      throw new Error(
-        "Private lanes need a passkey with PRF support. Try another device or turn privacy off."
-      );
-    }
-
-    return helper.deriveReceivers({
-      masterSecret: prfOutput,
-      laneId,
-      index,
-      chains: SOURCE_CHAINS.map((k) => ({ key: k, ...CHAINS[k] })),
-    });
-  }
-
   /* ---------- RPC and Announcements ---------- */
   async function rpcCall(url, method, params) {
     const res = await fetch(url, {
@@ -794,7 +767,7 @@
         const helper = window.beanieStealth;
         if (!helper?.deriveReceivers) {
           throw new Error(
-            "Privacy module not loaded. Include stealth.js and set window.beanieStealth.deriveReceivers."
+            "Privacy module not loaded."
           );
         }
 
