@@ -69,6 +69,7 @@ pub struct StarknetConfig {
     pub keeper_address: Felt,
     pub keeper_wallet: StarknetLocalWallet,
     pub registry_start_block: u64,
+    pub deposit_start_block: u64,
     pub webhook_registry_start_block: u64,
     pub poll_interval: Duration,
     pub log_chunk_blocks: u64,
@@ -93,6 +94,9 @@ impl StarknetConfig {
             registry_start_block: env("STARKNET_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid START_BLOCK")?,
+            deposit_start_block: env("STARKNET_DEPOSIT_START_BLOCK")?
+                .parse()
+                .context("invalid STARKNET_DEPOSIT_START_BLOCK")?,
             webhook_registry_start_block: env("STARKNET_WEBHOOK_REGISTRY_START_BLOCK")?
                 .parse()
                 .context("invalid REGISTRY_START_BLOCK")?,

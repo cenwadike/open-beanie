@@ -1,4 +1,3 @@
-use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,8 +83,12 @@ pub async fn run_native_transfer_poller(
     let mut base_registry_watermark = evm_cfg.registry_start_block;
     let mut base_deposit_watermark = evm_cfg.deposit_start_block;
     let mut sn_registry_watermark = starknet_cfg.registry_start_block;
-    let mut sn_deposit_watermark = starknet_cfg.registry_start_block;
+    let mut sn_deposit_watermark = starknet_cfg.deposit_start_block;
 
+    let mut evm_merchant_map: HashMap<Address, Address> = HashMap::new();
+    let mut sn_merchant_map: HashMap<Felt, Felt> = HashMap::new();
+
+    let mut sn_next_nonce: Option<Felt> = None;
     loop {
         // ------------------------------------------------------------------
         // EVM tip
@@ -102,7 +105,6 @@ pub async fn run_native_transfer_poller(
         // ------------------------------------------------------------------
         // Refresh EVM merchant registry (now includes ReceiverAnnounced)
         // ------------------------------------------------------------------
-        let mut evm_merchant_map: HashMap<Address, Address> = HashMap::new();
         if base_registry_watermark <= tip_bn {
             match beanie_keeper::evm_keeper::discover_merchants(
                 &keeper_client,
@@ -357,166 +359,170 @@ pub async fn run_native_transfer_poller(
             .await
             {
                 Ok(found) => {
-                    let mut sn_merchant_map: HashMap<Felt, Felt> = HashMap::new();
                     for (merchant, receiver) in found {
                         sn_merchant_map.insert(receiver, merchant);
                     }
                     sn_registry_watermark = sn_tip + 1;
-
-                    if sn_deposit_watermark <= sn_tip && !sn_merchant_map.is_empty() {
-                        let receivers_sn: Vec<Felt> = sn_merchant_map.keys().copied().collect();
-
-                        match beanie_keeper::starknet_keeper::fetch_deposits_since_block(
-                            &starknet_account,
-                            &*starknet_cfg,
-                            &receivers_sn,
-                            sn_deposit_watermark,
-                            sn_tip,
-                        )
-                        .await
-                        {
-                            Ok(sn_deposits) => {
-                                if !sn_deposits.is_empty() {
-                                    // Unique receivers
-                                    let mut unique: Vec<Felt> = sn_deposits
-                                        .iter()
-                                        .filter_map(|d| Felt::from_hex(&d.receiver).ok())
-                                        .collect();
-                                    unique.sort_by(|a, b| a.to_bytes_be().cmp(&b.to_bytes_be()));
-                                    unique.dedup();
-
-                                    // Build atomic calls: register (if needed) + sweep
-                                    let mut calls: Vec<Call> = Vec::new();
-
-                                    let register_selector =
-                                        match get_selector_from_name("register_merchant") {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                eprintln!("selector register_merchant: {e}");
-                                                continue;
-                                            }
-                                        };
-                                    let sweep_selector = match get_selector_from_name("sweep") {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            eprintln!("selector sweep: {e}");
-                                            continue;
-                                        }
-                                    };
-
-                                    for &receiver in &unique {
-                                        let merchant = match sn_merchant_map.get(&receiver) {
-                                            Some(m) => *m,
-                                            None => continue,
-                                        };
-
-                                        // Existence check via class hash.
-                                        // If the call fails or returns zero we treat
-                                        // the address as still counterfactual.
-                                        let needs_deploy = match starknet_account
-                                            .provider()
-                                            .get_class_hash_at(
-                                                BlockId::Tag(BlockTag::Latest),
-                                                receiver,
-                                            )
-                                            .await
-                                        {
-                                            Ok(ch) => ch == Felt::ZERO,
-                                            Err(_) => true, // no class → needs deploy
-                                        };
-
-                                        if needs_deploy {
-                                            // Same-chain default (zeros).
-                                            // Extend ReceiverAnnounced if you need
-                                            // cross-chain params here.
-                                            calls.push(Call {
-                                                to: starknet_cfg.factory_address,
-                                                selector: register_selector,
-                                                calldata: vec![
-                                                    merchant,
-                                                    Felt::ZERO, // cctp_mint_chain
-                                                    Felt::ZERO, // recipient low
-                                                    Felt::ZERO, // recipient high
-                                                ],
-                                            });
-                                        }
-
-                                        calls.push(Call {
-                                            to: receiver,
-                                            selector: sweep_selector,
-                                            calldata: vec![],
-                                        });
-                                    }
-
-                                    let sweep_tx_sn = if calls.is_empty() {
-                                        None
-                                    } else {
-                                        match starknet_account.execute_v3(calls).send().await {
-                                            Ok(pending) => {
-                                                let tx_hash =
-                                                    format!("{:#x}", pending.transaction_hash);
-                                                println!(
-                                                    "starknet native atomic register+sweep -> {tx_hash}"
-                                                );
-                                                Some(tx_hash)
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "starknet native atomic invoke failed: {e}"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    };
-
-                                    // Webhooks (lookup via derived EVM merchant address)
-                                    for d in sn_deposits {
-                                        let merchant_felt = match Felt::from_hex(&d.receiver) {
-                                            Ok(f) => f,
-                                            Err(_) => continue,
-                                        };
-                                        // Prefer the real merchant from the map
-                                        let merchant_for_webhook = sn_merchant_map
-                                            .get(&merchant_felt)
-                                            .copied()
-                                            .unwrap_or(merchant_felt);
-
-                                        let merchant_str = format!("{:#x}", merchant_for_webhook);
-                                        let hash = keccak256(merchant_str.as_bytes());
-                                        let evm_merchant = Address::from_slice(&hash[12..32]);
-                                        let webhook_key = format!("{evm_merchant:?}");
-
-                                        if let Some(url) = webhook_map.get(&webhook_key) {
-                                            let cfg = beanie_keeper::config::Config::Starknet(
-                                                (*starknet_cfg).clone(),
-                                            );
-                                            let job = crate::models::WebhookJob {
-                                                cfg,
-                                                webhook_url: url.clone(),
-                                                deposit: d.clone(),
-                                                sweep_tx: sweep_tx_sn.clone(),
-                                                max_retries: 5,
-                                            };
-                                            if let Err(e) = webhook_tx.send(job).await {
-                                                eprintln!("failed enqueuing webhook job: {e}");
-                                            }
-                                        } else {
-                                            eprintln!("no webhook URL for merchant {webhook_key}");
-                                        }
-                                    }
-                                }
-                                sn_deposit_watermark = sn_tip + 1;
-                            }
-                            Err(e) => {
-                                eprintln!("starknet fetch_deposits_since_block failed: {e}")
-                            }
-                        }
-                    }
                 }
                 Err(e) => eprintln!("starknet discover_merchants failed: {e}"),
             }
         }
 
-        sleep(max(evm_cfg.poll_interval, starknet_cfg.poll_interval)).await;
+        if sn_deposit_watermark <= sn_tip && !sn_merchant_map.is_empty() {
+            let receivers_sn: Vec<Felt> = sn_merchant_map.keys().copied().collect();
+            match beanie_keeper::starknet_keeper::fetch_deposits_since_block(
+                &starknet_account,
+                &*starknet_cfg,
+                &receivers_sn,
+                sn_deposit_watermark,
+                sn_tip,
+            )
+            .await
+            {
+                Ok(sn_deposits) => {
+                    if !sn_deposits.is_empty() {
+                        // Unique receivers
+                        let mut unique: Vec<Felt> = sn_deposits
+                            .iter()
+                            .filter_map(|d| Felt::from_hex(&d.receiver).ok())
+                            .collect();
+                        unique.sort_by(|a, b| a.to_bytes_be().cmp(&b.to_bytes_be()));
+                        unique.dedup();
+
+                        // Build atomic calls: register (if needed) + sweep
+                        let mut calls: Vec<Call> = Vec::new();
+
+                        let register_selector = match get_selector_from_name("register_merchant") {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("selector register_merchant: {e}");
+                                continue;
+                            }
+                        };
+                        let sweep_selector = match get_selector_from_name("sweep") {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("selector sweep: {e}");
+                                continue;
+                            }
+                        };
+
+                        for &receiver in &unique {
+                            let merchant = match sn_merchant_map.get(&receiver) {
+                                Some(m) => *m,
+                                None => continue,
+                            };
+
+                            // Existence check via class hash.
+                            // If the call fails or returns zero we treat
+                            // the address as still counterfactual.
+                            let needs_deploy = match starknet_account
+                                .provider()
+                                .get_class_hash_at(BlockId::Tag(BlockTag::L1Accepted), receiver)
+                                .await
+                            {
+                                Ok(ch) => ch == Felt::ZERO,
+                                Err(_) => true, // no class → needs deploy
+                            };
+
+                            if needs_deploy {
+                                // Same-chain default (zeros).
+                                // Extend ReceiverAnnounced if you need
+                                // cross-chain params here.
+                                calls.push(Call {
+                                    to: starknet_cfg.factory_address,
+                                    selector: register_selector,
+                                    calldata: vec![
+                                        merchant,
+                                        Felt::ZERO, // cctp_mint_chain
+                                        Felt::ZERO, // recipient low
+                                        Felt::ZERO, // recipient high
+                                    ],
+                                });
+                            }
+
+                            calls.push(Call {
+                                to: receiver,
+                                selector: sweep_selector,
+                                calldata: vec![],
+                            });
+                        }
+
+                        if sn_next_nonce.is_none() {
+                            sn_next_nonce = Some(
+                                starknet_account
+                                    .provider()
+                                    .get_nonce(
+                                        BlockId::Tag(BlockTag::L1Accepted),
+                                        starknet_account.address(),
+                                    )
+                                    .await
+                                    .unwrap_or(Felt::ZERO),
+                            );
+                        }
+                        let nonce = sn_next_nonce.unwrap();
+                        let sweep_tx_sn = if calls.is_empty() {
+                            None
+                        } else {
+                            match starknet_account.execute_v3(calls).nonce(nonce).send().await {
+                                Ok(pending) => {
+                                    let tx_hash = format!("{:#x}", pending.transaction_hash);
+                                    println!("starknet native atomic register+sweep -> {tx_hash}");
+                                    sn_next_nonce = Some(nonce + Felt::ONE); // advance locally, don't ask RPC
+                                    Some(tx_hash)
+                                }
+                                Err(e) => {
+                                    eprintln!("starknet native atomic invoke failed: {e}");
+                                    sn_next_nonce = None; // force a fresh get_nonce() next time — something's out of sync
+                                    None
+                                }
+                            }
+                        };
+
+                        // Webhooks (lookup via derived EVM merchant address)
+                        for d in sn_deposits {
+                            let merchant_felt = match Felt::from_hex(&d.receiver) {
+                                Ok(f) => f,
+                                Err(_) => continue,
+                            };
+                            // Prefer the real merchant from the map
+                            let merchant_for_webhook = sn_merchant_map
+                                .get(&merchant_felt)
+                                .copied()
+                                .unwrap_or(merchant_felt);
+
+                            let merchant_str = format!("{:#x}", merchant_for_webhook);
+                            let hash = keccak256(merchant_str.as_bytes());
+                            let evm_merchant = Address::from_slice(&hash[12..32]);
+                            let webhook_key = format!("{evm_merchant:?}");
+
+                            if let Some(url) = webhook_map.get(&webhook_key) {
+                                let cfg = beanie_keeper::config::Config::Starknet(
+                                    (*starknet_cfg).clone(),
+                                );
+                                let job = crate::models::WebhookJob {
+                                    cfg,
+                                    webhook_url: url.clone(),
+                                    deposit: d.clone(),
+                                    sweep_tx: sweep_tx_sn.clone(),
+                                    max_retries: 5,
+                                };
+                                if let Err(e) = webhook_tx.send(job).await {
+                                    eprintln!("failed enqueuing webhook job: {e}");
+                                }
+                            } else {
+                                eprintln!("no webhook URL for merchant {webhook_key}");
+                            }
+                        }
+                    }
+                    sn_deposit_watermark = sn_tip + 1;
+                }
+                Err(e) => {
+                    eprintln!("starknet fetch_deposits_since_block failed: {e}")
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(2)).await;
     }
 }

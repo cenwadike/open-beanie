@@ -1,40 +1,80 @@
 {
-  "transactions": [
-    {
-      "test": {
-        "base_transfer": "https://basescan.org/tx/0x172998f1682259a4fc790ac7919fbe93b7805c9d2296c74caf45c42600a9a95e",
-        "base_sweep": "https://basescan.org/tx/0x45b18787ab8b6977796f63b9ffbe63a302dd2a7d4d71e6e16e139e48c5397f84",
-        "starknet_inbound": "https://voyager.online/tx/0x76d06ba1baa8c57a77031308fdc3c51f8565f6f62aa08ff5e047ee904b20710"
+  "v0.1.0": {
+    "transactions": [
+      {
+        "test": {
+          "base_transfer": "https://basescan.org/tx/0x172998f1682259a4fc790ac7919fbe93b7805c9d2296c74caf45c42600a9a95e",
+          "base_sweep": "https://basescan.org/tx/0x45b18787ab8b6977796f63b9ffbe63a302dd2a7d4d71e6e16e139e48c5397f84",
+          "starknet_inbound": "https://voyager.online/tx/0x76d06ba1baa8c57a77031308fdc3c51f8565f6f62aa08ff5e047ee904b20710"
+        },
+        "init_lane": {
+          "starknet": "https://voyager.online/tx/0x36ac7c7a13dcc464fa3cb28c648043635b067a2336d63da12bd8464bcd87a60",
+          "base": "https://basescan.org/tx/0x9e186e4ee0c2b18e62519195e84bf6c1272900c70810bcafaa4a68c1b06089ab"
+        },
+        "base_leg": {
+          "base_transfer": "https://basescan.org/tx/0x555c2c99b6da2efba54c5cc1b05b907d93a34c6e17aa091075e31f6d53552bef",
+          "base_sweep": "https://basescan.org/tx/0x53d7e80b73d44cefaa7e7f97fc70c5bff711ac583ed27a8240b028700575f5a2",
+          "starknet_inbound": "https://voyager.online/tx/0x54E1150BA8AF59CA275271F0FF7F970A12490C635BD4982135DC25DAE72F511"
+        },
+        "starknet_leg": {
+          "unshield_transfer": "https://voyager.online/tx/0x0530d6a7b0eb2566fffd630352598a2d7788bbf37309d133b2020922850ce7bc?mtm_campaign=argent-redirect&mtm_source=argent&mtm_medium=referral",
+          "starknet_sweep": "https://voyager.online/tx/0x00eb7638a96df9813b2b2c855f6446fb1fbcf3c7ff83a36f9792cea0e97bd7d7"
+        }
+      }
+    ],
+    "contracts": {
+      "starknet": {
+        "StarknetReceiverImpl": "0x04a26a0c634686af653f72dfa8a1e65e8c74dce085e9e6adb6f21804621754ca",
+        "MerchantFactory": "0x7abee2a0f0108075c35b2b249cd193e4246ca067d9c26f57c086b37fe55dc73"
       },
-      "init_lane": {
-        "starknet": "https://voyager.online/tx/0x36ac7c7a13dcc464fa3cb28c648043635b067a2336d63da12bd8464bcd87a60",
-        "base": "https://basescan.org/tx/0x9e186e4ee0c2b18e62519195e84bf6c1272900c70810bcafaa4a68c1b06089ab"
-      },
-      "base_leg": {
-        "base_transfer": "https://basescan.org/tx/0x555c2c99b6da2efba54c5cc1b05b907d93a34c6e17aa091075e31f6d53552bef",
-        "base_sweep": "https://basescan.org/tx/0x53d7e80b73d44cefaa7e7f97fc70c5bff711ac583ed27a8240b028700575f5a2",
-        "starknet_inbound": "https://voyager.online/tx/0x54E1150BA8AF59CA275271F0FF7F970A12490C635BD4982135DC25DAE72F511"
-      },
-      "starknet_leg": {
-        "unshield_transfer": "https://voyager.online/tx/0x0530d6a7b0eb2566fffd630352598a2d7788bbf37309d133b2020922850ce7bc?mtm_campaign=argent-redirect&mtm_source=argent&mtm_medium=referral",
-        "starknet_sweep": "https://voyager.online/tx/0x00eb7638a96df9813b2b2c855f6446fb1fbcf3c7ff83a36f9792cea0e97bd7d7"
+      "base": {
+        "ChainXReceiverImpl": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
+        "MerchantFactory": "0x4e00d7985799da53d529677410996a6B49DFD5BF",
+        "MerchantWebhookRegistry": "0x4389822B42deA140EaCcb060C648eECff42BBb61"
       }
     }
-  ],
-  "contracts": {
-    "starknet": {
-      "StarknetReceiverImpl": "0x04a26a0c634686af653f72dfa8a1e65e8c74dce085e9e6adb6f21804621754ca",
-      "MerchantFactory": "0x7abee2a0f0108075c35b2b249cd193e4246ca067d9c26f57c086b37fe55dc73"
-    },
-    "base": {
-      "ChainXReceiverImpl": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
-      "MerchantFactory": "0x4e00d7985799da53d529677410996a6B49DFD5BF",
-      "MerchantWebhookRegistry": "0x4389822B42deA140EaCcb060C648eECff42BBb61"
-    },
-    "solana": {
-      "MerchantFactory": "8bgj..."
+  },
+  "v0.1.1": {
+    "transactions": [
+      {
+        "announce": {
+          "starknet": [
+            "0x78b88099bec140c6a4de056666d8d6983bc6a7fc064339faf314a5aa65cb0aa"
+          ],
+          "base": [
+            "0x8308c120cbbe98f3298bc07e83be2f299c28fa1afcd6ade68b33b4339f6fb2f6"
+          ]
+        },
+        "starknet_leg": {
+          "strk20_pool_transfer": [
+            "0x5a4d27a18e0d2450f13b065495921ac8a2b68646298b954f2a1f1ed29fdac86",
+            "0x02e1b2313ea4d849a24f4e1161839320532f35023307adea891e8b713fc18493"
+          ],
+          "transfer": [
+            "0x06b1319f564634f5e320c2effe15e29da8a457ece787b4ff2f59bd677eb07318",
+            "0x01a4e004ae7157d62f6786b5dbcd73b9928fdcbfd4e57d3c5c479b982ea232c7"
+          ],
+          "starknet_sweep": [
+            "0x0356e36e00e89b652fcd6dddd8f052ce68fe27f2adacc63bd36995da99059b97",
+            "0x7673ac93966974ef5ff9442268559114e53d3d6f935734b1732cbd120e55496"
+          ]
+        }
+      }
+    ],
+    "contracts": {
+      "starknet": {
+        "StarknetReceiverImpl": "0x04a26a0c634686af653f72dfa8a1e65e8c74dce085e9e6adb6f21804621754ca",
+        "MerchantFactory": "0x074fc53d92ed14249d7d7f37a22d879ad6d5660c2f86bcf5ae74e3d22347e30c",
+        "StealthAccountImpl": "0x1764a400b3131c39a4ecb85199ac75ba2717c498d9a0245e932ec815674a003"
+      },
+      "base": {
+        "ChainXReceiverImpl": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
+        "MerchantFactory": "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
+        "StealthAccount": "",
+        "MerchantWebhookRegistry": "0x4389822B42deA140EaCcb060C648eECff42BBb61"
+      }
     }
   },
-  "demo_video": "https://youtu.be/4_l7BIDj8RQ",
+  "demo_video": "https://youtu.be/kGaXVlH6fWE",
   "demo_url": "https://beanie.up.railway.app/"
 }

@@ -9,7 +9,7 @@
       chainId: 8453,
       rpc: "https://base-mainnet.g.alchemy.com/v2/alch_pbUufy18xMzGDkyKmU87-",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      factory: "0x4e00d7985799da53d529677410996a6B49DFD5BF",
+      factory: "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
       explorerAddress: "https://basescan.org/address/",
       litCosigner: "0x0000000000000000000000000000000000000000",
     },
@@ -18,9 +18,9 @@
       kind: "starknet",
       rpc: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-      factory: "0x07AbEE2A0f0108075C35B2B249CD193E4246ca067D9C26f57c086b37fE55dc73",
+      factory: "0x074fc53d92ed14249d7d7f37a22d879ad6d5660c2f86bcf5ae74e3d22347e30c",
       explorerAddress: "https://starkscan.co/contract/",
-      stealthClassHash: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      stealthClassHash: "0x1764a400b3131c39a4ecb85199ac75ba2717c498d9a0245e932ec815674a003",
       litCosigner: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
     },
   };
@@ -115,24 +115,37 @@
     // Helper placeholder if needed for UI constraints
   }
 
+  function ensureNotifyDot() {
+    const btn = $("#historyBtn");
+    if (!btn) return null;
+    let dot = btn.querySelector("#historyDot");
+    if (!dot) {
+      dot = el("span", "notify-dot");
+      dot.id = "historyDot";
+      dot.hidden = true;
+      btn.append(dot);
+    }
+    return dot;
+  }
+
+  function pendingDepositCount() {
+    const seenAt = getSeenAt();
+    return Object.values(getHistory()).flat().filter((entry) => entry.time > seenAt).length;
+  }
+
   function refreshNotifyDot() {
-    // Refresh indicator if unread deposits exist
+    const dot = ensureNotifyDot();
+    if (dot) dot.hidden = pendingDepositCount() === 0;
   }
 
   function revealShareRoute() {
     $("#shareBtn")?.classList.remove("is-hidden");
   }
 
-  /* ---------- WebAuthn ceremony helpers ----------
-   * Real server-verified ceremony (webauthn-rs backend), not the old
-   * self-picked-challenge/custom-header scheme. `getVerifiedToken` runs a
-   * full authentication ceremony bound to a specific server-checked
-   * `binding` string and hands back a short-lived, single-use token that
-   * announce/claim requests attach instead of X-Passkey-* headers.
-   */
+  /* ---------- WebAuthn ceremony helpers ---------- */
 
   function prepareCreationOptions(resp) {
-    const o = resp.publicKey; // unwrap webauthn-rs's CreationChallengeResponse envelope
+    const o = resp.publicKey;
     return {
       ...o,
       challenge: base64UrlToBuffer(o.challenge),
@@ -145,7 +158,7 @@
   }
 
   function prepareRequestOptions(resp) {
-    const o = resp.publicKey; // unwrap webauthn-rs's RequestChallengeResponse envelope
+    const o = resp.publicKey;
     return {
       ...o,
       challenge: base64UrlToBuffer(o.challenge),
@@ -199,13 +212,6 @@
     return credential_id;
   }
 
-  /**
-   * Runs a full verification ceremony bound to `binding`, returns a
-   * single-use verified_token the server will check matches. If `salt` is
-   * passed, evaluates PRF in the same user gesture and returns the derived
-   * secret too — one passkey tap covers both identity proof and key
-   * derivation for privacy-mode lanes, instead of two separate prompts.
-   */
   async function getVerifiedToken(binding, { salt, maxUses = 1, forceNew = false } = {}) {
     const credentialId = await ensureRegistered(forceNew);
 
@@ -262,10 +268,8 @@
 
   /* ---------- Cross-chain merchant identity (mirrors worker) ---------- */
 
-  // Minimal keccak256. Replace with ethers.utils.keccak256 / viem if available.
   async function keccak256Bytes(bytes) {
     if (window.keccak256) {
-      // Convert Uint8Array to Buffer if window.Buffer exists or pass explicit array/buffer
       const input = window.Buffer ? Buffer.from(bytes) : Array.from(bytes);
       const out = window.keccak256(input);
       return out instanceof Uint8Array ? out : new Uint8Array(out);
@@ -273,7 +277,6 @@
     throw new Error("keccak256 helper required for cross-chain merchant derivation");
   }
 
-  /** Same as worker: Address::parse OR keccak256(utf8)[12..32] */
   async function toEvmMerchant(merchantAddress) {
     const trimmed = (merchantAddress || "").trim();
     if (isValidEvmAddress(trimmed)) {
@@ -286,10 +289,6 @@
     return `0x${addr}`;
   }
 
-  /**
-   * Same as worker: Felt::from_hex OR derive_felt_from_foreign_address
-   * (keccak256(utf8), take bytes[12..32] as the felt value)
-   */
   async function toStarknetMerchant(merchantAddress) {
     const trimmed = (merchantAddress || "").trim();
     const hex = trimmed.replace(/^0x/i, "");
@@ -322,7 +321,7 @@
       chain: "BASE",
       address: `0x${String(predictedAddrHex).slice(-40)}`,
       is_privacy_lane: false,
-      merchant, // the identity actually used on this chain
+      merchant,
     };
   }
 
@@ -375,7 +374,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chain: CHAIN_WIRE[chain] || chain, // was defined but never actually applied before
+        chain: CHAIN_WIRE[chain] || chain,
         address,
         lane_id: laneId,
         verified_token: verifiedToken,
@@ -528,7 +527,7 @@
         "receiver-row",
         `<span class="mini-icon">${chainIcons[lane.targetChain] || ""}</span>
          <span>
-           <div>${escapeHtml(short(lane.merchantAddress))} (Index #${lane.currentIndex || 0})</div>
+           <div>${escapeHtml(short(lane.merchantAddress))}</div>
            <div class="mono">settles on ${escapeHtml(chainLabel(lane.targetChain))}${privacyBadge} · ${lane.receivers.filter((r) => r.status === "active").length}/${lane.receivers.length} live</div>
          </span>
          <a class="receiver-link" href="${escapeAttr(laneUrl)}" target="_blank" rel="noreferrer">Pay page</a>
@@ -626,18 +625,13 @@
     refreshNotifyDot();
   }
 
-  /* ---------- Status (replaces client-side balance-delta guessing) ---------- */
+  /* ---------- Status ---------- */
 
-  /**
-   * The worker knows definitively whether a sweep/settle succeeded. Poll it
-   * instead of inferring "Funds settled" / "Deposit shielded" from a raw
-   * balance drop, which could just as easily be an unauthorized drain.
-   */
   async function fetchReceiverStatus(chain, address) {
     try {
       const res = await fetch(`${API_STATUS}?chain=${encodeURIComponent(chain)}&address=${encodeURIComponent(address)}`);
       if (!res.ok) return null;
-      return await res.json(); // expected: { state: "pending" | "active" | "swept" | "shielded", detail?: string }
+      return await res.json();
     } catch {
       return null;
     }
@@ -676,8 +670,6 @@
         if (statusEl) statusEl.textContent = "Payment received.";
       }
     } else if (balance < previous) {
-      // Don't guess what a balance drop means — ask the backend, which
-      // actually dispatched (or didn't dispatch) the sweep/bridge-out.
       const status = await fetchReceiverStatus(chain, address);
       if (status?.state === "swept") {
         notify("Funds settled", "success", status.detail || `${chainLabel(chain)} lane swept to your wallet.`);
@@ -753,8 +745,6 @@
       const salt = privacy ? await deriveLaneSalt(laneId) : undefined;
       const { verifiedToken, prfOutput } = await getVerifiedToken(binding, { salt, maxUses });
 
-      // ---------- after the single getVerifiedToken call ----------
-
       let receivers = [];
       let announced = [];
 
@@ -781,7 +771,6 @@
           throw new Error("Could not derive stealth merchant identities.");
         }
 
-        // Collect predictions first (pure local / RPC work)
         for (const s of stealth) {
           const chain = String(s.chain || "").toUpperCase();
           const stealthMerchant = s.address;
@@ -816,11 +805,13 @@
           );
         }
 
-        // Now announce — every chain must succeed
         if (btn) btn.textContent = "Announcing…";
         for (const r of receivers) {
           try {
             await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken);
+            if (out?.address) {
+              r.address = out.address;
+            }
             announced.push(r.chain);
           } catch (e) {
             console.error(`announce failed ${r.chain}`, e);
@@ -831,7 +822,6 @@
           }
         }
       } else {
-        // Public path
         receivers = (await derivePublicReceivers(merchantAddress)).map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
           address: l.address,
@@ -844,9 +834,7 @@
           throw new Error("Could not predict any receiver addresses");
         }
 
-        // Only announce the chains we actually predicted
         if (btn) btn.textContent = "Announcing…";
-
 
         const announceResults = [];
         for (const r of receivers) {
@@ -877,8 +865,6 @@
 
         announced = announceResults.map((r) => r.chain);
       }
-
-      // ---------- only reach here when every chain succeeded ----------
 
       const record = {
         id: laneId,
@@ -970,7 +956,6 @@
     if (e.target.id === "receiversModal") $("#receiversModal")?.classList.remove("open");
   });
 
-  // Was registered twice with identical bodies in the original file — kept once.
   const selectEl = $("#settlementChain");
   selectEl?.addEventListener("change", () => {
     const rawVal = selectEl.value;

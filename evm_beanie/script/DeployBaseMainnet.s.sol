@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
 import "../src/ChainXReceiver.sol";
+import "../src/StealthAccount.sol";
 import "../src/MerchantFactory.sol";
 import "../src/MerchantWebhookRegistry.sol";
 
@@ -21,17 +22,29 @@ contract DeployBaseMainnet is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address treasury = vm.envAddress("TREASURY_ADDRESS");
+        address implementation = vm.envAddress("RECEIVER_IMPL");
 
         require(treasury != address(0), "Treasury address required");
 
         vm.startBroadcast(deployerPrivateKey);
 
-        // 1. Deploy Implementation
-        ChainXReceiver implementation = new ChainXReceiver();
-        console.log(
-            "ChainXReceiver Implementation deployed to:",
-            address(implementation)
-        );
+        // 1a. Deploy Implementation
+        // ChainXReceiver implementation = new ChainXReceiver();
+        // console.log(
+        //     "ChainXReceiver Implementation deployed to:",
+        //     address(implementation)
+        // );
+
+        // // 1b. Deploy Stealth account ref
+        // StealthAccount stealthAccount = new StealthAccount(
+        //     address(0),
+        //     address(0),
+        //     address(0)
+        // );
+        // console.log(
+        //     "StealthAccount Implementation deployed to:",
+        //     address(stealthAccount)
+        // );
 
         // 2. Deploy Factory
         MerchantFactory factory = new MerchantFactory(
@@ -47,13 +60,13 @@ contract DeployBaseMainnet is Script {
         console.log("MerchantFactory deployed to:", address(factory));
 
         // 3. Deploy Webhook Registry
-        MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(
-            address(factory)
-        );
-        console.log(
-            "MerchantWebhookRegistry deployed to:",
-            address(webhookRegistry)
-        );
+        // MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(
+        //     address(factory)
+        // );
+        // console.log(
+        //     "MerchantWebhookRegistry deployed to:",
+        //     address(webhookRegistry)
+        // );
 
         vm.stopBroadcast();
     }

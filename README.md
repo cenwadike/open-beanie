@@ -72,7 +72,7 @@ A single Rust daemon runs both chains' sweep loops concurrently from one process
 
 The HTTP layer serving API requests and static assets.
 - `POST /api/v1/lanes/init`: No signup, no login, no wallet connect — merchant address and target chain in, predicted receiver addresses back out immediately.
-- `POST /api/v1/stealth/execute`: Co-signing and gasless relay proxy. Accepts client signatures $(r_1, s_1)$, requests Lit Protocol TEE enclave co-signatures $(r_2, s_2)$, pays gas via Paymaster, and submits the transaction to Starknet RPC.
+- `POST /api/v1/stealth/claim`: Co-signing and gasless relay proxy. Accepts client signatures $(r_1, s_1)$, requests Lit Protocol TEE enclave co-signatures $(r_2, s_2)$, pays gas via Paymaster, and submits the transaction to Starknet RPC.
 
 This process also serves the frontend as a static-file fallback route — starting `beanie_api` brings up the API, the deploy worker, the stealth claim engine, and the customer/merchant-facing UI together.
 
@@ -81,7 +81,7 @@ This process also serves the frontend as a static-file fallback route — starti
 Served from `beanie_api/public/`:
 - `beanie.html` — lane-creation flow (pick a settlement chain, get a receiver address, poll for deposits).
 - `pay.html` — customer-facing payment page for a shared lane link.
-- `claim.html` — stealth payment recovery dashboard (`stealth-claim.js`). Performs passkey PRF key derivation, scans RPC logs for payment indices, and triggers gasless 2-of-2 stealth sweeps.
+- `stealth.html` — stealth payment recovery dashboard. Performs passkey PRF key derivation, scans RPC logs for payment indices, and triggers gasless 2-of-2 stealth sweeps.
 
 ## Local setup
 

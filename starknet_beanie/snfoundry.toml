@@ -13,7 +13,6 @@
 [sncast.mainnet]
 account = "deployer"
 accounts-file = "~/.starknet_accounts/starknet_open_zeppelin_accounts.json"
-url = "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_ElnVnrKipwLUIRlEuAmno"
-
+url = "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-"
 [sncast.default]
 account = "deployer"

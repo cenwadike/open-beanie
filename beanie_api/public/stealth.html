@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Slackey&display=swap" rel="stylesheet">
-  <title>Beanie — Stealth Payments</title>
+  <title>Beanie — Stealth Balances</title>
   <link rel="icon" href="/assets/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">
@@ -24,37 +24,101 @@
     <div class="veil" aria-hidden="true"></div>
     <div class="grain" aria-hidden="true"></div>
 
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Beanie home">
-        <span class="wordmark">bean<span class="colon">:</span>ie</span>
-      </a>
-    </header>
+    <a class="brand" href="/" aria-label="Beanie home">
+      <span class="wordmark">bean<span class="colon">:</span>ie</span>
+    </a>
 
     <main class="stealth-shell">
-      <div class="stealth-panel">
-        <h1>Claim Private Payments</h1>
-        <section class="step">
-          <h2>1. Scan for payments</h2>
-          <label>
-            Lane ID
-            <input type="text" id="lane-id" placeholder="your lane ID" autocomplete="off" />
-          </label>
-          <button id="scan-btn" type="button">Scan with passkey</button>
-          <div id="scan-status" class="status"></div>
-          <ul id="matches-list"></ul>
-        </section>
+      <div class="history-sheet stealth-sheet">
+        <div class="modal-head">
+          <div class="modal-title">
+            <strong>Stealth Balances</strong>
+            <span id="scan-status" class="status-subtitle">Scanning for private payments...</span>
+          </div>
+          <div class="history-head-actions">
+            <button class="history-chain-select" id="stealthChainSelect" type="button" aria-label="Select chain">
+              <span class="mini-icon" id="stealthChainIcon">
+              </span>
+              <span id="stealthChainName">All chains</span>
+            </button>
 
-        <section class="step">
-          <h2>2. Claim / sweep to your wallet</h2>
-          <label>
-            Destination address to sweep claimed funds to
-            <input type="text" id="destination-address" placeholder="0x..." autocomplete="off" />
+            <div class="history-chain-menu" id="stealthChainMenu" role="menu" aria-label="Select chain filter">
+              <button class="history-chain-option" data-chain="all" role="menuitem" aria-selected="true">
+                <span class="mini-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                  </svg>
+                </span>
+                <span>All chains</span>
+              </button>
+              <button class="history-chain-option" data-chain="base" role="menuitem">
+                <span class="mini-icon">
+                  <svg viewBox="0 0 42 42" width="24" height="24">
+                    <circle cx="21" cy="21" r="21" fill="#0052ff" />
+                    <path
+                      d="M21 32.8c6.52 0 11.8-5.28 11.8-11.8S27.52 9.2 21 9.2c-5.82 0-10.66 4.21-11.62 9.75h15.2v4.1H9.38C10.34 28.59 15.18 32.8 21 32.8Z"
+                      fill="#fff" />
+                  </svg>
+
+                </span>
+                <span>Base</span>
+              </button>
+              <button class="history-chain-option" data-chain="starknet" role="menuitem">
+                <span class="mini-icon">
+                  <svg viewBox="0 0 42 42" width="24" height="24">
+                    <circle cx="21" cy="21" r="21" fill="#0c0c4d" />
+                    <path d="M21 8 32 21 21 34 10 21 21 8Z" fill="#ec796b" />
+                  </svg>
+                </span>
+                <span>Starknet</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Shielded & Unshielded Balances -->
+        <div class="stealth-balance-grid">
+          <div class="balance-card">
+            <div class="balance-info">
+              <span class="balance-label">Shielded Balance</span>
+              <span class="balance-value" id="shieldedBalance">0.00 USDC</span>
+            </div>
+            <button class="stealth-action-btn" id="unshieldBtn" type="button" disabled>
+              Unshield
+            </button>
+          </div>
+
+          <div class="balance-card">
+            <div class="balance-info">
+              <span class="balance-label">Unshielded Balance</span>
+              <span class="balance-value" id="unshieldedBalance">0.00 USDC</span>
+            </div>
+            <button class="stealth-action-btn secondary" id="shieldBtn" type="button">
+              Shield
+            </button>
+          </div>
+        </div>
+
+        <!-- Sweep & Action Controls -->
+        <div class="sweep-panel" id="sweepPanel">
+          <label class="compact-field">
+            <span class="field-label">Destination Address</span>
+            <input type="text" id="destination-address" class="compact-input" placeholder="0x..." autocomplete="off" />
           </label>
-          <button id="claim-btn" type="button" disabled>Claim selected payment</button>
-          <div id="claim-status" class="status"></div>
-        </section>
+        </div>
+
+        <!-- History List -->
+        <div class="history-section">
+          <div class="section-title">Activity</div>
+          <div class="history-list" id="matches-list">
+            <div class="history-empty">History is empty — no deposits detected yet.</div>
+          </div>
+        </div>
       </div>
     </main>
+
+    <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="false"></div>
   </div>
 
   <script type="module" src="/scripts/stealth.js"></script>
