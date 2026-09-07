@@ -45,21 +45,88 @@ const AUTH_CEREMONY_TTL: Duration = Duration::from_secs(120);
 const VERIFIED_TOKEN_TTL: Duration = Duration::from_secs(60);
 
 // ---------- State ----------
+// ---------- State ----------
+
+struct VerifiedEntry {
+    credential_id: String,
+    binding: String,
+    expires_at: Instant,
+    uses_remaining: u32,
+}
 
 pub struct AuthState {
     webauthn: Webauthn,
-    /// credential_id (base64url) -> Passkey (public key + sign counter).
-    /// This is the one piece of state WebAuthn signature verification cannot
-    /// exist without — see conversation notes. Everything else here is
-    /// disposable ceremony bookkeeping.
     passkeys: Mutex<HashMap<String, Passkey>>,
     reg_ceremonies: Mutex<HashMap<String, (PasskeyRegistration, Instant)>>,
-    auth_ceremonies: Mutex<HashMap<String, (PasskeyAuthentication, String, Instant)>>,
-    /// verified_token -> (credential_id, binding, expires_at). Single-use.
-    verified: Mutex<HashMap<String, (String, String, Instant)>>,
+    // now also carries how many verified_token redemptions this ceremony grants
+    auth_ceremonies: Mutex<HashMap<String, (PasskeyAuthentication, String, u32, Instant)>>,
+    verified: Mutex<HashMap<String, VerifiedEntry>>,
 }
 
 impl AuthState {
+    // ...unchanged reg_ceremony helpers...
+
+    fn insert_auth_ceremony(
+        &self,
+        token: String,
+        state: PasskeyAuthentication,
+        binding: String,
+        max_uses: u32,
+    ) {
+        let mut map = self.auth_ceremonies.lock().unwrap();
+        map.retain(|_, (_, _, _, exp)| *exp > Instant::now());
+        map.insert(
+            token,
+            (state, binding, max_uses, Instant::now() + AUTH_CEREMONY_TTL),
+        );
+    }
+
+    fn take_auth_ceremony(&self, token: &str) -> Option<(PasskeyAuthentication, String, u32)> {
+        let mut map = self.auth_ceremonies.lock().unwrap();
+        let (state, binding, max_uses, exp) = map.remove(token)?;
+        if exp < Instant::now() {
+            return None;
+        }
+        Some((state, binding, max_uses))
+    }
+
+    fn store_verified(&self, token: String, credential_id: String, binding: String, max_uses: u32) {
+        let mut map = self.verified.lock().unwrap();
+        map.retain(|_, e| e.expires_at > Instant::now() && e.uses_remaining > 0);
+        map.insert(
+            token,
+            VerifiedEntry {
+                credential_id,
+                binding,
+                expires_at: Instant::now() + VERIFIED_TOKEN_TTL,
+                uses_remaining: max_uses.max(1),
+            },
+        );
+    }
+
+    /// Multi-use up to the ceremony's granted count. Still requires an
+    /// exact binding match and a live TTL on every redemption.
+    pub fn consume_verified(&self, token: &str, expected_binding: &str) -> Option<String> {
+        let mut map = self.verified.lock().unwrap();
+        map.retain(|_, e| e.expires_at > Instant::now() && e.uses_remaining > 0);
+
+        let entry = map.get_mut(token)?;
+        if entry.expires_at < Instant::now() || entry.uses_remaining == 0 {
+            map.remove(token);
+            return None;
+        }
+        if !entry.binding.eq_ignore_ascii_case(expected_binding) {
+            return None;
+        }
+
+        entry.uses_remaining -= 1;
+        let credential_id = entry.credential_id.clone();
+        if entry.uses_remaining == 0 {
+            map.remove(token);
+        }
+        Some(credential_id)
+    }
+
     pub fn new(rp_id: &str, rp_origin: &str) -> Self {
         let origin = Url::parse(rp_origin).expect("invalid RP origin URL");
         let webauthn = WebauthnBuilder::new(rp_id, &origin)
@@ -92,52 +159,12 @@ impl AuthState {
         Some(state)
     }
 
-    fn insert_auth_ceremony(&self, token: String, state: PasskeyAuthentication, binding: String) {
-        let mut map = self.auth_ceremonies.lock().unwrap();
-        map.retain(|_, (_, _, exp)| *exp > Instant::now());
-        map.insert(token, (state, binding, Instant::now() + AUTH_CEREMONY_TTL));
-    }
-
-    fn take_auth_ceremony(&self, token: &str) -> Option<(PasskeyAuthentication, String)> {
-        let mut map = self.auth_ceremonies.lock().unwrap();
-        let (state, binding, exp) = map.remove(token)?;
-        if exp < Instant::now() {
-            return None;
-        }
-        Some((state, binding))
-    }
-
     fn store_passkey(&self, credential_id: String, passkey: Passkey) {
         self.passkeys.lock().unwrap().insert(credential_id, passkey);
     }
 
     fn get_passkey(&self, credential_id: &str) -> Option<Passkey> {
         self.passkeys.lock().unwrap().get(credential_id).cloned()
-    }
-
-    fn store_verified(&self, token: String, credential_id: String, binding: String) {
-        let mut map = self.verified.lock().unwrap();
-        map.retain(|_, (_, _, exp)| *exp > Instant::now());
-        map.insert(
-            token,
-            (credential_id, binding, Instant::now() + VERIFIED_TOKEN_TTL),
-        );
-    }
-
-    /// Single-use: consumes the token, checks it's fresh and bound to
-    /// exactly the action the caller expects, returns the verified
-    /// credential_id on success.
-    pub fn consume_verified(&self, token: &str, expected_binding: &str) -> Option<String> {
-        let mut map = self.verified.lock().unwrap();
-        map.retain(|_, (_, _, exp)| *exp > Instant::now());
-        let (credential_id, binding, exp) = map.remove(token)?;
-        if exp < Instant::now() {
-            return None;
-        }
-        if !binding.eq_ignore_ascii_case(&expected_binding) {
-            return None;
-        }
-        Some(credential_id)
     }
 }
 
@@ -225,9 +252,9 @@ pub async fn register_finish(
 #[derive(Deserialize)]
 pub struct AuthStartReq {
     credential_id: String,
-    /// Action-specific string this ceremony will be locked to, e.g.
-    /// "create:Base:0xabc..." or "claim:Starknet:0xdef...:0x123...".
     binding: String,
+    #[serde(default)]
+    max_uses: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -242,20 +269,18 @@ pub async fn auth_start(
 ) -> Response {
     let passkey = match state.auth.get_passkey(&payload.credential_id) {
         Some(p) => p,
-        None => {
-            return err(
-                StatusCode::NOT_FOUND,
-                "Unknown credential_id — register first",
-            );
-        }
+        None => return err(StatusCode::CONFLICT, "refresh_credential"),
     };
+
+    // Nothing in the create flow needs more than a couple of announces.
+    let max_uses = payload.max_uses.unwrap_or(1).clamp(1, 4);
 
     match state.auth.webauthn.start_passkey_authentication(&[passkey]) {
         Ok((rcr, auth_state)) => {
             let token = Uuid::new_v4().to_string();
             state
                 .auth
-                .insert_auth_ceremony(token.clone(), auth_state, payload.binding);
+                .insert_auth_ceremony(token.clone(), auth_state, payload.binding, max_uses);
             Json(AuthStartResp {
                 session_token: token,
                 options: rcr,
@@ -284,15 +309,16 @@ pub async fn auth_finish(
     State(state): State<AppState>,
     Json(payload): Json<AuthFinishReq>,
 ) -> Response {
-    let (auth_state, binding) = match state.auth.take_auth_ceremony(&payload.session_token) {
-        Some(s) => s,
-        None => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "Unknown or expired verification session",
-            );
-        }
-    };
+    let (auth_state, binding, max_uses) =
+        match state.auth.take_auth_ceremony(&payload.session_token) {
+            Some(s) => s,
+            None => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "Unknown or expired verification session",
+                );
+            }
+        };
 
     match state
         .auth
@@ -304,7 +330,7 @@ pub async fn auth_finish(
             let verified_token = Uuid::new_v4().to_string();
             state
                 .auth
-                .store_verified(verified_token.clone(), credential_id, binding);
+                .store_verified(verified_token.clone(), credential_id, binding, max_uses);
             Json(AuthFinishResp { verified_token }).into_response()
         }
         Err(e) => err(

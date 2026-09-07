@@ -213,10 +213,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
-        .route("/api/v1/auth/register/start", post(register_start))
-        .route("/api/v1/auth/register/finish", post(register_finish))
-        .route("/api/v1/auth/start", post(auth_start))
-        .route("/api/v1/auth/finish", post(auth_finish))
+        .route("/api/v1/webauthn/register/start", post(register_start))
+        .route("/api/v1/webauthn/register/finish", post(register_finish))
+        .route("/api/v1/webauthn/auth/start", post(auth_start))
+        .route("/api/v1/webauthn/auth/finish", post(auth_finish))
         .route("/api/v1/stealth/claim", post(execute_stealth_claim))
         .route("/api/v1/create", post(announce_receiver))
         .route("/api/v1/pay", post(receive_payment))

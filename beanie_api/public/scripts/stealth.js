@@ -21,7 +21,7 @@ import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/eth
 const CHAINS = {
   starknet: {
     type: "starknet",
-    rpcUrl: "https://starknet-mainnet.public.blastapi.io",
+    rpcUrl: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-",
     tokenAddress: "0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb", // Starknet USDC
     stealthAccountClassHash: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     litCosignerPubKey: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
@@ -30,7 +30,7 @@ const CHAINS = {
   base: {
     type: "evm",
     chainId: 8453,
-    rpcUrl: "https://mainnet.base.org",
+    rpcUrl: "https://base-mainnet.g.alchemy.com/v2/alch_pbUufy18xMzGDkyKmU87-",
     tokenAddress: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // Base USDC
     factoryAddress: "0x0000000000000000000000000000000000000000",
     entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",

@@ -7,43 +7,38 @@
       name: "Base",
       kind: "evm",
       chainId: 8453,
-      rpc: "https://base-mainnet.g.alchemy.com/v2/alch_ElnVnrKipwLUIRlEuAmno",
+      rpc: "https://base-mainnet.g.alchemy.com/v2/alch_pbUufy18xMzGDkyKmU87-",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      factory: "0x0000000000000000000000000000000000000000",
+      factory: "0x4e00d7985799da53d529677410996a6B49DFD5BF",
       explorerAddress: "https://basescan.org/address/",
       litCosigner: "0x0000000000000000000000000000000000000000",
     },
     STARKNET: {
       name: "Starknet",
       kind: "starknet",
-      rpc: "https://starknet-mainnet.public.blastapi.io",
+      rpc: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-      factory: "0x0000000000000000000000000000000000000000",
+      factory: "0x07AbEE2A0f0108075C35B2B249CD193E4246ca067D9C26f57c086b37fE55dc73",
       explorerAddress: "https://starkscan.co/contract/",
       stealthClassHash: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       litCosigner: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
     },
   };
 
-  // Wire format the backend's `Chain` enum expects. This mapping already
-  // existed in stealth-claim.js ("Map string key directly to exact Rust
-  // enum variant naming") but was missing here — announce calls were
-  // sending raw "BASE"/"STARKNET" straight through, which likely never
-  // matched what `Chain` deserializes. Fixed by reusing the same map.
-  const CHAIN_WIRE = { BASE: "Base", STARKNET: "Starknet" };
-
+  const CHAIN_WIRE = { BASE: "BASE", STARKNET: "STARKNET" };
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
   const POLL_INTERVAL_MS = 20000;
   const API_CREATE = "/api/v1/create";
   const API_STATUS = "/api/v1/status";
-  const RP_ID = window.location.hostname;
+  const RP_ID = "localhost"
+  // RP_ORIGIN = "http://localhost:8080"
 
   const STARKNET_BALANCEOF_SELECTOR =
     "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
   const STARKNET_PREDICT_SELECTOR =
-    "0x0000000000000000000000000000000000000000000000000000000000000000";
-  const EVM_PREDICT_SELECTOR = "0x0c40efef";
+    "0x28d4d0fe094b456bae50b2d871903c993ba153ec519b7f4f1c71252fa4304cf";
+  const EVM_PREDICT_SELECTOR = "0x6a6a0dff";
 
   const STORAGE_LANES = "beanie.lanes.v1";
   const STORAGE_HISTORY = "beanie.history.v1";
@@ -136,7 +131,8 @@
    * announce/claim requests attach instead of X-Passkey-* headers.
    */
 
-  function prepareCreationOptions(o) {
+  function prepareCreationOptions(resp) {
+    const o = resp.publicKey; // unwrap webauthn-rs's CreationChallengeResponse envelope
     return {
       ...o,
       challenge: base64UrlToBuffer(o.challenge),
@@ -148,7 +144,8 @@
     };
   }
 
-  function prepareRequestOptions(o) {
+  function prepareRequestOptions(resp) {
+    const o = resp.publicKey; // unwrap webauthn-rs's RequestChallengeResponse envelope
     return {
       ...o,
       challenge: base64UrlToBuffer(o.challenge),
@@ -179,13 +176,13 @@
     return json;
   }
 
-  async function ensureRegistered() {
-    const existing = localStorage.getItem(STORAGE_CRED);
+  async function ensureRegistered(forceNew = false) {
+    const existing = !forceNew && localStorage.getItem(STORAGE_CRED);
     if (existing) return existing;
 
     const startRes = await fetch("/api/v1/webauthn/register/start", { method: "POST" });
     if (!startRes.ok) throw new Error("Could not start passkey registration");
-    const { session_token, options } = await startRes.json();
+    const { session_token, options } = await expectJson(startRes);
 
     const credential = await navigator.credentials.create({
       publicKey: prepareCreationOptions(options),
@@ -197,7 +194,7 @@
       body: JSON.stringify({ session_token, credential: credentialToJSON(credential) }),
     });
     if (!finishRes.ok) throw new Error("Passkey registration was rejected by the server");
-    const { credential_id } = await finishRes.json();
+    const { credential_id } = await expectJson(finishRes);
     localStorage.setItem(STORAGE_CRED, credential_id);
     return credential_id;
   }
@@ -209,21 +206,24 @@
    * secret too — one passkey tap covers both identity proof and key
    * derivation for privacy-mode lanes, instead of two separate prompts.
    */
-  async function getVerifiedToken(binding, { salt } = {}) {
-    const credentialId = await ensureRegistered();
+  async function getVerifiedToken(binding, { salt, maxUses = 1, forceNew = false } = {}) {
+    const credentialId = await ensureRegistered(forceNew);
 
     const startRes = await fetch("/api/v1/webauthn/auth/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ credential_id: credentialId, binding }),
+      body: JSON.stringify({ credential_id: credentialId, binding, max_uses: maxUses }),
     });
+
+    if (startRes.status === 409) {
+      localStorage.removeItem(STORAGE_CRED);
+      return getVerifiedToken(binding, { salt, maxUses, forceNew: true });
+    }
     if (!startRes.ok) throw new Error("Could not start passkey verification");
-    const { session_token, options } = await startRes.json();
+    const { session_token, options } = await expectJson(startRes);
 
     const requestOptions = prepareRequestOptions(options);
-    if (salt) {
-      requestOptions.extensions = { prf: { eval: { first: salt } } };
-    }
+    if (salt) requestOptions.extensions = { prf: { eval: { first: salt } } };
 
     const assertion = await navigator.credentials.get({ publicKey: requestOptions });
 
@@ -233,13 +233,10 @@
       body: JSON.stringify({ session_token, credential: credentialToJSON(assertion) }),
     });
     if (!finishRes.ok) throw new Error("Passkey verification was rejected by the server");
-    const { verified_token } = await finishRes.json();
+    const { verified_token } = await expectJson(finishRes);
 
     const prfOutput = assertion.getClientExtensionResults()?.prf?.results?.first;
-    return {
-      verifiedToken: verified_token,
-      prfOutput: prfOutput ? new Uint8Array(prfOutput) : null,
-    };
+    return { verifiedToken: verified_token, prfOutput: prfOutput ? new Uint8Array(prfOutput) : null };
   }
 
   /* ---------- Privacy Derivation ---------- */
@@ -290,52 +287,141 @@
     return json.result;
   }
 
+  /* ---------- Cross-chain merchant identity (mirrors worker) ---------- */
+
+  // Minimal keccak256. Replace with ethers.utils.keccak256 / viem if available.
+  async function keccak256Bytes(bytes) {
+    if (window.keccak256) {
+      // Convert Uint8Array to Buffer if window.Buffer exists or pass explicit array/buffer
+      const input = window.Buffer ? Buffer.from(bytes) : Array.from(bytes);
+      const out = window.keccak256(input);
+      return out instanceof Uint8Array ? out : new Uint8Array(out);
+    }
+    throw new Error("keccak256 helper required for cross-chain merchant derivation");
+  }
+
+  /** Same as worker: Address::parse OR keccak256(utf8)[12..32] */
+  async function toEvmMerchant(merchantAddress) {
+    const trimmed = (merchantAddress || "").trim();
+    if (isValidEvmAddress(trimmed)) {
+      return trimmed.toLowerCase();
+    }
+    const hash = await keccak256Bytes(new TextEncoder().encode(trimmed));
+    const addr = Array.from(hash.slice(12, 32))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return `0x${addr}`;
+  }
+
+  /**
+   * Same as worker: Felt::from_hex OR derive_felt_from_foreign_address
+   * (keccak256(utf8), take bytes[12..32] as the felt value)
+   */
+  async function toStarknetMerchant(merchantAddress) {
+    const trimmed = (merchantAddress || "").trim();
+    const hex = trimmed.replace(/^0x/i, "");
+    if (/^[0-9a-fA-F]+$/.test(hex) && hex.length >= 1 && hex.length <= 64) {
+      try {
+        const val = BigInt(`0x${hex}`);
+        if (val < STARK_PRIME) {
+          return `0x${val.toString(16)}`;
+        }
+      } catch { /* fall through */ }
+    }
+    const hash = await keccak256Bytes(new TextEncoder().encode(trimmed));
+    const feltHex = Array.from(hash.slice(12, 32))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return `0x${feltHex}`;
+  }
+
   async function predictEvmReceiver(merchantAddress) {
     const chain = CHAINS.BASE;
+    const merchant = await toEvmMerchant(merchantAddress);
     const data =
       EVM_PREDICT_SELECTOR +
-      merchantAddress.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
-    const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [{ to: chain.factory, data }, "latest"]);
-    return { chain: "BASE", address: `0x${String(predictedAddrHex).slice(-40)}`, is_privacy_lane: false };
+      merchant.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+    const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [
+      { to: chain.factory, data },
+      "latest",
+    ]);
+    return {
+      chain: "BASE",
+      address: `0x${String(predictedAddrHex).slice(-40)}`,
+      is_privacy_lane: false,
+      merchant, // the identity actually used on this chain
+    };
   }
 
   async function predictStarknetReceiver(merchantAddress) {
     const chain = CHAINS.STARKNET;
+    const merchant = await toStarknetMerchant(merchantAddress);
     const predictRes = await rpcCall(chain.rpc, "starknet_call", [
-      { contract_address: chain.factory, entry_point_selector: STARKNET_PREDICT_SELECTOR, calldata: [merchantAddress] },
+      {
+        contract_address: chain.factory,
+        entry_point_selector: STARKNET_PREDICT_SELECTOR,
+        calldata: [merchant],
+      },
       "latest",
     ]);
-    return { chain: "STARKNET", address: predictRes?.[0] || "0x0", is_privacy_lane: false };
+    return {
+      chain: "STARKNET",
+      address: predictRes?.[0] || "0x0",
+      is_privacy_lane: false,
+      merchant,
+    };
   }
 
   async function derivePublicReceivers(merchantAddress) {
-    const results = await Promise.all([
-      predictEvmReceiver(merchantAddress).catch((e) => { console.error(e); return null; }),
-      predictStarknetReceiver(merchantAddress).catch((e) => { console.error(e); return null; }),
-    ]);
-    return results.filter(Boolean);
+    const receivers = [];
+
+    for (const chainKey of SOURCE_CHAINS) {
+      try {
+        const predicted =
+          chainKey === "BASE"
+            ? await predictEvmReceiver(merchantAddress)
+            : await predictStarknetReceiver(merchantAddress);
+        if (!predicted?.address) {
+          throw new Error(`empty predict result on ${chainKey}`);
+        }
+        receivers.push(predicted);
+      } catch (e) {
+        console.error(`${chainKey} predict failed`, e);
+        throw new Error(
+          `Predict failed on ${chainKey}: ${e.message || e}. ` +
+          `All ${SOURCE_CHAINS.length} source chains are required.`
+        );
+      }
+    }
+
+    return receivers;
   }
 
-  async function announceReceiverOnChain(chain, address) {
-    const wireChain = CHAIN_WIRE[chain] || chain;
-    const binding = `announce:${wireChain}:${address.trim()}`;
-    const { verifiedToken } = await getVerifiedToken(binding);
-
+  async function announceReceiverOnChain(chain, address, laneId, verifiedToken) {
     const res = await fetch(API_CREATE, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain: wireChain, address, verified_token: verifiedToken }),
+      body: JSON.stringify({
+        chain: CHAIN_WIRE[chain] || chain, // was defined but never actually applied before
+        address,
+        lane_id: laneId,
+        verified_token: verifiedToken,
+      }),
     });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || body.message || `Announce failed (${res.status})`);
-    return body;
+    const text = await res.text();
+    if (!res.ok) {
+      let msg = text;
+      try { msg = JSON.parse(text).error || msg; } catch { }
+      throw new Error(`Announce failed (${res.status}): ${msg}`);
+    }
+    return text ? JSON.parse(text) : {};
   }
 
-  async function announceAllSourceChains(merchantAddress) {
+  async function announceAllSourceChains(merchantAddress, laneId, verifiedToken) {
     const results = [];
     for (const chain of SOURCE_CHAINS) {
       try {
-        const out = await announceReceiverOnChain(chain, merchantAddress);
+        const out = await announceReceiverOnChain(chain, merchantAddress, laneId, verifiedToken);
         results.push({ chain, ok: true, out });
       } catch (e) {
         results.push({ chain, ok: false, error: e.message || String(e) });
@@ -584,6 +670,17 @@
     }
   }
 
+  async function expectJson(res) {
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Expected JSON from ${res.url} but got "${ct || "unknown content-type"}" (status ${res.status}): ${text.slice(0, 120)}`
+      );
+    }
+    return res.json();
+  }
+
   /* ---------- Polling ---------- */
   async function pollDeposits(chain, address) {
     let balance;
@@ -675,19 +772,43 @@
     }
 
     try {
-      const all = getLanes();
-      const currentIndex = all.length;
       const laneId = `lane_${Date.now()}`;
+      const binding = `create-lane:${laneId}`;
+      const maxUses = SOURCE_CHAINS.length;
+
+      if (btn) btn.textContent = "Confirm passkey…";
+      const salt = privacy ? await deriveLaneSalt(laneId) : undefined;
+      const { verifiedToken, prfOutput } = await getVerifiedToken(binding, { salt, maxUses });
+
+      // ---------- after the single getVerifiedToken call ----------
 
       let receivers = [];
       let announced = [];
 
       if (privacy) {
-        if (btn) btn.textContent = "Confirm passkey…";
-        const stealth = await derivePrivacyReceivers({ laneId, index: 0 });
+        if (!prfOutput) {
+          throw new Error(
+            "Private lanes need a passkey with PRF support. Try another device or turn privacy off."
+          );
+        }
+        const helper = window.beanieStealth;
+        if (!helper?.deriveReceivers) {
+          throw new Error(
+            "Privacy module not loaded. Include stealth.js and set window.beanieStealth.deriveReceivers."
+          );
+        }
 
-        if (!stealth?.length) throw new Error("Could not derive stealth merchant identities.");
+        const stealth = await helper.deriveReceivers({
+          masterSecret: prfOutput,
+          laneId,
+          index: 0,
+          chains: SOURCE_CHAINS.map((k) => ({ key: k, ...CHAINS[k] })),
+        });
+        if (!stealth?.length) {
+          throw new Error("Could not derive stealth merchant identities.");
+        }
 
+        // Collect predictions first (pure local / RPC work)
         for (const s of stealth) {
           const chain = String(s.chain || "").toUpperCase();
           const stealthMerchant = s.address;
@@ -695,57 +816,102 @@
 
           let predicted;
           try {
-            if (chain === "BASE") predicted = await predictEvmReceiver(stealthMerchant);
-            else if (chain === "STARKNET") predicted = await predictStarknetReceiver(stealthMerchant);
-            else continue;
+            predicted =
+              chain === "BASE"
+                ? await predictEvmReceiver(stealthMerchant)
+                : chain === "STARKNET"
+                  ? await predictStarknetReceiver(stealthMerchant)
+                  : null;
+            if (!predicted) continue;
           } catch (e) {
             console.error(`predict failed ${chain}`, e);
-            notify("Predict failed", "info", `${chain}: ${e.message}`);
-            continue;
+            throw new Error(`Predict failed on ${chain}: ${e.message || e}`);
           }
 
-          receivers.push({ chain, address: predicted.address, isPrivacy: true, stealthMerchant, status: "pending" });
-
-          if (btn) btn.textContent = `Announcing ${chain}…`;
-          try {
-            await announceReceiverOnChain(chain, stealthMerchant);
-            announced.push(chain);
-          } catch (e) {
-            console.error(`announce failed ${chain}`, e);
-            notify("Announce failed", "info", `${chain}: ${e.message}`);
-          }
+          receivers.push({
+            chain,
+            address: predicted.address,
+            isPrivacy: true,
+            stealthMerchant,
+            status: "pending",
+          });
         }
 
-        if (!receivers.length) throw new Error("Could not derive private factory receivers.");
+        if (receivers.length !== SOURCE_CHAINS.length) {
+          throw new Error(
+            `Could only derive ${receivers.length}/${SOURCE_CHAINS.length} private receivers`
+          );
+        }
+
+        // Now announce — every chain must succeed
+        if (btn) btn.textContent = "Announcing…";
+        for (const r of receivers) {
+          try {
+            await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken);
+            announced.push(r.chain);
+          } catch (e) {
+            console.error(`announce failed ${r.chain}`, e);
+            throw new Error(
+              `Announce failed on ${r.chain}: ${e.message || e}. ` +
+              `All ${SOURCE_CHAINS.length} chains must succeed.`
+            );
+          }
+        }
       } else {
+        // Public path
         receivers = (await derivePublicReceivers(merchantAddress)).map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
           address: l.address,
+          merchant: l.merchant,
           isPrivacy: false,
           status: "pending",
         }));
 
-        if (!receivers.length) throw new Error("Could not predict receiver addresses.");
+        if (receivers.length === 0) {
+          throw new Error("Could not predict any receiver addresses");
+        }
 
-        if (btn) btn.textContent = "Confirm passkey…";
-        const announceResults = await announceAllSourceChains(merchantAddress);
+        // Only announce the chains we actually predicted
+        if (btn) btn.textContent = "Announcing…";
+
+
+        const announceResults = [];
+        for (const r of receivers) {
+          try {
+            const out = await announceReceiverOnChain(
+              r.chain,
+              r.merchant,
+              laneId,
+              verifiedToken
+            );
+            announceResults.push({ chain: r.chain, ok: true, out });
+          } catch (e) {
+            announceResults.push({
+              chain: r.chain,
+              ok: false,
+              error: e.message || String(e),
+            });
+          }
+        }
+
         const failed = announceResults.filter((r) => !r.ok);
-
-        if (failed.length === announceResults.length) {
-          throw new Error(failed.map((f) => `${f.chain}: ${f.error}`).join("; ") || "Announce failed on all chains");
-        }
         if (failed.length) {
-          notify("Partial announce", "info", failed.map((f) => `${f.chain}: ${f.error}`).join("; "));
+          throw new Error(
+            failed.map((f) => `${f.chain}: ${f.error}`).join("; ") ||
+            "Announce failed on one or more chains"
+          );
         }
 
-        announced = announceResults.filter((r) => r.ok).map((r) => r.chain);
+        announced = announceResults.map((r) => r.chain);
       }
+
+      // ---------- only reach here when every chain succeeded ----------
 
       const record = {
         id: laneId,
         merchantAddress,
         targetChain,
-        currentIndex,
+        currentIndex: 0,
         webhookUrl: webhookResult.value,
         createdAt: Date.now(),
         privacy,
@@ -753,8 +919,9 @@
         receivers,
       };
 
-      all.unshift(record);
-      saveLanes(all);
+      const lanes = getLanes();
+      lanes.unshift(record);
+      saveLanes(lanes);
 
       notify(
         privacy ? "Private payment lane ready" : "Payment lane created",

@@ -21,6 +21,7 @@ use crate::models::{AppState, Chain, SocketAddr, err};
 pub struct AnnounceRequest {
     pub chain: Chain,
     pub address: String,
+    pub lane_id: String,
     pub verified_token: String,
 }
 
@@ -51,15 +52,6 @@ fn parse_and_sanitize_felt(input: &str) -> Result<String, &'static str> {
     Ok(format!("{:#064x}", felt))
 }
 
-/// Same wire representation the client sent, whatever your `Chain` enum's
-/// serde casing convention is — avoids assuming PascalCase/UPPERCASE/etc.
-fn chain_tag(chain: &Chain) -> String {
-    serde_json::to_value(chain)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 pub async fn announce_receiver(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -67,11 +59,15 @@ pub async fn announce_receiver(
 ) -> Response {
     // 1. Passkey verification — proves a real, verified passkey session
     //    authorized announcing exactly this chain+address, nothing else.
-    let binding = format!(
-        "announce:{}:{}",
-        chain_tag(&payload.chain),
-        payload.address.trim()
-    );
+
+    let lane_id = payload.lane_id.trim();
+    if lane_id.is_empty() || lane_id.len() > 128 {
+        return err(StatusCode::BAD_REQUEST, "Invalid lane_id");
+    }
+
+    // Bound to the lane as a whole now, not one chain+address, so a single
+    // ceremony can cover every chain announced for this lane.
+    let binding = format!("create-lane:{lane_id}");
     let credential_id = match state
         .auth
         .consume_verified(&payload.verified_token, &binding)
@@ -80,7 +76,7 @@ pub async fn announce_receiver(
         None => {
             return err(
                 StatusCode::UNAUTHORIZED,
-                "Passkey verification missing, expired, or bound to a different chain/address",
+                "Passkey verification missing, expired, or bound to a different lane",
             );
         }
     };

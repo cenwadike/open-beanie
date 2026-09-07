@@ -1262,20 +1262,6 @@ main {
 
 
 @media (max-width: 440px) {
-  .right-rail {
-    position: fixed;
-    left: 12px;
-    right: 12px;
-    top: auto;
-    bottom: max(12px, env(safe-area-inset-bottom));
-    width: auto;
-  }
-
-  .rail-pill {
-    width: 100%;
-    justify-content: center;
-  }
-
   main {
     padding-bottom: 96px;
   }
