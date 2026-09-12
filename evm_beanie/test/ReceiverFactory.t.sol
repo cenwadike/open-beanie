@@ -181,8 +181,10 @@ contract ReceiverFactoryTest is Test {
         // mint tokens into clone2
         token.mint(clone2, 10000);
 
-        // call sweep on clone2 — msg.sender here is this test contract,
-        // which is the "caller" that gets the 10%-of-fee incentive
+        // Set relayer as both msg.sender AND tx.origin
+        address relayer = address(0x5555);
+        vm.prank(relayer, relayer);
+
         (
             uint256 net,
             uint256 toCaller,
@@ -197,8 +199,8 @@ contract ReceiverFactoryTest is Test {
         assertEq(toCaller, 5);
         assertEq(toTreasury, 45);
 
-        // caller (this test contract) and treasury both received their share
-        assertEq(token.balanceOf(address(this)), toCaller);
+        // relayer (tx.origin) and treasury both received their share
+        assertEq(token.balanceOf(relayer), toCaller);
         assertEq(token.balanceOf(treasury), toTreasury);
 
         // messenger recorded the burn
