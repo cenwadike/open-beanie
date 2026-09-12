@@ -10,9 +10,9 @@ export const configSchema = z.object({
   creKeeperReceiverAddress: z.string(),
   registryStartBlock: z.number(),
   webhookRegistryStartBlock: z.number(),
-  logChunkBlocks: z.number().default(2000),
-  depositScanBlocks: z.number().default(500),
-  schedule: z.string().default("*/3 * * * * *"),
+  logChunkBlocks: z.number().default(10),
+  depositScanBlocks: z.number().default(10),
+  schedule: z.string().default("*/30 * * * * *"),
 });
 
 export type Config = z.infer<typeof configSchema>;

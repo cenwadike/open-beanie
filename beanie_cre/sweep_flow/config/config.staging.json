@@ -6,9 +6,9 @@
   "webhookRegistryAddress": "0x4389822B42deA140EaCcb060C648eECff42BBb61",
   "tokenAddress": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "creKeeperReceiverAddress": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
-  "registryStartBlock": 0,
-  "webhookRegistryStartBlock": 0,
-  "logChunkBlocks": 2000,
-  "depositScanBlocks": 500,
-  "schedule": "*/3 * * * * *"
+  "registryStartBlock": 51232087,
+  "webhookRegistryStartBlock": 51232087,
+  "logChunkBlocks": 10,
+  "depositScanBlocks": 10,
+  "schedule": "*/30 * * * * *"
 }
