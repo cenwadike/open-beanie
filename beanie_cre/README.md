@@ -67,7 +67,8 @@ export type Config = z.infer<typeof configSchema>;
 To guarantee that log pagination never triggers call quota errors, ensure `getLogsChunked` limits total HTTP calls:
 
 ```typescript
-export function getLogsChunked(
+export function 
+  maxCalls: number,
   requester: HttpRequester,
   rpcUrl: string,
   address: string,
@@ -75,7 +76,6 @@ export function getLogsChunked(
   fromBlock: number,
   toBlock: number,
   chunkSize: number,
-  maxCalls: number = 3,
 ): Log[] {
   const logs: Log[] = [];
   

@@ -1,3 +1,5 @@
+import { Config } from "./config";
+
 export type HttpRequester = {
   sendRequest: (req: unknown) => { result: () => { body: Uint8Array; statusCode: number } };
 };
@@ -76,6 +78,9 @@ export function rpcBatchCall<T>(
   });
 }
 
+/**
+ * Fetches logs in fixed-size block chunks, enforced with a strict maximum HTTP call limit per tick.
+ */
 export function getLogsChunked(
   requester: HttpRequester,
   rpcUrl: string,
@@ -84,11 +89,17 @@ export function getLogsChunked(
   fromBlock: number,
   toBlock: number,
   chunkSize: number,
+  maxCalls: number = 3,
 ): Log[] {
   const logs: Log[] = [];
-  let start = fromBlock;
 
-  while (start <= toBlock) {
+  // Prevent endless loops if fromBlock is 0 or far behind the chain tip:
+  // Calculate the lowest start block allowed based on (chunkSize * maxCalls) backwards from toBlock.
+  const minAllowedStart = Math.max(fromBlock, toBlock - chunkSize * maxCalls + 1);
+  let start = minAllowedStart;
+  let callsMade = 0;
+
+  while (start <= toBlock && callsMade < maxCalls) {
     const end = Math.min(start + chunkSize - 1, toBlock);
     logs.push(
       ...rpcCall<Log[]>(requester, rpcUrl, "eth_getLogs", [
@@ -101,6 +112,7 @@ export function getLogsChunked(
       ]),
     );
     start = end + 1;
+    callsMade++;
   }
 
   return logs;
