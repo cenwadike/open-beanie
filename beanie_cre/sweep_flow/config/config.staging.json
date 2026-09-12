@@ -1,0 +1,14 @@
+{
+  "chainSelectorName": "ethereum-mainnet-base-1",
+  "isTestnet": false,
+  "rpcUrl": "https://mainnet.base.org",
+  "factoryAddress": "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
+  "webhookRegistryAddress": "0x4389822B42deA140EaCcb060C648eECff42BBb61",
+  "tokenAddress": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "creKeeperReceiverAddress": "0x46D7E780Dd2DA8A1034b54D6Af4297b9eB06e3dd",
+  "registryStartBlock": 0,
+  "webhookRegistryStartBlock": 0,
+  "logChunkBlocks": 2000,
+  "depositScanBlocks": 500,
+  "schedule": "*/3 * * * * *"
+}

@@ -13,7 +13,7 @@ pragma solidity ^0.8.24;
  * Fee split: sweep() has no dedicated relayer the way Starknet's
  * privacy_invoke does (that one is driven by STRK20 pool nodes), so the
  * caller who triggers it here is paid directly out of the fee — 10% of
- * fee to msg.sender, the remaining 90% to a single treasury address.
+ * fee to tx.origin, the remaining 90% to a single treasury address.
  */
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -109,7 +109,7 @@ contract ChainXReceiver {
 
     /// PERMISSIONLESS, IDEMPOTENT, atomic. Zero balance -> silent no-op.
     ///   fee        = balance * FEE_BPS / BPS_DENOM
-    ///   feeToCaller = fee * CALLER_SHARE_BPS / BPS_DENOM   (10% of fee, to msg.sender)
+    ///   feeToCaller = fee * CALLER_SHARE_BPS / BPS_DENOM   (10% of fee, to tx.origin)
     ///   feeToTreasury = fee - feeToCaller
     ///   net = balance - fee -> burned via CCTP, or transferred same-chain
     function sweep()
@@ -133,8 +133,7 @@ contract ChainXReceiver {
         feeToCaller = (fee * CALLER_SHARE_BPS) / BPS_DENOM;
         feeToTreasury = fee - feeToCaller;
 
-        if (feeToCaller > 0)
-            IERC20(token).safeTransfer(msg.sender, feeToCaller);
+        if (feeToCaller > 0) IERC20(token).safeTransfer(tx.origin, feeToCaller);
         if (feeToTreasury > 0)
             IERC20(token).safeTransfer(treasury, feeToTreasury);
 
@@ -154,7 +153,7 @@ contract ChainXReceiver {
                 token,
                 bytes32(0), // destination_caller: 0 = permissionless mint on Starknet
                 max_fee,
-                1000 // min_finality_threshold: standard
+                1000 // min_finality_threshold: fast
             );
         } else {
             IERC20(token).safeTransfer(merchant, net);

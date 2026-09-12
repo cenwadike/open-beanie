@@ -20,7 +20,7 @@ Registration is completely permissionless and requires no login, wallet connecti
 ## Architecture Overview
 
 ```
-                          POST /api/v1/lanes/init
+                          POST /api/v1/lanes/create
                                      │
                                      ▼
                       ┌──────────────────────────────┐
@@ -29,15 +29,21 @@ Registration is completely permissionless and requires no login, wallet connecti
                                      │
            ┌─────────────────────────┴─────────────────────────┐
            ▼                                                   ▼
-┌──────────────────────┐                           ┌──────────────────────┐
-│  Contract View Call  │                           │ Background Worker    │
-│  (Instant Prediction)│                           │ (mpsc Deploy Queue)  │
-└──────────┬───────────┘                           └──────────┬───────────┘
-           │                                                  │
-           ▼                                                  ▼
-┌────────────────────────┐                         ┌──────────────────────┐
-│ Json(InitLaneResponse) │                         │ On-Chain Deployment  │
-└────────────────────────┘                         └──────────────────────┘
+┌──────────────────────┐                           ┌──────────────────────────────────────────────┐
+│  Contract View Call  │                           │  Background Worker (mpsc Worker Queues)      │
+│  (Instant Prediction)│─────────────┬             └───┬──────────────────┬────────────────────┬──┘
+└──────────┬───────────┘             │                 │                  │                    │
+           │                         │                 ▼                  ▼                    ▼
+           ▼                         │           ┌──────────┐       ┌───────────┐         ┌──────────┐       
+┌────────────────────────┐           │           │  Gasless │       │ Transfers │         │  Stealth │
+│ Json(InitLaneResponse) │           │           │  Payment │       │  Keepers  │         │  Workers │
+└────────────────────────┘           │           └──────────┘       └───────────┘         └──────────┘
+                                     │
+                                     ▼  
+                      ┌──────────────────────────────┐
+                      │    Announce Receivers Call   │
+                      └──────────────────────────────┘
+
 
 ```
 
