@@ -12,10 +12,21 @@ chrono = "0.4.45"
 ethers = "2.0.14"
 hex = "0.4.3"
 tokio = { version = "1.53.1", features = ["full"] }
-reqwest = { version = "0.12.28", features = ["json"] }
+reqwest = { version = "0.12.28", features = ["json", "stream"] }
 serde = { version = "1.0.151", features = ["derive"] }
 serde_json = "1.0.151"
 dotenvy = "0.15.7"
 starknet = "0.17.0"
 starknet-crypto = "0.8.1"
 url = "2.5.8"
+alloy = { version = "2.4.2", features = ["provider-ws"] }
+futures-util = "0.3.34"
+starknet-tokio-tungstenite = "0.3.0"
+sled = "0.34.7"
+log = "0.4.34"
+simple_logger = "5.2.0"
+tokio-util = "0.7.19"
+apibara-dna-sdk = { version = "2.0.1", features = ["starknet"] }
+prost = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+governor = "0.10.4"

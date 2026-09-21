@@ -1,20 +1,16 @@
-use std::sync::Arc;
+// src/evm_keeper.rs
 
 use anyhow::{Context, Result as AnyhowResult};
 use ethers::{
-    abi::{ParamType, Token, decode},
     contract::abigen,
     middleware::{NonceManagerMiddleware, SignerMiddleware},
     providers::{Http, Middleware, Provider, RetryClient},
     signers::{LocalWallet, Signer},
-    types::{
-        Address, BlockNumber, Eip1559TransactionRequest, Filter, H256, U256, ValueOrArray,
-        transaction::eip2718::TypedTransaction,
-    },
-    utils::keccak256,
+    types::{Address, Eip1559TransactionRequest, transaction::eip2718::TypedTransaction},
 };
+use std::sync::Arc;
 
-use crate::config::{Deposit, EvmConfig, now_formatted};
+use crate::config::{EvmConfig, now_formatted};
 
 abigen!(
     ChainXReceiver,
@@ -72,7 +68,6 @@ pub type SignerProvider =
     SignerMiddleware<NonceManagerMiddleware<Provider<RetryClient<Http>>>, LocalWallet>;
 
 pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> {
-    // Retries 10 times max with 2000ms initial backoff on rate limits / 429s
     let provider = Provider::<RetryClient<Http>>::new_client(cfg.evm_rpc_url.as_str(), 10, 2000)
         .context("invalid RPC URL or failed initializing retry client")?;
 
@@ -87,186 +82,6 @@ pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> 
 
     let nonce_managed = NonceManagerMiddleware::new(provider, address);
     Ok(Arc::new(SignerMiddleware::new(nonce_managed, wallet)))
-}
-
-pub async fn discover_merchants(
-    client: &Arc<SignerProvider>,
-    cfg: &EvmConfig,
-    from_block: u64,
-    to_block: u64,
-) -> AnyhowResult<Vec<(Address, Address)>> {
-    if from_block > to_block {
-        return Ok(Vec::new());
-    }
-
-    let merchant_reg_topic = H256::from(keccak256("MerchantRegistered(address,address)"));
-    let receiver_announced_topic =
-        H256::from(keccak256("ReceiverAnnounced(address,address,uint256)"));
-
-    let mut out = Vec::new();
-    let mut chunk_start = from_block;
-
-    while chunk_start <= to_block {
-        let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
-
-        // Fetch both event types in one eth_getLogs call
-        let filter = Filter::new()
-            .address(cfg.factory_address)
-            .topic0(vec![merchant_reg_topic, receiver_announced_topic]) // OR
-            .from_block(BlockNumber::Number(chunk_start.into()))
-            .to_block(BlockNumber::Number(chunk_end.into()));
-
-        let logs = client.get_logs(&filter).await.with_context(|| {
-            format!("eth_getLogs failed for merchant registry blocks {chunk_start}-{chunk_end}")
-        })?;
-
-        for log in logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let topic0 = log.topics[0];
-
-            if topic0 == merchant_reg_topic {
-                // MerchantRegistered(address indexed merchant, address receiver)
-                // topics[1] = merchant, data[12..32] = receiver
-                if log.topics.len() < 2 || log.data.len() < 32 {
-                    continue;
-                }
-                let merchant = Address::from(log.topics[1]);
-                let receiver = Address::from_slice(&log.data[12..32]);
-                out.push((merchant, receiver));
-            } else if topic0 == receiver_announced_topic {
-                // ReceiverAnnounced(address indexed merchant, address indexed receiver, uint256 nonce)
-                // topics[1] = merchant, topics[2] = receiver, data = nonce (ignored)
-                if log.topics.len() < 3 {
-                    continue;
-                }
-                let merchant = Address::from(log.topics[1]);
-                let receiver = Address::from(log.topics[2]);
-                out.push((merchant, receiver));
-            }
-        }
-
-        chunk_start = chunk_end + 1;
-    }
-
-    // Optional: dedup (same address can appear first as Announced, later as Registered)
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out.dedup_by(|a, b| a.1 == b.1);
-
-    Ok(out)
-}
-
-pub async fn discover_webhook_urls(
-    client: &Arc<SignerProvider>,
-    cfg: &EvmConfig,
-    from_block: u64,
-    to_block: u64,
-) -> AnyhowResult<Vec<(Address, String)>> {
-    if from_block > to_block {
-        return Ok(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let mut chunk_start = from_block;
-    let webhook_set_topic = H256::from(keccak256("WebhookUrlSet(address,string)"));
-
-    while chunk_start <= to_block {
-        let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
-
-        let filter = Filter::new()
-            .address(cfg.webhook_registry_address)
-            .topic0(webhook_set_topic)
-            .from_block(BlockNumber::Number(chunk_start.into()))
-            .to_block(BlockNumber::Number(chunk_end.into()));
-
-        let logs = client.get_logs(&filter).await.with_context(|| {
-            format!("eth_getLogs failed for webhook registry blocks {chunk_start}-{chunk_end}")
-        })?;
-
-        for log in logs {
-            if log.topics.len() < 2 {
-                continue;
-            }
-            let merchant = Address::from(log.topics[1]);
-
-            let url = match decode(&[ParamType::String], &log.data) {
-                Ok(mut tokens) => match tokens.remove(0) {
-                    Token::String(s) => s,
-                    _ => continue,
-                },
-                Err(_) => continue,
-            };
-
-            out.push((merchant, url));
-        }
-
-        chunk_start = chunk_end + 1;
-    }
-
-    Ok(out)
-}
-
-pub async fn fetch_deposits_since_block(
-    client: &Arc<SignerProvider>,
-    cfg: &EvmConfig,
-    receivers: &[Address],
-    from_block: u64,
-    to_block: u64,
-) -> AnyhowResult<Vec<Deposit>> {
-    if receivers.is_empty() || from_block > to_block {
-        return Ok(Vec::new());
-    }
-
-    let mut deposits = Vec::new();
-    let mut chunk_start = from_block;
-    let transfer_topic = H256::from(keccak256("Transfer(address,address,uint256)"));
-
-    while chunk_start <= to_block {
-        let chunk_end = std::cmp::min(chunk_start + cfg.log_chunk_blocks - 1, to_block);
-
-        let filter = Filter::new()
-            .address(cfg.token_address)
-            .topic0(transfer_topic)
-            .topic2(ValueOrArray::Array(
-                receivers.iter().map(|a| H256::from(*a)).collect(),
-            ))
-            .from_block(BlockNumber::Number(chunk_start.into()))
-            .to_block(BlockNumber::Number(chunk_end.into()));
-
-        let logs = client
-            .get_logs(&filter)
-            .await
-            .with_context(|| format!("eth_getLogs failed for blocks {chunk_start}-{chunk_end}"))?;
-
-        for log in logs {
-            if log.topics.len() < 3 {
-                continue;
-            }
-            let from = Address::from(log.topics[1]);
-            let to = Address::from(log.topics[2]);
-            let amount = U256::from_big_endian(&log.data);
-            let block_number = log.block_number.map(|b| b.as_u64()).unwrap_or(chunk_end);
-            let tx_hash = log
-                .transaction_hash
-                .map(|h| format!("{h:?}"))
-                .unwrap_or_default();
-
-            deposits.push(Deposit {
-                tx_hash,
-                from_address: format!("{from:?}"),
-                receiver: format!("{to:?}"),
-                amount_raw: amount.to_string(),
-                block_number,
-            });
-        }
-
-        chunk_start = chunk_end + 1;
-    }
-
-    deposits.sort_by_key(|d| d.block_number);
-    Ok(deposits)
 }
 
 pub async fn multicall_sweep(

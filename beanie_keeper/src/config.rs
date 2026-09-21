@@ -58,7 +58,7 @@ impl From<StarknetConfig> for Config {
     }
 }
 
-// ── EvmConfig ───────────────────────────────────────────────────────────────────
+// ── StarknetConfig ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct StarknetConfig {
@@ -72,7 +72,8 @@ pub struct StarknetConfig {
     pub deposit_start_block: u64,
     pub webhook_registry_start_block: u64,
     pub poll_interval: Duration,
-    pub log_chunk_blocks: u64,
+    pub starknet_events_rpc_url: String,
+    pub starknet_events_api_key: Option<String>,
 }
 
 impl StarknetConfig {
@@ -106,10 +107,9 @@ impl StarknetConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12),
             ),
-            log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000),
+            starknet_events_rpc_url: env("STARKNET_EVENT_STREAM_URL")
+                .context("missing STARKNET_EVENT_STREAM_URL")?,
+            starknet_events_api_key: env("STARKNET_EVENT_API_KEY").ok(),
         })
     }
 }
@@ -119,9 +119,17 @@ fn parse_felt_env(var_name: &str) -> Result<Felt> {
     Felt::from_hex(&raw).with_context(|| format!("invalid felt for {var_name}: {raw}"))
 }
 
+// ── EvmConfig ───────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct EvmConfig {
     pub evm_rpc_url: String,
+    // Optional now: only feeds the newHeads-only push in evm_ws.rs, which
+    // is itself an optional minor optimization (free base_fee_per_gas per
+    // block) rather than something anything downstream depends on. `None`
+    // means fee calculation always falls back to `estimate_eip1559_fees`.
+    // See evm_ws.rs's module doc for what did and didn't survive Phase 2.
+    pub ws_url: Option<String>,
     pub chain_name: String, // "base" | "ethereum" — carried into the webhook payload
     pub token_address: Address, // the stablecoin ERC20 contract
     pub factory_address: Address, // Beanie's EVM MerchantFactory
@@ -136,13 +144,31 @@ pub struct EvmConfig {
     // the `from` on every sweep tx. One identity, nothing separate to publish.
     pub keeper_wallet: EvmLocalWallet,
     pub poll_interval: Duration,
-    pub log_chunk_blocks: u64, // most RPC providers cap eth_getLogs to a block range — confirm the real limit for your provider before trusting this
+
+    // ── Subsquid Portal (event discovery — see evm_subsquid.rs) ──────────
+    //
+    // Replaces `backfill_rpc_url` (a second, Etherscan-backed explorer
+    // backfill path that only ran if `etherscan_api_key` happened to be
+    // set, with the live RPC path carrying the full cold-start backlog
+    // against `evm_rpc_url`'s quota otherwise) and the whole
+    // adaptive-bisection / CdpBudget / RPC-chunked eth_getLogs discovery
+    // path in evm_keeper.rs. There is exactly one data source for event
+    // discovery now and it is not optional — unlike the old Etherscan
+    // key, `subsquid_portal_url` is required, because there's no
+    // "fall back to the live RPC path instead" option left: `evm_rpc_url`
+    // above is used exclusively for state reads and sending transactions.
+    //
+    // Base URL is `https://portal.sqd.dev/datasets/{network}` — see
+    // evm_subsquid.rs's module doc for the exact request/response shape.
+    pub subsquid_portal_url: String,
+    pub subsquid_portal_api_key: String,
 }
 
 impl EvmConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             evm_rpc_url: env("BASE_RPC_URL")?,
+            ws_url: env("BASE_WS_URL").ok(),
             chain_name: "base".into(),
             token_address: addr(&env("BASE_TOKEN_ADDRESS")?)?,
             factory_address: addr(&env("BASE_FACTORY_ADDRESS")?)?,
@@ -163,10 +189,12 @@ impl EvmConfig {
             deposit_start_block: env("BASE_DEPOSIT_START_BLOCK")?
                 .parse()
                 .context("BASE_DEPOSIT_START_BLOCK must be a valid u64")?,
-            log_chunk_blocks: env("LOG_CHUNK_BLOCKS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2000),
+            subsquid_portal_url: env("BASE_SUBSQUID_PORTAL_URL").context(
+                "missing BASE_SUBSQUID_PORTAL_URL (e.g. https://portal.sqd.dev/datasets/base-mainnet)",
+            )?,
+            subsquid_portal_api_key: env("BASE_SUBSQUID_PORTAL_API_KEY").context(
+                "missing BASE_SUBSQUID_PORTAL_API_KEY (Get one from https://portal.sqd.dev/)",
+            )?,
         })
     }
 }

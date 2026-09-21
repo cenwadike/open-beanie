@@ -6,6 +6,7 @@ import "../src/ChainXReceiver.sol";
 import "../src/StealthAccount.sol";
 import "../src/MerchantFactory.sol";
 import "../src/MerchantWebhookRegistry.sol";
+import "../src/CREKeeperReceiver.sol";
 
 contract DeployBaseMainnet is Script {
     // Base Mainnet Constants
@@ -24,27 +25,32 @@ contract DeployBaseMainnet is Script {
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         address implementation = vm.envAddress("RECEIVER_IMPL");
 
+        address keeper = vm.envAddress("KEEPER_ADDRESS");
+        address multicall3 = vm.envAddress("MULTICALL3_ADDRESS");
+        bytes32 expectedWorkflowId = vm.envBytes32("WORKFLOW_ID");
+        address expectedWorkflowOwner = vm.envAddress("WORKFLOW_OWNER");
+
         require(treasury != address(0), "Treasury address required");
 
         vm.startBroadcast(deployerPrivateKey);
 
         // 1a. Deploy Implementation
-        // ChainXReceiver implementation = new ChainXReceiver();
-        // console.log(
-        //     "ChainXReceiver Implementation deployed to:",
-        //     address(implementation)
-        // );
+        ChainXReceiver iChainXReceiver = new ChainXReceiver();
+        console.log(
+            "ChainXReceiver Implementation deployed to:",
+            address(iChainXReceiver)
+        );
 
-        // // 1b. Deploy Stealth account ref
-        // StealthAccount stealthAccount = new StealthAccount(
-        //     address(0),
-        //     address(0),
-        //     address(0)
-        // );
-        // console.log(
-        //     "StealthAccount Implementation deployed to:",
-        //     address(stealthAccount)
-        // );
+        // 1b. Deploy Stealth account ref
+        StealthAccount iStealthAccount = new StealthAccount(
+            address(0),
+            address(0),
+            address(0)
+        );
+        console.log(
+            "StealthAccount Implementation deployed to:",
+            address(iStealthAccount)
+        );
 
         // 2. Deploy Factory
         MerchantFactory factory = new MerchantFactory(
@@ -60,13 +66,21 @@ contract DeployBaseMainnet is Script {
         console.log("MerchantFactory deployed to:", address(factory));
 
         // 3. Deploy Webhook Registry
-        // MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(
-        //     address(factory)
-        // );
-        // console.log(
-        //     "MerchantWebhookRegistry deployed to:",
-        //     address(webhookRegistry)
-        // );
+        MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(
+            address(factory)
+        );
+        console.log(
+            "MerchantWebhookRegistry deployed to:",
+            address(webhookRegistry)
+        );
+
+        // 4. Deploy CREKeeperReceiver
+        CREKeeperReceiver creKeeperReceiver = new CREKeeperReceiver(
+            keeper,
+            multicall3,
+            expectedWorkflowId,
+            expectedWorkflowOwner
+        );
 
         vm.stopBroadcast();
     }

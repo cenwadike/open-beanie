@@ -1,44 +1,38 @@
-use anyhow::Result;
-use starknet::{
-    accounts::{Account, ConnectedAccount, ExecutionEncoding, SingleOwnerAccount},
-    core::{
-        types::{BlockId, Call, EventFilter, Felt},
-        utils::get_selector_from_name,
-    },
-    providers::{JsonRpcClient, Provider, jsonrpc::HttpTransport},
-    signers::LocalWallet,
-};
-use std::sync::Arc;
-use url::Url;
-
-use crate::config::Deposit;
-use crate::config::StarknetConfig;
-
-pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
+use anyhow::{Context, Result};
 use reqwest::{
     Client,
     header::{HeaderMap, HeaderValue, ORIGIN, USER_AGENT},
 };
+use starknet::{
+    accounts::{Account, ExecutionEncoding, SingleOwnerAccount},
+    core::{
+        types::{BlockId, BlockTag, Call, Felt, FunctionCall, requests::CallRequest},
+        utils::get_selector_from_name,
+    },
+    providers::{
+        JsonRpcClient, Provider, ProviderRequestData, ProviderResponseData, jsonrpc::HttpTransport,
+    },
+    signers::LocalWallet,
+};
+use std::collections::HashSet;
+use std::sync::Arc;
+use url::Url;
+
+use crate::config::StarknetConfig;
+
+pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>;
+pub type StarknetProvider = JsonRpcClient<HttpTransport>;
 
 pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccount>> {
     let parsed_url = Url::parse(&cfg.rpc_url)?;
-
     let mut headers = HeaderMap::new();
 
-    // Option A: Use the parsed URL string as the Origin header
     headers.insert(ORIGIN, HeaderValue::from_str(parsed_url.as_str())?);
-
-    // Option B: Extract host/origin scheme manually if required by the RPC endpoint
-    // let origin_str = format!("{}://{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""));
-    // headers.insert(ORIGIN, HeaderValue::from_str(&origin_str)?);
-
     headers.insert(USER_AGENT, HeaderValue::from_static("beanie-keeper/1.0"));
 
     let reqwest_client = Client::builder().default_headers(headers).build()?;
-
     let transport = HttpTransport::new_with_client(parsed_url, reqwest_client);
     let provider = JsonRpcClient::new(transport);
-
     let chain_id = starknet::core::chain_id::MAINNET;
 
     let account = SingleOwnerAccount::new(
@@ -52,148 +46,54 @@ pub fn build_starknet_account(cfg: &StarknetConfig) -> Result<Arc<StarknetAccoun
     Ok(Arc::new(account))
 }
 
-/// Discovers both deployed receivers (MerchantRegistered) and
-/// announced/predicted receivers (ReceiverAnnounced).
-pub async fn discover_merchants(
-    account: &StarknetAccount,
-    cfg: &StarknetConfig,
-    from_block: u64,
-    to_block: u64,
-) -> Result<Vec<(Felt, Felt)>> {
-    if from_block > to_block {
-        return Ok(Vec::new());
-    }
-
-    let registered_selector = get_selector_from_name("MerchantRegistered")?;
-    let announced_selector = get_selector_from_name("ReceiverAnnounced")?;
-
-    let mut out = Vec::new();
-    let step = cfg.log_chunk_blocks.max(1);
-
-    let mut current_from = from_block;
-    while current_from <= to_block {
-        let current_to = (current_from + step - 1).min(to_block);
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            // Fetch both event types in one filter (OR on the first key)
-            let filter = EventFilter {
-                from_block: Some(BlockId::Number(current_from)),
-                to_block: Some(BlockId::Number(current_to)),
-                address: Some(cfg.factory_address),
-                keys: Some(vec![
-                    vec![registered_selector, announced_selector], // topic0 can be either
-                ]),
-            };
-
-            let events_page = account
-                .provider()
-                .get_events(filter, continuation_token.clone(), 100)
-                .await?;
-
-            for event in events_page.events {
-                // Both events currently put (merchant, receiver) in data[0..2]
-                // (nonce is data[2] for ReceiverAnnounced – we ignore it here)
-                if event.data.len() >= 2 {
-                    let merchant = event.data[0];
-                    let receiver = event.data[1];
-                    out.push((merchant, receiver));
-                }
-            }
-
-            continuation_token = events_page.continuation_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        current_from = current_to + 1;
-    }
-
-    // Optional: dedup in case the same address was both announced and later registered
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out.dedup_by(|a, b| a.1 == b.1);
-
-    Ok(out)
-}
-
-/// Scans Starknet ERC-20 Transfer events with block chunking and pagination.
-pub async fn fetch_deposits_since_block(
-    account: &StarknetAccount,
-    cfg: &StarknetConfig,
+/// Batched ERC-20 `balanceOf` check across candidate receivers in one HTTP round trip.
+pub async fn batch_check_nonzero_balance(
+    provider: &StarknetProvider,
+    token_address: Felt,
     receivers: &[Felt],
-    from_block: u64,
-    to_block: u64,
-) -> Result<Vec<Deposit>> {
-    if receivers.is_empty() || from_block > to_block {
-        return Ok(Vec::new());
+) -> Result<HashSet<Felt>> {
+    if receivers.is_empty() {
+        return Ok(HashSet::new());
     }
 
-    let transfer_selector = get_selector_from_name("Transfer")?;
-    let mut deposits = Vec::new();
-    let keys = vec![vec![transfer_selector], vec![], receivers.to_vec()];
-    let step = cfg.log_chunk_blocks.max(1);
+    let balance_of_selector = get_selector_from_name("balanceOf")?;
 
-    let mut current_from = from_block;
-    while current_from <= to_block {
-        let current_to = (current_from + step - 1).min(to_block);
-        let mut continuation_token: Option<String> = None;
+    let requests: Vec<ProviderRequestData> = receivers
+        .iter()
+        .map(|&receiver| {
+            ProviderRequestData::Call(CallRequest {
+                request: FunctionCall {
+                    contract_address: token_address,
+                    entry_point_selector: balance_of_selector,
+                    calldata: vec![receiver],
+                },
+                block_id: BlockId::Tag(BlockTag::L1Accepted),
+            })
+        })
+        .collect();
 
-        loop {
-            let filter = EventFilter {
-                from_block: Some(BlockId::Number(current_from)),
-                to_block: Some(BlockId::Number(current_to)),
-                address: Some(cfg.token_address),
-                keys: Some(keys.clone()),
-            };
+    let responses = provider
+        .batch_requests(requests)
+        .await
+        .context("batched balanceOf request failed")?;
 
-            let events_page = account
-                .provider()
-                .get_events(filter, continuation_token.clone(), 1000)
-                .await?;
-
-            for event in events_page.events {
-                if event.keys.len() < 3 || event.data.len() < 2 {
-                    continue;
+    let mut nonzero = HashSet::with_capacity(receivers.len());
+    for (&receiver, response) in receivers.iter().zip(responses) {
+        match response {
+            ProviderResponseData::Call(values) => {
+                if values.iter().any(|f| *f != Felt::ZERO) {
+                    nonzero.insert(receiver);
                 }
-
-                let from = event.keys[1];
-                let to = event.keys[2];
-
-                // Cairo u256 consists of 2 felts: low (data[0]), high (data[1])
-                let low: u128 = event.data[0].try_into().unwrap_or(0);
-                let high: u128 = event.data[1].try_into().unwrap_or(0);
-                let amount = u256_to_string(low, high);
-
-                deposits.push(Deposit {
-                    tx_hash: format!("{:#x}", event.transaction_hash),
-                    from_address: format!("{:#x}", from),
-                    receiver: format!("{:#x}", to),
-                    amount_raw: amount,
-                    block_number: event.block_number.unwrap_or(current_to),
-                });
             }
-
-            continuation_token = events_page.continuation_token;
-            if continuation_token.is_none() {
-                break;
+            other => {
+                eprintln!(
+                    "balanceOf batch: unexpected response variant for receiver {receiver:#x}: {other:?} — treating as zero balance"
+                );
             }
         }
-
-        current_from = current_to + 1;
     }
 
-    Ok(deposits)
-}
-
-/// Helper to convert low/high u128 felts to full integer string representation
-fn u256_to_string(low: u128, high: u128) -> String {
-    if high == 0 {
-        low.to_string()
-    } else {
-        let val = (u128::from(high) << 64) | u128::from(low); // Fits within u128 for normal standard ranges
-        val.to_string()
-    }
+    Ok(nonzero)
 }
 
 /// Sweeps multiple receivers via Starknet's native multicall mechanism.
