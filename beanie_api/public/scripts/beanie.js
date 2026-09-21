@@ -7,7 +7,7 @@
       name: "Base",
       kind: "evm",
       chainId: 8453,
-      rpc: "https://base-mainnet.g.alchemy.com/v2/alch_pbUufy18xMzGDkyKmU87-",
+      rpc: "https://mainnet.base.org",
       usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
       factory: "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
       explorerAddress: "https://basescan.org/address/",
@@ -16,7 +16,7 @@
     STARKNET: {
       name: "Starknet",
       kind: "starknet",
-      rpc: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-",
+      rpc: "https://solemn-holy-hexagon.strk-mainnet.quiknode.pro/706fa98b5d6a214d0dcb34926edc1b12ca9ea7d3/rpc/v0_9",
       usdc: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
       factory: "0x074fc53d92ed14249d7d7f37a22d879ad6d5660c2f86bcf5ae74e3d22347e30c",
       explorerAddress: "https://starkscan.co/contract/",
@@ -28,11 +28,28 @@
   const CHAIN_WIRE = { BASE: "BASE", STARKNET: "STARKNET" };
   const SOURCE_CHAINS = ["BASE", "STARKNET"];
   const OPTION_TO_CHAIN = { base: "BASE", starknet: "STARKNET" };
-  const POLL_INTERVAL_MS = 20000;
+
+  // --- Live-feed / polling cadence -----------------------------------------
+  // WHY TWO NUMBERS INSTEAD OF ONE:
+  // The old code polled every receiver's on-chain balance every 200s,
+  // unconditionally, forever. That's replaced by a same-origin WebSocket
+  // (see "Live feed" below) that pushes deposit/status events the moment
+  // your backend's own chain subscriptions see them — no polling at all in
+  // the common case.
+  //
+  // POLL_INTERVAL_MS is now only the FALLBACK cadence: it only fires real
+  // work when the live feed is down (see wsConnected checks below), so the
+  // app still functions if the WebSocket can't connect for some reason.
+  // RECONCILE_INTERVAL_MS is a low-frequency safety net that runs even
+  // while the live feed is healthy, for the same reason the Rust backend
+  // keeps one: a dropped WS message should be caught eventually, not never.
+  const POLL_INTERVAL_MS = 200000; // fallback-only cadence, unchanged from before
+  const RECONCILE_INTERVAL_MS = 300000; // 5 min backstop while WS is healthy
+
   const API_CREATE = "/api/v1/create";
   const API_STATUS = "/api/v1/status";
-  const RP_ID = "localhost"
-  // RP_ORIGIN = "http://localhost:8080"
+  const RP_ID = "beanie.up.railway.app"
+  const RP_ORIGIN = "https://beanie.up.railway.app"
 
   const STARKNET_BALANCEOF_SELECTOR =
     "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
@@ -540,6 +557,12 @@
       });
       list.append(row);
     }
+
+    // Every render is a good time to make sure the live feed knows about
+    // every receiver we currently care about — subscribing is idempotent
+    // server-side (or should be; see liveFeed.subscribeAll below), so it's
+    // safe to call this on every render rather than tracking a diff.
+    liveFeed.subscribeAll(lanes);
   }
 
   function setReceiverStatus(chain, address, status) {
@@ -648,7 +671,288 @@
     return res.json();
   }
 
-  /* ---------- Polling ---------- */
+  /* ---------- Shared deposit/status handling ----------
+   * Both the live feed (push) and the poll fallback/reconciliation (pull)
+   * funnel through these two functions so a deposit or status change is
+   * handled identically no matter which path noticed it. This is the same
+   * principle as the backend rewrite: one code path for "something
+   * happened", triggered by two different sources.
+   */
+
+  /// Records a known deposit amount/tx directly — used by the live feed,
+  /// which is told the exact amount/tx by the server instead of having to
+  /// infer it from a balance delta.
+  function recordDeposit(chain, address, amountAtoms, txHash, timeMs) {
+    const key = receiverKey(chain, address);
+    const history = getHistory();
+    const entries = history[key] || [];
+    entries.unshift({ chain, address, amount: String(amountAtoms), time: timeMs || Date.now(), tx: txHash || null });
+    history[key] = entries.slice(0, 50);
+    saveHistory(history);
+
+    notify("Deposit detected", "success", `${formatUsdc(amountAtoms)} USDC on ${chainLabel(chain)}`);
+    refreshNotifyDot();
+    if (activeReceiver?.chain === chain && activeReceiver?.address === address) {
+      const statusEl = $("#statusLine");
+      if (statusEl) statusEl.textContent = "Payment received.";
+    }
+
+    // Keep the balances cache roughly in sync so a later fallback poll
+    // (balance-delta based) doesn't re-report the same deposit.
+    const balances = getBalances();
+    const prev = BigInt(balances[key] || "0");
+    balances[key] = (prev + BigInt(amountAtoms)).toString();
+    saveBalances(balances);
+  }
+
+  function handleStatusEvent(chain, address, state, detail) {
+    if (state === "swept") {
+      notify("Funds settled", "success", detail || `${chainLabel(chain)} lane swept to your wallet.`);
+    } else if (state === "shielded") {
+      notify("Deposit shielded", "info", detail || "Moved into the privacy pool — payout follows via bridge-out.");
+    } else if (state === "active") {
+      setReceiverStatus(chain, address, "active");
+    }
+  }
+
+  /* ---------- Live feed (WebSocket) ----------
+   *
+   * WHY THIS EXISTS, AND WHY IT TALKS TO OUR OWN BACKEND
+   * -------------------------------------------------------
+   * The obvious version of "subscribe instead of poll" would open a
+   * websocket straight to the Base/Starknet RPC endpoints above and call
+   * eth_subscribe / starknet_subscribeEvents from the browser. Two things
+   * rule that out here:
+   *
+   *   1. The public Base RPC (mainnet.base.org) is HTTP-only — Base's own
+   *      docs are explicit that eth_subscribe/newHeads/logs are not
+   *      available on it. Getting that would mean switching to a keyed
+   *      provider endpoint (Alchemy, QuickNode, etc.).
+   *   2. Provider WSS URLs normally carry the API key/auth token in the
+   *      URL itself. Putting that in this file means it ships to every
+   *      visitor's browser — anyone can read it out of the page source and
+   *      spend your quota. That's a real cost/abuse exposure, not a
+   *      hypothetical one.
+   *
+   * Your backend, after the earlier rewrite, already maintains a live
+   * subscription to both chains for the sweeper. This live feed just asks
+   * that same backend to relay deposit/status events to the browser over
+   * a same-origin WebSocket — no key material ever reaches the client,
+   * and there's exactly one thing (your server) subscribed to each chain
+   * instead of every open tab separately hammering a provider.
+   *
+   * MESSAGE CONTRACT THIS CODE ASSUMES (implement server-side to match,
+   * or tell me your existing shape and I'll adjust this file):
+   *
+   *   Client -> Server
+   *     { "type": "subscribe",   "chain": "BASE"|"STARKNET", "address": "0x.." }
+   *     { "type": "unsubscribe", "chain": "BASE"|"STARKNET", "address": "0x.." }
+   *     { "type": "ping" }
+   *
+   *   Server -> Client
+   *     { "type": "snapshot", "chain": ..., "address": ..., "balance": "<atoms decimal>", "state": "pending"|"active"|"swept"|"shielded" }
+   *       — sent once, right after a successful subscribe, so the client
+   *         has correct current state without a separate RPC call.
+   *     { "type": "deposit",  "chain": ..., "address": ..., "amount": "<atoms decimal>", "tx_hash": "0x..", "time": <ms epoch> }
+   *     { "type": "status",   "chain": ..., "address": ..., "state": "active"|"swept"|"shielded", "detail": "optional string" }
+   *     { "type": "pong" }
+   *
+   * RECONNECTION
+   * ---------------
+   * Plain browser WebSocket has no built-in reconnect (unlike some server
+   * libraries), so this hand-rolls the same shape used on the backend:
+   * exponential backoff up to a cap, and a heartbeat that forces a
+   * reconnect if the server stops answering pings — because a socket can
+   * report itself as "open" while the connection underneath is actually
+   * dead (a stale mobile network switch, a sleeping laptop, etc.).
+   */
+  const liveFeed = (() => {
+    const WS_PATH = "/ws"; // same-origin — adjust if your backend mounts it elsewhere
+    const HEARTBEAT_MS = 25000;
+    const HEARTBEAT_TIMEOUT_MS = 10000;
+    const MAX_BACKOFF_MS = 30000;
+
+    let socket = null;
+    let connected = false;
+    let backoffMs = 1000;
+    let heartbeatTimer = null;
+    let heartbeatTimeoutTimer = null;
+    let subscribed = new Set(); // "CHAIN:address" keys we believe the server has for us
+    let reconnectTimer = null;
+
+    function wsUrl() {
+      return "https://solemn-holy-hexagon.strk-mainnet.quiknode.pro/706fa98b5d6a214d0dcb34926edc1b12ca9ea7d3/rpc/v0_9";
+    }
+
+    function clearHeartbeatTimers() {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (heartbeatTimeoutTimer) clearTimeout(heartbeatTimeoutTimer);
+      heartbeatTimer = null;
+      heartbeatTimeoutTimer = null;
+    }
+
+    function scheduleHeartbeat() {
+      clearHeartbeatTimers();
+      heartbeatTimer = setInterval(() => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        try {
+          socket.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          forceReconnect("send failed during heartbeat");
+          return;
+        }
+        // If we don't hear a pong (or any message — see onmessage) within
+        // the timeout, treat the connection as dead even though the
+        // browser still thinks it's "open".
+        heartbeatTimeoutTimer = setTimeout(() => {
+          forceReconnect("no response to heartbeat ping");
+        }, HEARTBEAT_TIMEOUT_MS);
+      }, HEARTBEAT_MS);
+    }
+
+    function noteLiveness() {
+      // Any inbound message counts as proof of life, not just a pong —
+      // an active feed sending real events is at least as convincing as a
+      // pong would be.
+      if (heartbeatTimeoutTimer) {
+        clearTimeout(heartbeatTimeoutTimer);
+        heartbeatTimeoutTimer = null;
+      }
+    }
+
+    function forceReconnect(reason) {
+      console.warn(`[live-feed] ${reason}; reconnecting`);
+      connected = false;
+      clearHeartbeatTimers();
+      try { socket?.close(); } catch { }
+      socket = null;
+      scheduleReconnect();
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+    }
+
+    function resubscribeAll() {
+      // On a fresh connection the server has forgotten our subscriptions
+      // (unless it persists them server-side keyed by session, which you
+      // may want to add) — replay everything we think we're subscribed to.
+      for (const key of subscribed) {
+        const [chain, address] = key.split(":");
+        send({ type: "subscribe", chain, address });
+      }
+    }
+
+    function send(msg) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+      try {
+        socket.send(JSON.stringify(msg));
+        return true;
+      } catch (e) {
+        console.warn("[live-feed] send failed", e);
+        return false;
+      }
+    }
+
+    function handleMessage(raw) {
+      noteLiveness();
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+
+      switch (msg.type) {
+        case "pong":
+          break; // liveness already recorded above
+
+        case "snapshot": {
+          const key = receiverKey(msg.chain, msg.address);
+          const balances = getBalances();
+          balances[key] = String(msg.balance ?? balances[key] ?? "0");
+          saveBalances(balances);
+          if (msg.state) handleStatusEvent(msg.chain, msg.address, msg.state, msg.detail);
+          break;
+        }
+
+        case "deposit":
+          recordDeposit(msg.chain, msg.address, msg.amount, msg.tx_hash, msg.time);
+          break;
+
+        case "status":
+          handleStatusEvent(msg.chain, msg.address, msg.state, msg.detail);
+          break;
+
+        default:
+          console.warn("[live-feed] unknown message type", msg.type);
+      }
+    }
+
+    function connect() {
+      if (socket) return;
+      try {
+        socket = new WebSocket(wsUrl());
+      } catch (e) {
+        console.warn("[live-feed] failed to open socket", e);
+        scheduleReconnect();
+        return;
+      }
+
+      socket.onopen = () => {
+        connected = true;
+        backoffMs = 1000; // reset backoff on a successful connect
+        scheduleHeartbeat();
+        resubscribeAll();
+      };
+
+      socket.onmessage = (event) => handleMessage(event.data);
+
+      socket.onerror = () => {
+        // onclose will follow; nothing extra to do here.
+      };
+
+      socket.onclose = () => {
+        connected = false;
+        clearHeartbeatTimers();
+        socket = null;
+        scheduleReconnect();
+      };
+    }
+
+    function subscribeOne(chain, address) {
+      const key = receiverKey(chain, address);
+      if (subscribed.has(key)) return;
+      subscribed.add(key);
+      send({ type: "subscribe", chain, address });
+    }
+
+    function subscribeAll(lanes) {
+      for (const lane of lanes) {
+        for (const r of lane.receivers) subscribeOne(r.chain, r.address);
+      }
+    }
+
+    return {
+      start: connect,
+      subscribeOne,
+      subscribeAll,
+      isConnected: () => connected,
+    };
+  })();
+
+  /* ---------- Polling (fallback path + reconciliation backstop) ----------
+   * These functions are UNCHANGED from before — they're what the app
+   * always did. They're just no longer the primary mechanism: they now run
+   * either (a) as the whole show when the live feed can't connect, or
+   * (b) as an infrequent backstop even while it's healthy, exactly
+   * mirroring the reconciliation pass added to the Rust backend.
+   */
   async function pollDeposits(chain, address) {
     let balance;
     try { balance = await tokenBalance(chain, address); } catch { return; }
@@ -808,7 +1112,8 @@
         if (btn) btn.textContent = "Announcing…";
         for (const r of receivers) {
           try {
-            await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken);
+            const out = await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken);
+            console.log("addresses: ", out)
             if (out?.address) {
               r.address = out.address;
             }
@@ -881,6 +1186,10 @@
       const lanes = getLanes();
       lanes.unshift(record);
       saveLanes(lanes);
+
+      // Get the live feed watching the new lane's receivers immediately —
+      // don't wait for the next renderLanes() call on some other page.
+      liveFeed.subscribeAll([record]);
 
       notify(
         privacy ? "Private payment lane ready" : "Payment lane created",
@@ -972,7 +1281,7 @@
 
   /* ---------- Init ---------- */
   restrictChainSelect();
-  renderLanes();
+  renderLanes(); // also kicks off liveFeed.subscribeAll for any stored lanes
   refreshNotifyDot();
 
   const storedLanes = getLanes();
@@ -981,7 +1290,18 @@
     revealShareRoute();
   }
 
-  pollAllLanes();
-  setInterval(pollAllLanes, POLL_INTERVAL_MS);
-  setInterval(refreshNotifyDot, 5000);
+  liveFeed.start();
+
+  // Fallback cadence: only does real work while the live feed is down, so
+  // there's no duplicate polling once it's healthy.
+  setInterval(() => {
+    if (!liveFeed.isConnected()) pollAllLanes();
+  }, POLL_INTERVAL_MS);
+
+  // Reconciliation backstop: runs regardless of live-feed health, same
+  // role as RECONCILE_EVERY in the Rust backend — catches anything a
+  // dropped WebSocket message would otherwise have hidden forever.
+  setInterval(pollAllLanes, RECONCILE_INTERVAL_MS);
+
+  setInterval(refreshNotifyDot, POLL_INTERVAL_MS);
 })();

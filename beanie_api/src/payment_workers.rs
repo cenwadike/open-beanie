@@ -1,3 +1,4 @@
+use log::info;
 use starknet::{
     accounts::{Account, ConnectedAccount, SingleOwnerAccount},
     core::types::{BlockId, BlockTag, Call, Felt, FunctionCall},
@@ -83,7 +84,7 @@ pub async fn run_payment_worker(
     mut rx: mpsc::Receiver<crate::models::PaymentTask>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
 ) {
-    println!("Payment worker active...");
+    info!("Payment worker starting");
 
     let starknet_factory_addr = starknet_cfg.factory_address;
     let evm_factory_addr = evm_cfg.factory_address;

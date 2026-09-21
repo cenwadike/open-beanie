@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ethers::types::Address;
 use ethers::utils::keccak256;
+use log::info;
 use starknet::accounts::Account;
 use starknet::core::types::{Call, Felt};
 use starknet::core::utils::get_selector_from_name;
@@ -20,7 +21,7 @@ pub async fn run_announce_worker(
     starknet_factory_addr: Felt,
     mut rx: mpsc::Receiver<AnnounceTask>,
 ) {
-    println!("Announce worker active...");
+    info!("Announce worker starting");
 
     while let Some(task) = rx.recv().await {
         match task.chain {

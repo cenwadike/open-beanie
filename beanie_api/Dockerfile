@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 1. Copy the local dependency first
+# Copy local dependency library first
 COPY beanie_keeper ./beanie_keeper
 
-# 2. Copy the main API manifests for dependency caching
+# Copy the main API manifests for dependency caching
 COPY beanie_api/Cargo.toml beanie_api/Cargo.loc[k] ./beanie_api/
 
 # Create a dummy main.rs inside the api folder to build dependencies
@@ -24,10 +24,11 @@ RUN cargo update -p time --precise 0.3.36 || true
 RUN cargo build --release
 RUN rm -rf src
 
-# 3. Copy the actual source code and compile the real binary
+# Copy actual source code and compile
 COPY beanie_api/src ./src
+COPY beanie_api/public ./public 
 RUN touch src/main.rs
-RUN cargo build --release --bin beani_api
+RUN cargo build --release --bin beanie_api
 
 # --- Stage 2: Runtime Stage ---
 FROM debian:trixie-slim AS runner
@@ -40,8 +41,8 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy compiled binary and static assets (adjust target path since we built inside /app/beanie_api)
-COPY --from=builder /app/beanie_api/target/release/beani_api /app/beanie-api
+# Copy compiled binary and static assets
+COPY --from=builder /app/beanie_api/target/release/beanie_api /app/beanie-api
 COPY beanie_api/public /app/public
 
 EXPOSE 8080

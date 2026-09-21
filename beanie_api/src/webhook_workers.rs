@@ -1,3 +1,4 @@
+use log::info;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -6,7 +7,7 @@ use reqwest::Client;
 use crate::models::WebhookJob;
 
 pub async fn run_webhook_worker(http_client: Arc<Client>, mut rx: mpsc::Receiver<WebhookJob>) {
-    println!("webhook worker starting...");
+    info!("Webhook worker starting");
 
     while let Some(job) = rx.recv().await {
         let cfg = job.cfg.clone();

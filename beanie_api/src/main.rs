@@ -40,6 +40,8 @@ use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use log::{debug, info};
+
 use crate::auth::{
     AuthState, RateLimiter, auth_finish, auth_start, register_finish, register_start,
 };
@@ -121,17 +123,28 @@ pub async fn serve_file(path: &str, forced_content_type: Option<&str>, req: Requ
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     dotenvy::dotenv().ok();
 
+    // Initializes the logger at the 'Info' level by default
+    simple_logger::init_with_level(log::Level::Info).unwrap();
+
+    info!("[baeanie_api::main]: Starting up Beanie API");
     let cfg = Config::from_env()?;
     let starknet_cfg = StarknetConfig::from_env()?;
     let evm_cfg = EvmConfig::from_env()?;
+    debug!("[baeanie_api::main]: env loaded");
 
     // 1. Initialize EVM Provider & Signer Client
     let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
 
     // 2. Initialize Starknet Account Client
     let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
+
+    debug!("[baeanie_api::main]: clients loaded");
 
     // 3. Setup Bounded Channels and Background Workers
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
@@ -145,6 +158,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (webhook_tx, webhook_rx) = mpsc::channel::<crate::models::WebhookJob>(4096);
     let webhook_tx = Arc::new(webhook_tx);
+
+    debug!("[baeanie_api::main]: channels loaded");
 
     let state = AppState {
         auth: Arc::new(AuthState::new(&cfg.rp_id, &cfg.rp_origin)),
@@ -169,6 +184,8 @@ async fn main() -> anyhow::Result<()> {
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
     let transfer_starknet_account_clone = starknet_account.clone();
+
+    debug!("[baeanie_api::main]: app state loaded");
 
     // Spawn announce workers
     tokio::spawn(run_announce_worker(
@@ -212,6 +229,8 @@ async fn main() -> anyhow::Result<()> {
         crate::webhook_workers::run_webhook_worker(http_for_webhooks, webhook_rx).await;
     });
 
+    debug!("[baeanie_api::main]: workers loaded");
+
     let app = Router::new()
         .route("/api/v1/webauthn/register/start", post(register_start))
         .route("/api/v1/webauthn/register/finish", post(register_finish))
@@ -225,13 +244,17 @@ async fn main() -> anyhow::Result<()> {
         .fallback(serve_static);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
-    println!("Beanie Lanes API running on {}", cfg.listen_addr);
 
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<crate::models::SocketAddr>(),
     )
     .await?;
+
+    info!(
+        "[baeanie_api::main]: Beanie Lanes API running on {}",
+        cfg.listen_addr
+    );
 
     Ok(())
 }

@@ -15,9 +15,9 @@ import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/eth
 export const CHAINS = {
   starknet: {
     type: "starknet",
-    rpcUrl: "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/alch_pbUufy18xMzGDkyKmU87-",
+    rpcUrl: "https://starknet.drpc.org",
     tokenAddress: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-    shieldedPoolAddress: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a", // Cannonica Privacy Pool Address
+    shieldedPoolAddress: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a", // Cannonical Privacy Pool Address
     stealthAccountClassHash: "0x1764a400b3131c39a4ecb85199ac75ba2717c498d9a0245e932ec815674a003",
     litCosignerPubKey: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
     decimals: 6,
@@ -25,7 +25,7 @@ export const CHAINS = {
   base: {
     type: "evm",
     chainId: 8453,
-    rpcUrl: "https://base-mainnet.g.alchemy.com/v2/alch_pbUufy18xMzGDkyKmU87-",
+    rpcUrl: "https://base-mainnet.org",
     tokenAddress: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     factoryAddress: "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
     entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",

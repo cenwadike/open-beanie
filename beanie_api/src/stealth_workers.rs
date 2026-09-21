@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use ethers::signers::Signer;
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, Bytes, TransactionRequest};
+use log::info;
 use serde::{Deserialize, Serialize};
 use starknet::accounts::ConnectedAccount;
 use starknet::{
@@ -51,7 +52,7 @@ struct LitCosignResponse {
 }
 
 pub async fn start_stealth_workers(state: Arc<AppState>, mut rx: mpsc::Receiver<StealthTask>) {
-    println!("[worker] Gasless paymaster worker running...");
+    info!("Gasless paymaster worker starting");
 
     while let Some(task) = rx.recv().await {
         let task_hash = task.tx_hash.clone();

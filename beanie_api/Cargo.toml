@@ -1,5 +1,5 @@
 [package]
-name = "beani_api"
+name = "beanie_api"
 version = "0.1.0"
 edition = "2024"
 
@@ -25,3 +25,7 @@ webauthn-rs = "0.5.5"
 base64 = "0.23.1"
 sha2 = "0.11.0"
 uuid = "1.26.0"
+alloy = "2.4.2"
+log = "0.4.34"
+simple_logger = "5.2.0"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
