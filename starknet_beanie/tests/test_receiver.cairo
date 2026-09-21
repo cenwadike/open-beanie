@@ -307,7 +307,7 @@ fn merchant_factory_registers_and_predicts_receiver() {
 
     let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
 
-    let predicted_addr = factory.predict_receiver_address(merchant);
+    let predicted_addr = factory.predict_receiver_address(merchant, 'BASE', 0x777_u256);
     let registered_addr = factory.register_merchant(merchant, 'BASE', 0x777_u256);
 
     assert(predicted_addr == registered_addr, 'PREDICTION_MATCH');
@@ -332,11 +332,20 @@ fn merchant_factory_rejects_exceeding_max_receivers() {
 
     let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
 
+    // Each route is a distinct (chain, recipient) pair, so vary the
+    // recipient to get MAX_RECEIVERS_PER_MERCHANT distinct deterministic
+    // addresses. Reusing one exact route would legitimately panic on a
+    // deploy_syscall collision (registering the same route twice is
+    // intentionally blocked), which is a different failure than the cap.
     let mut i: u32 = 0;
-    while i < 33 {
-        factory.register_merchant(merchant, 'BASE', 0x777_u256);
+    while i < 32 {
+        factory.register_merchant(merchant, 'BASE', (i + 1).into());
         i += 1;
     };
+
+    assert(factory.get_receiver_count(merchant) == 32, 'RECEIVER_COUNT_32');
+
+    factory.register_merchant(merchant, 'BASE', 999_u256);
 }
 #[test]
 fn merchant_factory_announces_receiver() {
@@ -353,13 +362,13 @@ fn merchant_factory_announces_receiver() {
     let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
 
     // Predicted address (view call – no event yet)
-    let predicted_addr = factory.predict_receiver_address(merchant);
+    let predicted_addr = factory.predict_receiver_address(merchant, 'BASE', 0x777_u256);
 
     // Start spying *before* the state-changing call
     let mut spy = spy_events();
 
     // This should emit ReceiverAnnounced
-    factory.announce_receiver(merchant);
+    factory.announce_receiver(merchant, 'BASE', 0x777_u256);
 
     // Assert the event was emitted with the expected data
     // (nonce is 0 on first announce because we never advanced merchant_nonces)
@@ -369,7 +378,12 @@ fn merchant_factory_announces_receiver() {
                 (
                     factory_addr,
                     MerchantFactoryEvent::ReceiverAnnounced(
-                        ReceiverAnnounced { merchant, receiver: predicted_addr, nonce: 0 },
+                        ReceiverAnnounced {
+                            merchant,
+                            receiver: predicted_addr,
+                            cctp_mint_chain: 'BASE',
+                            cctp_mint_recipient: 0x777_u256,
+                        },
                     ),
                 ),
             ],

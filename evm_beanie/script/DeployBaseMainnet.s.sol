@@ -82,6 +82,11 @@ contract DeployBaseMainnet is Script {
             expectedWorkflowOwner
         );
 
+        console.log(
+            "CREKeeperReceiver deployed to:",
+            address(creKeeperReceiver)
+        );
+
         vm.stopBroadcast();
     }
 }

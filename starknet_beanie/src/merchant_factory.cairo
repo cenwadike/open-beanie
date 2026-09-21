@@ -23,8 +23,12 @@ pub trait IMerchantFactory<T> {
     fn register_merchant(
         ref self: T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
     ) -> ContractAddress;
-    fn announce_receiver(ref self: T, merchant: ContractAddress);
-    fn predict_receiver_address(self: @T, merchant: ContractAddress) -> ContractAddress;
+    fn announce_receiver(
+        ref self: T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
+    );
+    fn predict_receiver_address(
+        self: @T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
+    ) -> ContractAddress;
     fn get_merchant_receivers(self: @T, merchant: ContractAddress) -> Array<ContractAddress>;
     fn get_merchant_receiver_at(self: @T, merchant: ContractAddress, index: u64) -> ContractAddress;
     fn get_receiver_count(self: @T, merchant: ContractAddress) -> u64;
@@ -54,7 +58,6 @@ pub mod MerchantFactory {
         token_messenger: ContractAddress,
         valid_domains: Map<felt252, bool>,
         destination_domains: Map<felt252, u32>,
-        merchant_nonces: Map<ContractAddress, felt252>,
         merchant_receivers: Map<ContractAddress, Vec<ContractAddress>>,
     }
 
@@ -69,7 +72,8 @@ pub mod MerchantFactory {
     pub struct ReceiverAnnounced {
         pub merchant: ContractAddress,
         pub receiver: ContractAddress,
-        pub nonce: felt252,
+        pub cctp_mint_chain: felt252,
+        pub cctp_mint_recipient: u256,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -85,6 +89,39 @@ pub mod MerchantFactory {
         pub const INDEX_OUT_OF_BOUNDS: felt252 = 'INDEX_OUT_OF_BOUNDS';
         pub const ZERO_ADDRESS: felt252 = 'ZERO_ADDRESS';
         pub const INVALID_RECIPIENT: felt252 = 'INVALID_RECIPIENT';
+    }
+
+    // The receiver's address is a pure function of (merchant, route): one receiver per
+    // merchant and route, no counter. The route is in the salt, which is what makes
+    // registration safe to leave open. Registering a route twice fails at deploy_syscall.
+    fn route_salt(
+        merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
+    ) -> felt252 {
+        let merchant_felt: felt252 = merchant.into();
+        poseidon_hash_span(
+            array![
+                merchant_felt, cctp_mint_chain, cctp_mint_recipient.low.into(),
+                cctp_mint_recipient.high.into(),
+            ]
+                .span(),
+        )
+    }
+
+    #[generate_trait]
+    impl InternalImpl of InternalTrait {
+        /// Validates the route and returns the CCTP destination domain (0 for same-chain).
+        fn check_route(
+            self: @ContractState, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
+        ) -> u32 {
+            if cctp_mint_chain != 0 {
+                assert(self.valid_domains.read(cctp_mint_chain), Errors::INVALID_DOMAIN);
+                assert(cctp_mint_recipient != 0, Errors::INVALID_RECIPIENT);
+                self.destination_domains.read(cctp_mint_chain)
+            } else {
+                assert(cctp_mint_recipient == 0, Errors::INVALID_RECIPIENT);
+                0
+            }
+        }
     }
 
     #[constructor]
@@ -132,20 +169,9 @@ pub mod MerchantFactory {
                 receivers_vec.len() < MAX_RECEIVERS_PER_MERCHANT, Errors::MAX_RECEIVERS_EXCEEDED,
             );
 
-            let mut destination_domain: u32 = 0;
+            let destination_domain = self.check_route(cctp_mint_chain, cctp_mint_recipient);
 
-            if cctp_mint_chain != 0 {
-                assert(self.valid_domains.read(cctp_mint_chain), Errors::INVALID_DOMAIN);
-                assert(cctp_mint_recipient != 0, Errors::INVALID_RECIPIENT);
-                destination_domain = self.destination_domains.read(cctp_mint_chain);
-            } else {
-                assert(cctp_mint_recipient == 0, Errors::INVALID_RECIPIENT);
-            }
-
-            let nonce = self.merchant_nonces.read(merchant);
-            let merchant_felt: felt252 = merchant.into();
-            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
-            self.merchant_nonces.write(merchant, nonce + 1);
+            let salt = route_salt(merchant, cctp_mint_chain, cctp_mint_recipient);
 
             let empty_calldata = array![];
             let (receiver_address, _) = deploy_syscall(
@@ -175,11 +201,12 @@ pub mod MerchantFactory {
         }
 
         fn predict_receiver_address(
-            self: @ContractState, merchant: ContractAddress,
+            self: @ContractState,
+            merchant: ContractAddress,
+            cctp_mint_chain: felt252,
+            cctp_mint_recipient: u256,
         ) -> ContractAddress {
-            let nonce = self.merchant_nonces.read(merchant);
-            let merchant_felt: felt252 = merchant.into();
-            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
+            let salt = route_salt(merchant, cctp_mint_chain, cctp_mint_recipient);
 
             let empty_calldata: Array<felt252> = array![];
 
@@ -192,10 +219,15 @@ pub mod MerchantFactory {
             )
         }
 
-        fn announce_receiver(ref self: ContractState, merchant: ContractAddress) {
-            let nonce = self.merchant_nonces.read(merchant);
-            let merchant_felt: felt252 = merchant.into();
-            let salt = poseidon_hash_span(array![merchant_felt, nonce].span());
+        fn announce_receiver(
+            ref self: ContractState,
+            merchant: ContractAddress,
+            cctp_mint_chain: felt252,
+            cctp_mint_recipient: u256,
+        ) {
+            let _ = self.check_route(cctp_mint_chain, cctp_mint_recipient);
+
+            let salt = route_salt(merchant, cctp_mint_chain, cctp_mint_recipient);
 
             let empty_calldata: Array<felt252> = array![];
             let receiver = calculate_contract_address_from_deploy_syscall(
@@ -205,7 +237,14 @@ pub mod MerchantFactory {
                 get_contract_address(),
             );
 
-            self.emit(Event::ReceiverAnnounced(ReceiverAnnounced { merchant, receiver, nonce }));
+            self
+                .emit(
+                    Event::ReceiverAnnounced(
+                        ReceiverAnnounced {
+                            merchant, receiver, cctp_mint_chain, cctp_mint_recipient,
+                        },
+                    ),
+                );
         }
 
         fn get_merchant_receivers(
