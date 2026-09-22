@@ -54,10 +54,10 @@
       <button type="button" class="embed-tag-btn" aria-label="Copy as widget" title="Copy as widget">
         ${embedIconSvg}
       </button>
-      <a class="powered-tag" href="/" aria-label="Powered by Beanie">
+      <div class="powered-tag" aria-label="Powered by Beanie">
         <span class="powered-tag__label">powered by</span>
         <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
-      </a>
+      </div>
     </footer>
   `;
 
