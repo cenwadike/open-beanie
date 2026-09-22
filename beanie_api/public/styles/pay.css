@@ -2,9 +2,13 @@
   --bg: #0a0a0a;
   --ink: #f7f7f2;
   --muted: rgba(247, 247, 242, 0.58);
-  --purple: #b8c99a;
   --panel: rgba(5, 5, 5, 0.78);
-  --line: rgba(184, 201, 154, 0.34);
+
+  /* Theme: overridden at runtime from ?primaryColor=&secondaryColor= (see pay.js) */
+  --primary-rgb: 184, 201, 154;
+  --secondary-rgb: 98, 72, 176;
+  --line: rgba(var(--primary-rgb), 0.34);
+
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -88,9 +92,104 @@ a {
 /* Tag Container - Placed directly inside card */
 .powered-tag-wrapper {
   display: flex;
-  justify-content: end;
+  align-items: center;
+  justify-content: space-between;
   margin-top: clamp(2px, 0.8vh, 8px);
   padding-top: clamp(2px, 0.6vh, 6px);
+}
+
+/* Icon-only "get embed code" button, standard ghost-icon treatment */
+.embed-tag-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.embed-tag-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--ink);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.embed-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+
+.embed-overlay[hidden] {
+  display: none;
+}
+
+.embed-modal {
+  width: 100%;
+  max-width: 400px;
+  background: rgba(13, 13, 13, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  padding: 18px;
+  color: var(--ink);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+}
+
+.embed-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-size: 0.92rem;
+}
+
+.embed-close {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.embed-close:hover {
+  color: var(--ink);
+}
+
+.embed-snippet {
+  margin: 0 0 12px;
+  padding: 12px;
+  background: rgba(8, 8, 7, 0.6);
+  border: 1px solid rgba(var(--primary-rgb), 0.25);
+  border-radius: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: rgba(247, 247, 242, 0.9);
+}
+
+.embed-modal .copy-btn {
+  width: 100%;
+  margin-bottom: 6px;
+}
+
+.embed-modal .status-hint {
+  margin: 0;
 }
 
 /* Privy-style Pill Tag */
@@ -107,28 +206,24 @@ a {
 }
 
 .powered-tag:hover {
-  background: rgba(255, 255, 255, 0.09);
   color: rgba(255, 255, 255, 0.9);
 }
 
-.powered-tag .tag-label {
+.powered-tag__label {
+  font-family: 'Slackey', cursive, sans-serif;
   font-weight: 400;
   letter-spacing: 0.02em;
+  font-size: 0.6rem;
 }
 
-.powered-tag .wordmark {
+.powered-tag__mark {
   font-family: 'Slackey', cursive, sans-serif;
   font-size: 0.75rem;
   color: #fff;
 }
 
-.powered-tag .colon {
+.powered-tag__dot {
   color: #a855f7;
-}
-
-.powered-tag .tag-label {
-  font-family: 'Slackey', cursive, sans-serif;
-  font-size: 0.6rem;
 }
 
 .doodle-field {
@@ -137,8 +232,8 @@ a {
   z-index: 0;
   overflow: hidden;
   background:
-    radial-gradient(circle at 70% 14%, rgba(184, 201, 154, 0.16), transparent 22%),
-    radial-gradient(circle at 22% 22%, rgba(98, 72, 176, 0.16), transparent 28%),
+    radial-gradient(circle at 70% 14%, rgba(var(--primary-rgb), 0.16), transparent 22%),
+    radial-gradient(circle at 22% 22%, rgba(var(--secondary-rgb), 0.16), transparent 28%),
     linear-gradient(rgba(4, 4, 4, 0.82), rgba(4, 4, 4, 0.91));
 }
 
@@ -239,8 +334,8 @@ a {
 }
 
 .pay-route.active {
-  border-color: rgba(184, 201, 154, 0.7);
-  background: rgba(184, 201, 154, 0.12);
+  border-color: rgba(var(--primary-rgb), 0.7);
+  background: rgba(var(--primary-rgb), 0.12);
 }
 
 .pay-route-icon {
@@ -284,7 +379,7 @@ a {
 .address-display-card {
   border-radius: 12px;
   background: rgba(8, 8, 7, 0.6);
-  border: 1px solid rgba(184, 201, 154, 0.25);
+  border: 1px solid rgba(var(--primary-rgb), 0.25);
   padding: clamp(10px, 1.8vh, 14px);
   display: flex;
   flex-direction: column;
@@ -303,9 +398,9 @@ a {
 
 .copy-btn {
   min-height: 38px;
-  border: 1px solid rgba(184, 201, 154, 0.4);
+  border: 1px solid rgba(var(--primary-rgb), 0.4);
   border-radius: 8px;
-  background: rgba(184, 201, 154, 0.12);
+  background: rgba(var(--primary-rgb), 0.12);
   color: var(--ink);
   cursor: pointer;
   font-size: 0.82rem;
@@ -314,7 +409,7 @@ a {
 }
 
 .copy-btn:hover {
-  background: rgba(184, 201, 154, 0.22);
+  background: rgba(var(--primary-rgb), 0.22);
   transform: translateY(-1px);
 }
 

@@ -32,12 +32,139 @@
 
   const poweredTagHtml = `
     <footer class="powered-tag-wrapper">
+      <div class="powered-tag" aria-label="Powered by Beanie">
+        <span class="powered-tag__label">powered by</span>
+        <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
+      </div>
+    </footer>
+  `;
+
+  const embedIconSvg = `
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="8 6 2 12 8 18"></polyline>
+      <polyline points="16 6 22 12 16 18"></polyline>
+    </svg>
+  `;
+
+  // Same footer as poweredTagHtml, plus a "get embed code" icon button.
+  // Only used where `routes` actually exist — never on error states.
+  const poweredTagWithEmbedHtml = `
+    <footer class="powered-tag-wrapper">
+      <button type="button" class="embed-tag-btn" aria-label="Copy as widget" title="Copy as widget">
+        ${embedIconSvg}
+      </button>
       <a class="powered-tag" href="/" aria-label="Powered by Beanie">
-        <span class="tag-label">powered by</span>
-        <span class="wordmark">bean<span class="colon">:</span>ie</span>
+        <span class="powered-tag__label">powered by</span>
+        <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
       </a>
     </footer>
   `;
+
+  // --- Embed code: built entirely from what this exact page already knows —
+  // its own origin, its own routes, its own current theme. Nothing to re-enter.
+  function rgbVarToHex(varName, fallback) {
+    const raw = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+    const parts = raw.split(",").map((n) => parseInt(n.trim(), 10));
+    if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return fallback;
+    return "#" + parts.map((n) => n.toString(16).padStart(2, "0")).join("");
+  }
+
+  function buildEmbedSnippet(routes) {
+    const params = new URLSearchParams(window.location.search);
+    const attrs = [];
+
+    // 1. Always include data-lane if available
+    const lane = params.get("lane");
+    if (lane) {
+      attrs.push(["data-lane", lane]);
+    }
+
+    // 2. Always pass the explicit routes so external sites don't rely on local storage/DB lookup
+    if (routes.length > 0) {
+      attrs.push(["data-routes", routes.map((r) => `${r.chain.toUpperCase()}:${r.address}`).join(",")]);
+    }
+
+    // 3. Keep current colors
+    attrs.push(["data-primary-color", rgbVarToHex("--primary-rgb", "#b8c99a")]);
+    attrs.push(["data-secondary-color", rgbVarToHex("--secondary-rgb", "#6248b0")]);
+
+    const attrLines = attrs.map(([k, v]) => `  ${k}="${v}"`).join("\n");
+    return `<div\n  data-beanie-checkout\n${attrLines}\n></div>\n<script src="${window.location.origin}/embed.js"></script>`;
+  }
+
+  function ensureEmbedOverlay() {
+    let overlay = document.getElementById("embedOverlay");
+    if (overlay) return overlay;
+
+    overlay = document.createElement("div");
+    overlay.id = "embedOverlay";
+    overlay.className = "embed-overlay";
+    overlay.hidden = true;
+    overlay.innerHTML = `
+      <div class="embed-modal" role="dialog" aria-modal="true" aria-label="Copy as widget">
+        <div class="embed-modal-head">
+          <strong>Copy as widget</strong>
+          <button type="button" class="embed-close" aria-label="Close">×</button>
+        </div>
+        <pre class="embed-snippet" id="embedSnippetText"></pre>
+        <button type="button" class="copy-btn" id="embedCopyBtn">Copy</button>
+        <p class="status-hint">Uses the routing and colors you're viewing right now.</p>
+      </div>
+    `;
+    document.body.append(overlay);
+
+    const close = () => { overlay.hidden = true; };
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector(".embed-close").addEventListener("click", close);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !overlay.hidden) close();
+    });
+
+    return overlay;
+  }
+
+  function openEmbedOverlay(routes) {
+    const overlay = ensureEmbedOverlay();
+    const snippet = buildEmbedSnippet(routes);
+    overlay.querySelector("#embedSnippetText").textContent = snippet;
+
+    const copyBtn = overlay.querySelector("#embedCopyBtn");
+    copyBtn.textContent = "Copy";
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(snippet);
+        copyBtn.textContent = "Copied";
+        notify("Widget copied to clipboard");
+      } catch {
+        notify("Failed to copy widget");
+        return;
+      }
+      setTimeout(() => { overlay.hidden = true; }, 500);
+    };
+
+    overlay.hidden = false;
+  }
+
+  // Embed theming: ?primaryColor=RRGGBB&secondaryColor=RRGGBB (# optional).
+  // Anything else invalid is ignored and the built-in default theme is kept.
+  function applyEmbedTheme() {
+    const params = new URLSearchParams(window.location.search);
+    const HEX = /^#?([0-9a-f]{6})$/i;
+
+    const toRgb = (input) => {
+      const match = HEX.exec(input || "");
+      if (!match) return null;
+      const hex = match[1];
+      return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(", ");
+    };
+
+    const primaryRgb = toRgb(params.get("primaryColor"));
+    if (primaryRgb) document.documentElement.style.setProperty("--primary-rgb", primaryRgb);
+
+    const secondaryRgb = toRgb(params.get("secondaryColor"));
+    if (secondaryRgb) document.documentElement.style.setProperty("--secondary-rgb", secondaryRgb);
+  }
 
   function bytesToHex(bytes) {
     return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -468,11 +595,12 @@
           `).join("")}
         </div>
         <p class="status-hint">Select a payment network above to continue.</p>  
-        ${poweredTagHtml}
+        ${poweredTagWithEmbedHtml}
         `;
         laneCard.querySelectorAll(".pay-route").forEach((btn) => {
           btn.addEventListener("click", () => { activeIndex = Number(btn.dataset.index); buildHtml(); });
         });
+        laneCard.querySelector(".embed-tag-btn")?.addEventListener("click", () => openEmbedOverlay(routes));
         return;
       }
 
@@ -516,7 +644,7 @@
       <img src="${qrApiUrl}" alt="Scan to Pay QR Code" class="qr-code-img" width="240" height="240" />
       <p style="font-size: 0.82rem; margin-top: 0.5rem; opacity: 0.8;">Scan and Pay on ${escapeHtml(chainName)}</p>
     </div>
-    ${poweredTagHtml}
+    ${poweredTagWithEmbedHtml}
   `;
 
         laneCard.querySelector("#copyBtn")?.addEventListener("click", async () => {
@@ -561,7 +689,7 @@
         Scan and Authorize Transfer
       </p>
     </div>
-    ${poweredTagHtml}
+    ${poweredTagWithEmbedHtml}
   `;
 
         laneCard.querySelector("#amountInput")?.addEventListener("input", (e) => {
@@ -655,6 +783,7 @@
       laneCard.querySelectorAll(".pay-route").forEach((btn) => {
         btn.addEventListener("click", () => { activeIndex = Number(btn.dataset.index); buildHtml(); });
       });
+      laneCard.querySelector(".embed-tag-btn")?.addEventListener("click", () => openEmbedOverlay(routes));
       laneCard.querySelector("#modeToggle")?.addEventListener("change", (e) => {
         isGaslessMode = e.target.checked;
         buildHtml();
@@ -674,6 +803,7 @@
   });
 
   async function init() {
+    applyEmbedTheme();
     try {
       const routes = await resolveRoutes();
       if (!routes.length) {
