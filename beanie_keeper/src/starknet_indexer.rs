@@ -23,6 +23,26 @@ use std::time::{Duration, Instant};
 use crate::config::{Deposit, StarknetConfig};
 use crate::log_cache::LogCache;
 
+/// CCTP routing credentials as carried by `ReceiverAnnounced`, in the exact
+/// felts the factory hashed into the receiver's deploy salt (chain as a short
+/// string, recipient as the u256's low/high halves). All zero = same-chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StarknetRoute {
+    pub chain: Felt,
+    pub recipient_low: Felt,
+    pub recipient_high: Felt,
+}
+
+/// One receiver the registry told us about.
+#[derive(Clone, Copy, Debug)]
+pub struct StarknetReceiverRecord {
+    pub merchant: Felt,
+    pub receiver: Felt,
+    /// `Some` for receivers learned from `ReceiverAnnounced`. `MerchantRegistered`
+    /// doesn't carry a route, but a registered receiver is already deployed.
+    pub route: Option<StarknetRoute>,
+}
+
 pub const STARKNET_REGISTRY_SCAN_ID: &str = "starknet:registry";
 pub const STARKNET_DEPOSITS_SCAN_ID: &str = "starknet:deposits";
 
@@ -432,7 +452,7 @@ fn log_backfill_progress(
 }
 
 pub struct StarknetCatchupSummary {
-    pub merchants: Vec<(Felt, Felt)>,
+    pub merchants: Vec<StarknetReceiverRecord>,
     pub deposits: Vec<Deposit>,
     pub caught_up_to_block: Option<u64>,
 }
@@ -443,7 +463,7 @@ pub async fn discover_merchants(
     cfg: &StarknetConfig,
     cache: &LogCache,
     to_block: u64,
-) -> Result<Vec<(Felt, Felt)>> {
+) -> Result<Vec<StarknetReceiverRecord>> {
     info!("Catching up on Beanie Starknet Registry started, this may take a while");
     let mut current_from = cache
         .get_checkpoint(STARKNET_REGISTRY_SCAN_ID)?
@@ -480,11 +500,12 @@ pub async fn discover_merchants(
         .await
         .context("failed fetching Starknet registry events")?;
 
-        // Neither `ReceiverAnnounced { merchant, receiver, nonce }` nor
-        // `MerchantRegistered { merchant, receiver }` in merchant_factory.cairo
-        // annotates any field `#[key]`, so every field lands in the event's
-        // `data` array — `keys` is always just `[selector]`. Read `data`, not
-        // `keys`. The two variants have different arities (3 fields vs. 2),
+        // Neither `ReceiverAnnounced { merchant, receiver, cctp_mint_chain,
+        // cctp_mint_recipient }` nor `MerchantRegistered { merchant, receiver }`
+        // in merchant_factory.cairo annotates any field `#[key]`, so every field
+        // lands in the event's `data` array — `keys` is always just `[selector]`.
+        // Read `data`, not `keys`. The two variants have different arities (5
+        // felts vs. 2, the u256 recipient being two),
         // so they're parsed on separate branches rather than one shared
         // `(m, r)` extraction. A shape mismatch is warned about instead of
         // silently dropped — that silence is exactly what let this bug run
@@ -494,7 +515,11 @@ pub async fn discover_merchants(
                 total_matching_events += 1;
                 // data = [merchant, receiver]
                 match (evt.data.first(), evt.data.get(1)) {
-                    (Some(&m), Some(&r)) => all_merchants.push((m, r)),
+                    (Some(&m), Some(&r)) => all_merchants.push(StarknetReceiverRecord {
+                        merchant: m,
+                        receiver: r,
+                        route: None,
+                    }),
                     _ => warn!(
                         "MerchantRegistered event at block {} (tx {}) had unexpected data shape (len={}), skipping",
                         evt.block_number,
@@ -504,12 +529,25 @@ pub async fn discover_merchants(
                 }
             } else if evt.selector == receiver_announced {
                 total_matching_events += 1;
-                // data = [merchant, receiver, nonce] — nonce isn't consumed
-                // here since nothing downstream of discover_merchants needs
-                // it yet; deliberately left unread rather than widening the
-                // return type for an unused value.
-                match (evt.data.first(), evt.data.get(1)) {
-                    (Some(&m), Some(&r)) => all_merchants.push((m, r)),
+                // data = [merchant, receiver, cctp_mint_chain,
+                //         recipient_low, recipient_high]
+                match (
+                    evt.data.first(),
+                    evt.data.get(1),
+                    evt.data.get(2),
+                    evt.data.get(3),
+                    evt.data.get(4),
+                ) {
+                    (Some(&m), Some(&r), Some(&chain), Some(&low), Some(&high)) => all_merchants
+                        .push(StarknetReceiverRecord {
+                            merchant: m,
+                            receiver: r,
+                            route: Some(StarknetRoute {
+                                chain,
+                                recipient_low: low,
+                                recipient_high: high,
+                            }),
+                        }),
                     _ => warn!(
                         "ReceiverAnnounced event at block {} (tx {}) had unexpected data shape (len={}), skipping",
                         evt.block_number,
@@ -559,7 +597,7 @@ pub async fn run_starknet_catchup(
         .await
         .context("failed fetching current Starknet head")?;
     let merchants = discover_merchants(cfg, cache, head).await?;
-    let receivers: Vec<Felt> = merchants.iter().map(|(_, r)| *r).collect();
+    let receivers: Vec<Felt> = merchants.iter().map(|rec| rec.receiver).collect();
     let deposits = fetch_deposits_since_block(cfg, cache, &receivers, head).await?;
     Ok(StarknetCatchupSummary {
         merchants,

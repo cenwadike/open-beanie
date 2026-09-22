@@ -6,6 +6,11 @@
 // *this* address on *this* chain, then enqueue the on-chain announce.
 // The distinction between standard/stealth lives entirely on the client;
 // this handler has no reason to know which one it's looking at.
+//
+// Every announce also names where the merchant is paid (`target_chain` +
+// `target_recipient`, both mandatory, chosen by the client). They are part of
+// the receiver's on-chain address, so the announce worker forwards them into
+// `announceReceiver` and the announce event carries them for the keeper.
 
 use axum::{
     Json,
@@ -23,6 +28,11 @@ pub struct AnnounceRequest {
     pub address: String,
     pub lane_id: String,
     pub verified_token: String,
+    /// Chain the merchant wants to be paid on. Equal to `chain` = same-chain.
+    pub target_chain: Chain,
+    /// The merchant's address on `target_chain` (the wallet in standard mode,
+    /// the target-chain stealth address in privacy mode).
+    pub target_recipient: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +109,33 @@ pub async fn announce_receiver(
         }
     };
 
+    // 2b. Settlement target: must be a real address on the chosen chain.
+    let target_recipient = match payload.target_chain {
+        Chain::Base | Chain::Ethereum => {
+            match parse_and_sanitize_evm_addr(&payload.target_recipient) {
+                Ok(v) => v,
+                Err(e) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid settlement address: {e}"),
+                    );
+                }
+            }
+        }
+        Chain::Starknet => match parse_and_sanitize_felt(&payload.target_recipient) {
+            Ok(v) => v,
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid settlement address: {e}"),
+                );
+            }
+        },
+        _ => {
+            return err(StatusCode::BAD_REQUEST, "Unsupported settlement chain");
+        }
+    };
+
     // 3. Single rate-limit call site, now against a proven credential_id.
     if let Err(msg) = state.limiter.check(addr.ip(), &address, &credential_id) {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
@@ -109,6 +146,8 @@ pub async fn announce_receiver(
         chain: payload.chain,
         merchant_address: address,
         credential_id,
+        target_chain: payload.target_chain,
+        target_recipient,
     };
 
     if let Err(e) = state.announce_tx.send(task).await {

@@ -80,6 +80,8 @@ pub struct AnnounceTask {
     pub chain: Chain,
     pub merchant_address: String,
     pub credential_id: String,
+    pub target_chain: Chain,
+    pub target_recipient: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,9 +166,10 @@ pub(crate) fn derive_felt_from_foreign_address(addr: &str) -> Felt {
 abigen!(
     MerchantFactory,
     r#"[
+    
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)
         function getReceiverCount(address merchant) external view returns (uint256)
-        function announceReceiver(address merchant) external
+        function announceReceiver(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external
     ]"#;
     MerchantWebhookRegistry,
     r#"[

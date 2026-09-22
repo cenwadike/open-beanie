@@ -55,7 +55,9 @@
     "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
   const STARKNET_PREDICT_SELECTOR =
     "0x28d4d0fe094b456bae50b2d871903c993ba153ec519b7f4f1c71252fa4304cf";
-  const EVM_PREDICT_SELECTOR = "0x6a6a0dff";
+  // predictReceiverAddress(address,bytes32,bytes32) — the CCTP route is part of
+  // the receiver's address, so it is an argument of the prediction.
+  const EVM_PREDICT_SELECTOR = "0xf05b69dd";
 
   const STORAGE_LANES = "beanie.lanes.v1";
   const STORAGE_HISTORY = "beanie.history.v1";
@@ -324,12 +326,49 @@
     return `0x${feltHex}`;
   }
 
-  async function predictEvmReceiver(merchantAddress) {
+  /* ---------- CCTP route (part of the receiver address) ----------
+   * Must byte-match create_workers.rs (`evm_route` / `starknet_route`).
+   * Same chain as the receiver => all zeros, as both factories require.
+   * Otherwise: chain name left-aligned in a bytes32 (EVM) / as a short-string
+   * felt (Starknet), and the recipient as a 32-byte big-endian value split
+   * into (low, high) 128-bit halves for Starknet's u256. */
+  const ZERO32 = `0x${"0".repeat(64)}`;
+  const MASK128 = (1n << 128n) - 1n;
+
+  function cctpRoute(sourceChain, targetChain, targetRecipient) {
+    if (!targetChain || !targetRecipient) {
+      throw new Error("Settlement chain and recipient are required");
+    }
+    if (sourceChain === targetChain) {
+      return { chain32: ZERO32, recipient32: ZERO32, chainFelt: "0x0", low: "0x0", high: "0x0" };
+    }
+    const nameHex = Array.from(new TextEncoder().encode(targetChain))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const recipient32 = `0x${targetRecipient.trim().replace(/^0x/i, "").toLowerCase().padStart(64, "0")}`;
+    const r = BigInt(recipient32);
+    return {
+      chain32: `0x${nameHex.padEnd(64, "0")}`,
+      recipient32,
+      chainFelt: `0x${nameHex}`,
+      low: `0x${(r & MASK128).toString(16)}`,
+      high: `0x${(r >> 128n).toString(16)}`,
+    };
+  }
+
+  // The merchant's identity on a given chain. A wallet valid on that chain is
+  // its own identity there.
+  const merchantIdentity = (chainKey, wallet) =>
+    chainKey === "BASE" ? toEvmMerchant(wallet) : toStarknetMerchant(wallet);
+
+  async function predictEvmReceiver(merchantAddress, route) {
     const chain = CHAINS.BASE;
     const merchant = await toEvmMerchant(merchantAddress);
     const data =
       EVM_PREDICT_SELECTOR +
-      merchant.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+      merchant.replace(/^0x/i, "").toLowerCase().padStart(64, "0") +
+      route.chain32.slice(2) +
+      route.recipient32.slice(2);
     const predictedAddrHex = await rpcCall(chain.rpc, "eth_call", [
       { to: chain.factory, data },
       "latest",
@@ -342,14 +381,14 @@
     };
   }
 
-  async function predictStarknetReceiver(merchantAddress) {
+  async function predictStarknetReceiver(merchantAddress, route) {
     const chain = CHAINS.STARKNET;
     const merchant = await toStarknetMerchant(merchantAddress);
     const predictRes = await rpcCall(chain.rpc, "starknet_call", [
       {
         contract_address: chain.factory,
         entry_point_selector: STARKNET_PREDICT_SELECTOR,
-        calldata: [merchant],
+        calldata: [merchant, route.chainFelt, route.low, route.high],
       },
       "latest",
     ]);
@@ -361,15 +400,16 @@
     };
   }
 
-  async function derivePublicReceivers(merchantAddress) {
+  async function derivePublicReceivers(merchantAddress, targetChain, targetRecipient) {
     const receivers = [];
 
     for (const chainKey of SOURCE_CHAINS) {
       try {
+        const route = cctpRoute(chainKey, targetChain, targetRecipient);
         const predicted =
           chainKey === "BASE"
-            ? await predictEvmReceiver(merchantAddress)
-            : await predictStarknetReceiver(merchantAddress);
+            ? await predictEvmReceiver(merchantAddress, route)
+            : await predictStarknetReceiver(merchantAddress, route);
         if (!predicted?.address) {
           throw new Error(`empty predict result on ${chainKey}`);
         }
@@ -386,7 +426,12 @@
     return receivers;
   }
 
-  async function announceReceiverOnChain(chain, address, laneId, verifiedToken) {
+  // targetChain / targetRecipient are mandatory: they are part of the receiver's
+  // address, so the backend announces (and later registers) exactly these.
+  async function announceReceiverOnChain(chain, address, laneId, verifiedToken, targetChain, targetRecipient) {
+    if (!targetChain || !targetRecipient) {
+      throw new Error("Settlement chain and recipient are required");
+    }
     const res = await fetch(API_CREATE, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -395,6 +440,8 @@
         address,
         lane_id: laneId,
         verified_token: verifiedToken,
+        target_chain: CHAIN_WIRE[targetChain] || targetChain,
+        target_recipient: targetRecipient,
       }),
     });
     const text = await res.text();
@@ -406,11 +453,11 @@
     return text ? JSON.parse(text) : {};
   }
 
-  async function announceAllSourceChains(merchantAddress, laneId, verifiedToken) {
+  async function announceAllSourceChains(merchantAddress, laneId, verifiedToken, targetChain, targetRecipient) {
     const results = [];
     for (const chain of SOURCE_CHAINS) {
       try {
-        const out = await announceReceiverOnChain(chain, merchantAddress, laneId, verifiedToken);
+        const out = await announceReceiverOnChain(chain, merchantAddress, laneId, verifiedToken, targetChain, targetRecipient);
         results.push({ chain, ok: true, out });
       } catch (e) {
         results.push({ chain, ok: false, error: e.message || String(e) });
@@ -1075,6 +1122,15 @@
           throw new Error("Could not derive stealth merchant identities.");
         }
 
+        // Where this lane pays out: the lane's own identity on the settlement chain.
+        const targetStealth = stealth.find(
+          (s) => String(s.chain || "").toUpperCase() === targetChain
+        );
+        const targetRecipient = targetStealth?.address;
+        if (!targetRecipient) {
+          throw new Error(`No private identity derived for settlement chain ${targetChain}.`);
+        }
+
         for (const s of stealth) {
           const chain = String(s.chain || "").toUpperCase();
           const stealthMerchant = s.address;
@@ -1082,11 +1138,12 @@
 
           let predicted;
           try {
+            const route = cctpRoute(chain, targetChain, targetRecipient);
             predicted =
               chain === "BASE"
-                ? await predictEvmReceiver(stealthMerchant)
+                ? await predictEvmReceiver(stealthMerchant, route)
                 : chain === "STARKNET"
-                  ? await predictStarknetReceiver(stealthMerchant)
+                  ? await predictStarknetReceiver(stealthMerchant, route)
                   : null;
             if (!predicted) continue;
           } catch (e) {
@@ -1112,7 +1169,7 @@
         if (btn) btn.textContent = "Announcing…";
         for (const r of receivers) {
           try {
-            const out = await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken);
+            const out = await announceReceiverOnChain(r.chain, r.stealthMerchant, laneId, verifiedToken, targetChain, targetRecipient);
             console.log("addresses: ", out)
             if (out?.address) {
               r.address = out.address;
@@ -1127,7 +1184,10 @@
           }
         }
       } else {
-        receivers = (await derivePublicReceivers(merchantAddress)).map((l) => ({
+        // The wallet was validated for targetChain above, so it is its own
+        // identity there — that is the CCTP recipient.
+        const targetRecipient = await merchantIdentity(targetChain, merchantAddress);
+        receivers = (await derivePublicReceivers(merchantAddress, targetChain, targetRecipient)).map((l) => ({
           chain: String(l.chain || "").toUpperCase(),
           address: l.address,
           merchant: l.merchant,
@@ -1148,7 +1208,9 @@
               r.chain,
               r.merchant,
               laneId,
-              verifiedToken
+              verifiedToken,
+              targetChain,
+              targetRecipient
             );
             announceResults.push({ chain: r.chain, ok: true, out });
           } catch (e) {

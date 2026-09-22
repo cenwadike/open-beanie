@@ -6,6 +6,7 @@
 
 use crate::starknet_indexer::StarknetTip;
 use crate::starknet_keeper::StarknetAccount;
+use log::warn;
 use starknet::{accounts::ConnectedAccount, providers::Provider};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -31,7 +32,7 @@ pub async fn run_starknet_tip_source(
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("[starknet-tip] block_number poll failed: {e:#}"),
+            Err(e) => warn!("[starknet-tip] block_number poll failed: {e:#}"),
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }

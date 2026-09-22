@@ -72,9 +72,29 @@ const REGISTRY_CHUNK_BLOCKS: u64 = 200_000;
 const REORG_SAFETY_BLOCKS: u64 = 128;
 
 const MERCHANT_REGISTERED_SIG: &str = "MerchantRegistered(address,address)";
-const RECEIVER_ANNOUNCED_SIG: &str = "ReceiverAnnounced(address,address,uint256)";
+const RECEIVER_ANNOUNCED_SIG: &str = "ReceiverAnnounced(address,address,bytes32,bytes32)";
 const WEBHOOK_URL_SET_SIG: &str = "WebhookUrlSet(address,string)";
 const TRANSFER_SIG: &str = "Transfer(address,address,uint256)";
+
+/// CCTP routing credentials as carried by `ReceiverAnnounced`: the chain-name
+/// key and mint recipient exactly as the factory hashed them into the
+/// receiver's salt. Both zero means same-chain settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvmRoute {
+    pub chain: [u8; 32],
+    pub recipient: [u8; 32],
+}
+
+/// One receiver the registry told us about.
+#[derive(Clone, Copy, Debug)]
+pub struct EvmReceiverRecord {
+    pub merchant: Address,
+    pub receiver: Address,
+    /// `Some` for receivers learned from `ReceiverAnnounced`. `MerchantRegistered`
+    /// doesn't carry a route, but a registered receiver is already deployed, so
+    /// nothing downstream needs one for it.
+    pub route: Option<EvmRoute>,
+}
 
 fn topic_hex(sig: &str) -> String {
     format!("0x{}", hex::encode(keccak256(sig)))
@@ -606,7 +626,7 @@ pub async fn discover_registry_activity(
     cfg: &EvmConfig,
     cache: &LogCache,
     to_block: u64,
-) -> Result<(Vec<(Address, Address)>, Vec<(Address, String)>)> {
+) -> Result<(Vec<EvmReceiverRecord>, Vec<(Address, String)>)> {
     // debug, not info: this is called from `process_evm_tip` on nearly
     // every qualifying live tip, not just at startup. The overwhelming
     // majority of calls find nothing new — see the conditional level below.
@@ -653,7 +673,7 @@ pub async fn discover_registry_activity(
 /// The COMPLETE registry state as of `scanned_to`, independent of any saved
 /// checkpoint.
 pub struct RegistrySnapshot {
-    pub merchants: Vec<(Address, Address)>,
+    pub merchants: Vec<EvmReceiverRecord>,
     pub webhooks: Vec<(Address, String)>,
     pub scanned_to: u64,
 }
@@ -662,18 +682,42 @@ pub struct RegistrySnapshot {
 /// cache stays chain-library agnostic, as `log_cache.rs` intends.
 #[derive(Serialize, Deserialize)]
 struct RegistryChunk {
-    /// (merchant, receiver)
-    merchants: Vec<(String, String)>,
+    merchants: Vec<CachedReceiver>,
     /// (merchant, url), in block order — later entries win
     webhooks: Vec<(String, String)>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CachedReceiver {
+    merchant: String,
+    receiver: String,
+    /// 0x-hex bytes32, present only for `ReceiverAnnounced` rows.
+    #[serde(default)]
+    cctp_chain: Option<String>,
+    #[serde(default)]
+    cctp_recipient: Option<String>,
+}
+
+fn bytes32_hex(b: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(b))
+}
+
+fn parse_bytes32(s: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
 impl RegistryChunk {
-    fn from_found(merchants: &[(Address, Address)], webhooks: &[(Address, String)]) -> Self {
+    fn from_found(merchants: &[EvmReceiverRecord], webhooks: &[(Address, String)]) -> Self {
         Self {
             merchants: merchants
                 .iter()
-                .map(|(m, r)| (format!("{m:?}"), format!("{r:?}")))
+                .map(|rec| CachedReceiver {
+                    merchant: format!("{:?}", rec.merchant),
+                    receiver: format!("{:?}", rec.receiver),
+                    cctp_chain: rec.route.map(|r| bytes32_hex(&r.chain)),
+                    cctp_recipient: rec.route.map(|r| bytes32_hex(&r.recipient)),
+                })
                 .collect(),
             webhooks: webhooks
                 .iter()
@@ -682,11 +726,24 @@ impl RegistryChunk {
         }
     }
 
-    fn into_found(self) -> (Vec<(Address, Address)>, Vec<(Address, String)>) {
+    fn into_found(self) -> (Vec<EvmReceiverRecord>, Vec<(Address, String)>) {
         let merchants = self
             .merchants
             .iter()
-            .filter_map(|(m, r)| Some((m.parse::<Address>().ok()?, r.parse::<Address>().ok()?)))
+            .filter_map(|c| {
+                let route = match (&c.cctp_chain, &c.cctp_recipient) {
+                    (Some(chain), Some(recipient)) => Some(EvmRoute {
+                        chain: parse_bytes32(chain)?,
+                        recipient: parse_bytes32(recipient)?,
+                    }),
+                    _ => None,
+                };
+                Some(EvmReceiverRecord {
+                    merchant: c.merchant.parse::<Address>().ok()?,
+                    receiver: c.receiver.parse::<Address>().ok()?,
+                    route,
+                })
+            })
             .collect();
         let webhooks = self
             .webhooks
@@ -729,7 +786,7 @@ pub async fn rebuild_registry_state(
 
     info!("Rebuilding EVM registry state: blocks {from_block}..={to_block}");
 
-    let mut merchants: Vec<(Address, Address)> = Vec::new();
+    let mut merchants: Vec<EvmReceiverRecord> = Vec::new();
     let mut webhooks: Vec<(Address, String)> = Vec::new();
     let mut scanned_to: Option<u64> = None;
     let (mut cache_hits, mut fetched) = (0u32, 0u32);
@@ -830,7 +887,7 @@ async fn discover_registry_range(
     to_block: u64,
     max_window: u64,
     persist_checkpoint: bool,
-) -> Result<(Vec<(Address, Address)>, Vec<(Address, String)>, Option<u64>)> {
+) -> Result<(Vec<EvmReceiverRecord>, Vec<(Address, String)>, Option<u64>)> {
     let merchant_reg_topic = topic_hex(MERCHANT_REGISTERED_SIG);
     let receiver_announced_topic = topic_hex(RECEIVER_ANNOUNCED_SIG);
     let webhook_set_topic = topic_hex(WEBHOOK_URL_SET_SIG);
@@ -878,9 +935,14 @@ async fn discover_registry_range(
                         continue;
                     };
                     let receiver = Address::from_slice(&data_bytes[12..32]);
-                    merchants.push((merchant, receiver));
+                    merchants.push(EvmReceiverRecord {
+                        merchant,
+                        receiver,
+                        route: None,
+                    });
                 } else if topic0 == receiver_announced_topic {
-                    if log.topics.len() < 3 {
+                    // data = cctpMintChain | cctpMintRecipient, 32 bytes each
+                    if log.topics.len() < 3 || data_bytes.len() < 64 {
                         continue;
                     }
                     let (Some(merchant), Some(receiver)) = (
@@ -889,7 +951,15 @@ async fn discover_registry_range(
                     ) else {
                         continue;
                     };
-                    merchants.push((merchant, receiver));
+                    let mut chain = [0u8; 32];
+                    let mut recipient = [0u8; 32];
+                    chain.copy_from_slice(&data_bytes[0..32]);
+                    recipient.copy_from_slice(&data_bytes[32..64]);
+                    merchants.push(EvmReceiverRecord {
+                        merchant,
+                        receiver,
+                        route: Some(EvmRoute { chain, recipient }),
+                    });
                 } else if topic0 == webhook_set_topic {
                     if log.topics.len() < 2 {
                         continue;
@@ -1043,7 +1113,7 @@ pub async fn fetch_deposits_since_block(
 /// API key being configured — `subsquid_portal_url` is required
 /// (`EvmConfig::from_env` already enforces that), so this always runs.
 pub struct EvmCatchupSummary {
-    pub merchants: Vec<(Address, Address)>,
+    pub merchants: Vec<EvmReceiverRecord>,
     pub webhooks: Vec<(Address, String)>,
     pub deposits: Vec<Deposit>,
     pub caught_up_to_block: Option<u64>,
@@ -1058,7 +1128,7 @@ pub async fn run_evm_catchup(cfg: &EvmConfig, cache: &LogCache) -> Result<EvmCat
     // since the saved checkpoint. The deposit filter is built from this set.
     let snapshot = rebuild_registry_state(cfg, cache, head).await?;
 
-    let mut receivers: Vec<Address> = snapshot.merchants.iter().map(|(_, r)| *r).collect();
+    let mut receivers: Vec<Address> = snapshot.merchants.iter().map(|rec| rec.receiver).collect();
     receivers.sort();
     receivers.dedup();
     info!(

@@ -17,8 +17,10 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
 
 use crate::models::{ChainXReceiverLocal, MerchantFactory};
+use beanie_keeper::evm_indexer::{EvmReceiverRecord, EvmRoute};
 use beanie_keeper::evm_ws::{self, EvmTip};
 use beanie_keeper::log_cache::LogCache;
+use beanie_keeper::starknet_indexer::{StarknetReceiverRecord, StarknetRoute};
 use beanie_keeper::starknet_keeper::StarknetAccount;
 
 abigen!(
@@ -165,11 +167,53 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(60);
 /// same way it always was.
 const STARKNET_MIN_LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// What the registry told us about a receiver: who it belongs to and, for
+/// receivers learned from `ReceiverAnnounced`, the CCTP route that is part of
+/// its address. Registration replays that route verbatim.
+#[derive(Clone, Copy)]
+struct EvmReceiverInfo {
+    merchant: Address,
+    route: Option<EvmRoute>,
+}
+
+#[derive(Clone, Copy)]
+struct StarknetReceiverInfo {
+    merchant: Felt,
+    route: Option<StarknetRoute>,
+}
+
+/// Never let a route-less `MerchantRegistered` row erase a route we already
+/// learned from `ReceiverAnnounced`.
+fn remember_evm_receiver(map: &mut HashMap<Address, EvmReceiverInfo>, rec: EvmReceiverRecord) {
+    let entry = map.entry(rec.receiver).or_insert(EvmReceiverInfo {
+        merchant: rec.merchant,
+        route: None,
+    });
+    entry.merchant = rec.merchant;
+    if rec.route.is_some() {
+        entry.route = rec.route;
+    }
+}
+
+fn remember_starknet_receiver(
+    map: &mut HashMap<Felt, StarknetReceiverInfo>,
+    rec: StarknetReceiverRecord,
+) {
+    let entry = map.entry(rec.receiver).or_insert(StarknetReceiverInfo {
+        merchant: rec.merchant,
+        route: None,
+    });
+    entry.merchant = rec.merchant;
+    if rec.route.is_some() {
+        entry.route = rec.route;
+    }
+}
+
 /// Shared, cross-tick state. Bundled into one struct so `process_evm_tip`
 /// and the reconciliation pass operate on identical state instead of two
 /// slightly-diverged copies.
 struct EvmState {
-    merchant_map: HashMap<Address, Address>,
+    merchant_map: HashMap<Address, EvmReceiverInfo>,
     /// Fix #5: persistent across ticks, only ever added to.
     webhook_map: HashMap<String, String>,
     /// Fix #3: once true, never checked again. Only ever set once a
@@ -179,7 +223,7 @@ struct EvmState {
 }
 
 struct StarknetState {
-    merchant_map: HashMap<Felt, Felt>,
+    merchant_map: HashMap<Felt, StarknetReceiverInfo>,
     deployed: HashSet<Felt>,
     next_nonce: Option<Felt>,
     /// Wall-clock time of the last live-tip-triggered registry/deposit
@@ -237,8 +281,8 @@ async fn run_evm_worker(
         }
     };
 
-    for (merchant, receiver) in &summary.merchants {
-        state.merchant_map.insert(*receiver, *merchant);
+    for rec in &summary.merchants {
+        remember_evm_receiver(&mut state.merchant_map, *rec);
     }
     for (merchant, url) in &summary.webhooks {
         state
@@ -382,8 +426,8 @@ async fn run_starknet_worker(
     if let Ok(summary) =
         beanie_keeper::starknet_indexer::run_starknet_catchup(&starknet_cfg, &log_cache).await
     {
-        for (merchant, receiver) in &summary.merchants {
-            sn_state.merchant_map.insert(*receiver, *merchant);
+        for rec in &summary.merchants {
+            remember_starknet_receiver(&mut sn_state.merchant_map, *rec);
         }
 
         act_on_starknet_deposits(
@@ -493,8 +537,8 @@ async fn process_evm_tip(
             .await
         {
             Ok((found_merchants, found_webhooks)) => {
-                for (merchant, receiver) in found_merchants {
-                    state.merchant_map.insert(receiver, merchant);
+                for rec in found_merchants {
+                    remember_evm_receiver(&mut state.merchant_map, rec);
                 }
                 for (merchant, url) in found_webhooks {
                     // Fix #5: insert into the persistent map, never reset it.
@@ -680,16 +724,21 @@ async fn sweep_evm_receivers(
         let exists = state.deployed.contains(&receiver_addr);
 
         if !exists {
-            let merchant = match state.merchant_map.get(&receiver_addr) {
-                Some(m) => *m,
+            let (merchant, route) = match state.merchant_map.get(&receiver_addr) {
+                Some(info) => (info.merchant, info.route),
                 None => {
                     error!("no merchant mapping for undeployed receiver {receiver_addr:?}");
                     continue;
                 }
             };
-
-            let cctp_chain_bytes = [0u8; 32];
-            let recipient_bytes = [0u8; 32];
+            // The route is part of the receiver's address, so it must be the
+            // one from its ReceiverAnnounced event, never a default.
+            let Some(route) = route else {
+                error!("no announced route for undeployed receiver {receiver_addr:?}");
+                continue;
+            };
+            let cctp_chain_bytes = route.chain;
+            let recipient_bytes = route.recipient;
 
             let reg_call = MerchantFactory::new(evm_cfg.factory_address, evm_client.clone())
                 .register_merchant(merchant, cctp_chain_bytes, recipient_bytes);
@@ -803,7 +852,7 @@ async fn act_on_evm_deposits(
             .merchant_map
             .get(&deposit.receiver.parse().unwrap_or_default());
         let merchant_addr = match merchant {
-            Some(m) => m,
+            Some(info) => &info.merchant,
             None => {
                 error!("no merchant known for receiver {}", deposit.receiver);
                 continue;
@@ -962,8 +1011,8 @@ async fn process_starknet_tip(
         .await
     {
         Ok(found) => {
-            for (merchant, receiver) in found {
-                state.merchant_map.insert(receiver, merchant);
+            for rec in found {
+                remember_starknet_receiver(&mut state.merchant_map, rec);
             }
         }
         Err(e) => error!("starknet discover_merchants failed: {e:#}"),
@@ -1060,8 +1109,8 @@ async fn act_on_starknet_deposits(
     let mut pending_deploys: Vec<Felt> = Vec::new();
 
     for &receiver in &unique {
-        let merchant = match state.merchant_map.get(&receiver) {
-            Some(m) => *m,
+        let (merchant, route) = match state.merchant_map.get(&receiver) {
+            Some(info) => (info.merchant, info.route),
             None => continue,
         };
 
@@ -1102,10 +1151,21 @@ async fn act_on_starknet_deposits(
         };
 
         if needs_deploy {
+            // The route is part of the receiver's address, so it must be the
+            // one from its ReceiverAnnounced event, never a default.
+            let Some(route) = route else {
+                error!("no announced route for undeployed receiver {receiver:#x}");
+                continue;
+            };
             calls.push(Call {
                 to: starknet_cfg.factory_address,
                 selector: register_selector,
-                calldata: vec![merchant, Felt::ZERO, Felt::ZERO, Felt::ZERO],
+                calldata: vec![
+                    merchant,
+                    route.chain,
+                    route.recipient_low,
+                    route.recipient_high,
+                ],
             });
             // Do NOT mark state.deployed here — same reasoning as the EVM
             // side. execute_v3(...).send() can fail without the receiver
@@ -1165,7 +1225,7 @@ async fn act_on_starknet_deposits(
         let merchant_for_webhook = state
             .merchant_map
             .get(&merchant_felt)
-            .copied()
+            .map(|info| info.merchant)
             .unwrap_or(merchant_felt);
 
         let merchant_str = format!("{:#x}", merchant_for_webhook);
