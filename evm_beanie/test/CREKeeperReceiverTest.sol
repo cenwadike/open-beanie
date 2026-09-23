@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 import "../src/CREKeeperReceiver.sol";
 import "../src/ChainXReceiver.sol";
-import "../src/MerchantFactory.sol";
+import "../src/ReceiverFactory.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 // Mock USDC token for testing balance transfers and approvals
@@ -40,7 +40,7 @@ contract CREKeeperReceiverTest is Test {
     CREKeeperReceiver public creReceiver;
     MockMulticall3 public multicall;
     ChainXReceiver public receiverImpl;
-    MerchantFactory public factory;
+    ReceiverFactory public factory;
     MockUSDC public token;
 
     // Identities & Roles
@@ -64,7 +64,7 @@ contract CREKeeperReceiverTest is Test {
 
         // 1. Deploy Implementation & Factory
         receiverImpl = new ChainXReceiver();
-        factory = new MerchantFactory(
+        factory = new ReceiverFactory(
             address(receiverImpl),
             address(token),
             treasury,

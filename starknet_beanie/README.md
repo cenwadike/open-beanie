@@ -8,7 +8,7 @@ Smart contracts for Beanie's Starknet leg written in Cairo. Handles deterministi
 ## Contracts Overview
 
 * **`StarknetReceiver.cairo`**: Merchant-specific receiver contract. Receives USDC deposits, calculates fee splits (0.50% total: 90% protocol treasury, 10% caller/keeper incentive), and executes atomic settlement—either via same-chain ERC-20 transfer or cross-chain CCTP `deposit_for_burn` to the merchant's target destination domain.
-* **`MerchantFactory.cairo`**: Deploys deterministic `StarknetReceiver` instances using `deploy_syscall` with salt calculated from the merchant address and nonce. Tracks merchant receiver counts and valid destination domains (`BASE`, `SOLANA`, `ETHEREUM`).
+* **`ReceiverFactory.cairo`**: Deploys deterministic `StarknetReceiver` instances using `deploy_syscall` with salt calculated from the merchant address and nonce. Tracks merchant receiver counts and valid destination domains (`BASE`, `SOLANA`, `ETHEREUM`).
 * **`StealthAccount.cairo`**: A minimal SNIP-6 account, single-purpose: owns stealth pubkey derived off-chain, and execute claims. Can directly create Notes and Shield Tokens on STRK20 pool.
 
 ---
@@ -83,15 +83,15 @@ sncast --profile mainnet declare \
 
 *Note down the returned `class_hash`.*
 
-**2. Declare `MerchantFactory` Contract:**
+**2. Declare `ReceiverFactory` Contract:**
 
 ```bash
 sncast --profile mainnet declare \
-  --contract-name MerchantFactory
+  --contract-name ReceiverFactory
 
 ```
 
-**3. Deploy `MerchantFactory`:**
+**3. Deploy `ReceiverFactory`:**
 
 ```bash
 sncast --profile mainnet deploy \
@@ -108,6 +108,6 @@ sncast --profile mainnet deploy \
 ```
 
 ## Dynamic Contract Instantiations
-* **StarknetReceiver**: Individual merchant receiver instances are not deployed manually. They are deployed dynamically on-demand via deploy_syscall when a merchant calls register_merchant(...) on the deployed MerchantFactory.
+* **StarknetReceiver**: Individual merchant receiver instances are not deployed manually. They are deployed dynamically on-demand via deploy_syscall when a merchant calls register_merchant(...) on the deployed ReceiverFactory.
 
 * **StealthAccount**: Stealth accounts are deployed counterfactually per user off-chain via sncast account deploy or standard AA account factory flows using the declared StealthAccount class hash and passing client_pubkey and cosigner_pubkey as constructor inputs.

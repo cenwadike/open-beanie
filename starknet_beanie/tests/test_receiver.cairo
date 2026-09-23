@@ -1,4 +1,4 @@
-// StarknetReceiver & MerchantFactory test suite
+// StarknetReceiver & ReceiverFactory test suite
 //
 // Invariants tested:
 // - Initialization safety & single-invocation restriction.
@@ -15,11 +15,11 @@ use snforge_std::{
     spy_events, start_cheat_caller_address, stop_cheat_caller_address,
 };
 use starknet::{ContractAddress, SyscallResultTrait};
-use starknet_beanie::merchant_factory::MerchantFactory::{
-    Event as MerchantFactoryEvent, ReceiverAnnounced,
+use starknet_beanie::merchant_factory::ReceiverFactory::{
+    Event as ReceiverFactoryEvent, ReceiverAnnounced,
 };
 use starknet_beanie::merchant_factory::{
-    IMerchantFactoryDispatcher, IMerchantFactoryDispatcherTrait,
+    IReceiverFactoryDispatcher, IReceiverFactoryDispatcherTrait,
 };
 use starknet_beanie::receiver::{IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
 #[starknet::interface]
@@ -183,7 +183,7 @@ fn deploy_factory(
     eth_destination_domain: u32,
     receiver_class: ContractClass,
 ) -> ContractAddress {
-    let factory_class = declare("MerchantFactory").unwrap_syscall().contract_class();
+    let factory_class = declare("ReceiverFactory").unwrap_syscall().contract_class();
     let calldata = array![
         receiver_class.class_hash.into(), token.into(), treasury.into(), token_messenger.into(),
         base_destination_domain.into(), solana_destination_domain.into(),
@@ -305,7 +305,7 @@ fn merchant_factory_registers_and_predicts_receiver() {
         token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
     );
 
-    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
+    let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };
 
     let predicted_addr = factory.predict_receiver_address(merchant, 'BASE', 0x777_u256);
     let registered_addr = factory.register_merchant(merchant, 'BASE', 0x777_u256);
@@ -330,7 +330,7 @@ fn merchant_factory_rejects_exceeding_max_receivers() {
         token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
     );
 
-    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
+    let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };
 
     // Each route is a distinct (chain, recipient) pair, so vary the
     // recipient to get MAX_RECEIVERS_PER_MERCHANT distinct deterministic
@@ -341,7 +341,7 @@ fn merchant_factory_rejects_exceeding_max_receivers() {
     while i < 32 {
         factory.register_merchant(merchant, 'BASE', (i + 1).into());
         i += 1;
-    };
+    }
 
     assert(factory.get_receiver_count(merchant) == 32, 'RECEIVER_COUNT_32');
 
@@ -359,7 +359,7 @@ fn merchant_factory_announces_receiver() {
         token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
     );
 
-    let factory = IMerchantFactoryDispatcher { contract_address: factory_addr };
+    let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };
 
     // Predicted address (view call – no event yet)
     let predicted_addr = factory.predict_receiver_address(merchant, 'BASE', 0x777_u256);
@@ -377,7 +377,7 @@ fn merchant_factory_announces_receiver() {
             @array![
                 (
                     factory_addr,
-                    MerchantFactoryEvent::ReceiverAnnounced(
+                    ReceiverFactoryEvent::ReceiverAnnounced(
                         ReceiverAnnounced {
                             merchant,
                             receiver: predicted_addr,

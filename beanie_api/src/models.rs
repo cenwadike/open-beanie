@@ -164,7 +164,7 @@ pub(crate) fn derive_felt_from_foreign_address(addr: &str) -> Felt {
 }
 
 abigen!(
-    MerchantFactory,
+    ReceiverFactory,
     r#"[
     
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)

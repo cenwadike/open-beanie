@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Script.sol";
 import "../src/ChainXReceiver.sol";
 import "../src/StealthAccount.sol";
-import "../src/MerchantFactory.sol";
+import "../src/ReceiverFactory.sol";
 import "../src/MerchantWebhookRegistry.sol";
 import "../src/CREKeeperReceiver.sol";
 
@@ -53,7 +53,7 @@ contract DeployBaseMainnet is Script {
         );
 
         // 2. Deploy Factory
-        MerchantFactory factory = new MerchantFactory(
+        ReceiverFactory factory = new ReceiverFactory(
             address(implementation),
             USDC,
             treasury,
@@ -63,7 +63,7 @@ contract DeployBaseMainnet is Script {
             SOLANA_DOMAIN,
             ETH_DOMAIN
         );
-        console.log("MerchantFactory deployed to:", address(factory));
+        console.log("ReceiverFactory deployed to:", address(factory));
 
         // 3. Deploy Webhook Registry
         MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(

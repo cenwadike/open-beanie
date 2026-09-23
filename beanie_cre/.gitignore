@@ -1,6 +1,0 @@
-*.env
-secrets.yaml
-bun.lock
-.cre_build_tmp.js
-
-node_modules/

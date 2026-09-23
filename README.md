@@ -8,12 +8,12 @@ Every supported chain gets its own receiver contract and its own factory, and bo
 
 ### Contracts — EVM (Base, Ethereum)
 - **`ChainXReceiver`** — an implementation contract cloned once per merchant with OpenZeppelin `Clones`. Collects funds, takes the fee (0.50%, split 90% to a single treasury address and 10% to whoever calls `sweep()`), then either burns the net amount through CCTP V2 to the merchant's chosen destination chain, or forwards it directly to the merchant on the same chain. `sweep()` is permissionless, idempotent, and atomic — a zero balance is a silent no-op.
-- **`MerchantFactory`** — deploys deterministic clones per merchant (`Clones.cloneDeterministic`, capped at `MAX_RECEIVERS_PER_MERCHANT = 32` per merchant) and resolves the CCTP destination domain for Starknet, Base, Solana, or Ethereum from a chain name. Same-chain settlement is signaled by a zero recipient; cross-chain settlement requires a nonzero one.
+- **`ReceiverFactory`** — deploys deterministic clones per merchant (`Clones.cloneDeterministic`, capped at `MAX_RECEIVERS_PER_MERCHANT = 32` per merchant) and resolves the CCTP destination domain for Starknet, Base, Solana, or Ethereum from a chain name. Same-chain settlement is signaled by a zero recipient; cross-chain settlement requires a nonzero one.
 - **`MerchantWebhookRegistry`** — the single webhook URL registry across **all** of Beanie, not just the EVM legs. Keyed by `address merchant`, permissionless (same trust model as `registerMerchant`, since it's called by Beanie's own sponsoring keeper wallet on the merchant's behalf, not by the merchant's own wallet).
 
 ### Contracts — Starknet
 - **`StarknetReceiver`** — the same contract as `ChainXReceiver`, in Cairo. Same fee split (0.50%, 90/10), same permissionless/idempotent/atomic `sweep()`, same same-chain-vs-CCTP-burn branch keyed off a zero/nonzero mint recipient. It calls `TokenTransmitter.send_message` directly.
-- **`MerchantFactory`** — deploys one `StarknetReceiver` instance per merchant via `deploy_syscall`, same cap and same register/predict/count interface shape as the EVM factory.
+- **`ReceiverFactory`** — deploys one `StarknetReceiver` instance per merchant via `deploy_syscall`, same cap and same register/predict/count interface shape as the EVM factory.
 - **`StealthAccount`** — a counterfactual 2-of-2 Cairo account requiring both a client WebAuthn PRF signature $(r_1, s_1)$ and a Lit Protocol TEE Enclave co-signature $(r_2, s_2)$ to execute sweeping transfers.
 
 ## Privacy & Stealth Account Architecture
@@ -126,7 +126,7 @@ cargo run
 ## Tests
 
 * **`test/ReceiverFactory.t.sol`** — Foundry tests covering clone deployment, CCTP-burn vs. same-chain paths, idempotency, and registration limits.
-* **`tests/test.cairo`** — snforge tests for `StarknetReceiver`, `MerchantFactory`, and 2-of-2 `StealthAccount` signature validations.
+* **`tests/test.cairo`** — snforge tests for `StarknetReceiver`, `ReceiverFactory`, and 2-of-2 `StealthAccount` signature validations.
 
 ## File map
 
@@ -136,7 +136,7 @@ cargo run
 | `starknet_beanie/src/receiver.cairo` | Per-merchant Starknet receiver: fee split + CCTP burn or same-chain transfer |
 | `starknet_beanie/src/stealth_account.cairo` | 2-of-2 multi-sig account validating client + Lit TEE signatures |
 | `starknet_beanie/tests/test.cairo` | snforge tests for factory, receiver, and stealth accounts |
-| `evm_beanie/src/MerchantFactory.sol` | Deploys a `ChainXReceiver` clone per merchant; resolves CCTP domain |
+| `evm_beanie/src/ReceiverFactory.sol` | Deploys a `ChainXReceiver` clone per merchant; resolves CCTP domain |
 | `evm_beanie/src/ChainXReceiver.sol` | Per-merchant EVM receiver: fee split + CCTP burn or same-chain transfer |
 | `evm_beanie/src/MerchantWebhookRegistry.sol` | Single, chain-agnostic webhook URL registry |
 | `beanie_keeper/src/main.rs` | Dual-chain sweep loops (Base + Starknet), run concurrently from one process |

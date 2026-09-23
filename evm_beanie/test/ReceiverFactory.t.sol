@@ -3,7 +3,7 @@ pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
 import "../src/ChainXReceiver.sol";
-import "../src/MerchantFactory.sol";
+import "../src/ReceiverFactory.sol";
 import "../src/ChainXReceiver.sol" as R;
 
 interface IERC20Minimal {
@@ -114,7 +114,7 @@ contract ReceiverFactoryTest is Test {
     MockToken token;
     MockMessenger messenger;
     ChainXReceiver implementation;
-    MerchantFactory factory;
+    ReceiverFactory factory;
 
     address treasury = address(0x100);
     uint32 _starknetDestinationDomain = 21;
@@ -134,7 +134,7 @@ contract ReceiverFactoryTest is Test {
         messenger = new MockMessenger();
         implementation = new ChainXReceiver();
 
-        factory = new MerchantFactory(
+        factory = new ReceiverFactory(
             address(implementation),
             address(token),
             treasury,
@@ -161,7 +161,7 @@ contract ReceiverFactoryTest is Test {
         assertEq(factory.getReceiverCount(merchant), 1);
         assertEq(factory.getMerchantReceiverAt(merchant, 0), clone);
 
-        MerchantFactory f2 = new MerchantFactory(
+        ReceiverFactory f2 = new ReceiverFactory(
             address(implementation),
             address(token),
             treasury,
@@ -224,7 +224,7 @@ contract ReceiverFactoryTest is Test {
     function test_register_and_sweep_transfer_path_happy() public {
         address merchant = address(0x123);
 
-        MerchantFactory f3 = new MerchantFactory(
+        ReceiverFactory f3 = new ReceiverFactory(
             address(implementation),
             address(token),
             treasury,
@@ -303,7 +303,7 @@ contract ReceiverFactoryTest is Test {
 
         assertEq(factory.getReceiverCount(merchant), 32);
 
-        vm.expectRevert(MerchantFactory.MaximumReceiversExceeded.selector);
+        vm.expectRevert(ReceiverFactory.MaximumReceiversExceeded.selector);
         factory.registerMerchant(merchant, "STARKNET", bytes32(uint256(999)));
     }
 
@@ -311,7 +311,7 @@ contract ReceiverFactoryTest is Test {
         address merchant = address(0x888);
         bytes32 validRecipient = getMintRecipient(merchant);
 
-        vm.expectRevert(MerchantFactory.InvalidDomain.selector);
+        vm.expectRevert(ReceiverFactory.InvalidDomain.selector);
         factory.registerMerchant(merchant, "STARKNET2", validRecipient);
     }
 
@@ -320,7 +320,7 @@ contract ReceiverFactoryTest is Test {
         bytes32 validRecipient = getMintRecipient(merchant);
         factory.registerMerchant(merchant, "BASE", validRecipient);
 
-        vm.expectRevert(MerchantFactory.IndexOutOfBounds.selector);
+        vm.expectRevert(ReceiverFactory.IndexOutOfBounds.selector);
         factory.getMerchantReceiverAt(merchant, 1);
     }
 
@@ -337,7 +337,7 @@ contract ReceiverFactoryTest is Test {
         );
 
         vm.expectEmit(true, true, true, true);
-        emit MerchantFactory.ReceiverAnnounced(
+        emit ReceiverFactory.ReceiverAnnounced(
             merchant,
             predicted,
             "STARKNET",

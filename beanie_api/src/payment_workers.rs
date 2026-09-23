@@ -24,7 +24,7 @@ use ethers::{types::Address, utils::keccak256};
 
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, StarknetWallet>;
 
-use crate::models::{ChainXReceiverLocal, MerchantFactory};
+use crate::models::{ChainXReceiverLocal, ReceiverFactory};
 use crate::models::{chain_to_bytes32, chain_to_felt, derive_felt_from_foreign_address};
 
 use std::str::FromStr;
@@ -159,7 +159,7 @@ pub async fn run_payment_worker(
                                 };
 
                             let reg_call =
-                                MerchantFactory::new(evm_factory_addr, evm_client.clone())
+                                ReceiverFactory::new(evm_factory_addr, evm_client.clone())
                                     .register_merchant(
                                         merchant_addr,
                                         cctp_chain_bytes,

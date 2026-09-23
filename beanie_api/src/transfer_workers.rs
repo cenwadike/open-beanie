@@ -16,7 +16,7 @@ use starknet::providers::Provider;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
 
-use crate::models::{ChainXReceiverLocal, MerchantFactory};
+use crate::models::{ChainXReceiverLocal, ReceiverFactory};
 use beanie_keeper::evm_indexer::{EvmReceiverRecord, EvmRoute};
 use beanie_keeper::evm_ws::{self, EvmTip};
 use beanie_keeper::log_cache::LogCache;
@@ -740,7 +740,7 @@ async fn sweep_evm_receivers(
             let cctp_chain_bytes = route.chain;
             let recipient_bytes = route.recipient;
 
-            let reg_call = MerchantFactory::new(evm_cfg.factory_address, evm_client.clone())
+            let reg_call = ReceiverFactory::new(evm_cfg.factory_address, evm_client.clone())
                 .register_merchant(merchant, cctp_chain_bytes, recipient_bytes);
 
             match reg_call.calldata() {

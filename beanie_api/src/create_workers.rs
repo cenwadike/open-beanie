@@ -8,7 +8,7 @@ use starknet::core::types::{Call, Felt};
 use starknet::core::utils::get_selector_from_name;
 use tokio::sync::mpsc;
 
-use crate::models::{AnnounceTask, Chain, MerchantFactory, derive_felt_from_foreign_address};
+use crate::models::{AnnounceTask, Chain, ReceiverFactory, derive_felt_from_foreign_address};
 use crate::payment_workers::StarknetAccount;
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ pub async fn run_announce_worker(
                     continue;
                 };
 
-                let factory = MerchantFactory::new(evm_factory_addr, evm_client.clone());
+                let factory = ReceiverFactory::new(evm_factory_addr, evm_client.clone());
                 let call = factory.announce_receiver(merchant, cctp_chain, cctp_recipient);
 
                 match call.send().await {

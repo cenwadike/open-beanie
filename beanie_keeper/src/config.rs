@@ -132,8 +132,8 @@ pub struct EvmConfig {
     pub ws_url: Option<String>,
     pub chain_name: String, // "base" | "ethereum" — carried into the webhook payload
     pub token_address: Address, // the stablecoin ERC20 contract
-    pub factory_address: Address, // Beanie's EVM MerchantFactory
-    pub registry_start_block: u64, // block MerchantFactory was deployed at
+    pub factory_address: Address, // Beanie's EVM ReceiverFactory
+    pub registry_start_block: u64, // block ReceiverFactory was deployed at
     pub deposit_start_block: u64, // deposit-scan watermark
     pub webhook_registry_address: Address, // MerchantWebhookRegistry
     pub webhook_registry_start_block: u64, // block MerchantWebhookRegistry was deployed at

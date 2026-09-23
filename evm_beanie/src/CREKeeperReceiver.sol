@@ -7,7 +7,7 @@ pragma solidity ^0.8.24;
  * CRE's write path never calls your contracts directly — the KeystoneForwarder
  * calls onReport(bytes metadata, bytes report) on a designated IReceiver
  * contract, full stop. Multicall3.aggregate3(), ChainXReceiver.sweep(), and
- * MerchantFactory.registerMerchant() are not IReceiver entry points, so this
+ * ReceiverFactory.registerMerchant() are not IReceiver entry points, so this
  * thin relay exists purely to be the thing the Forwarder calls, decode the
  * call batch the workflow already computed off-chain, and forward it into
  * Multicall3 in one shot.
@@ -33,7 +33,9 @@ interface IMulticall3 {
         bool success;
         bytes returnData;
     }
-    function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory);
+    function aggregate3(
+        Call3[] calldata calls
+    ) external payable returns (Result[] memory);
 }
 
 contract CREKeeperReceiver is IReceiver {
@@ -67,8 +69,12 @@ contract CREKeeperReceiver is IReceiver {
     /// function is the ENTIRE trust boundary — everything past this point
     /// assumes the caller is genuinely the trusted Forwarder relaying a
     /// genuinely consensus-approved report.
-    function onReport(bytes calldata metadata, bytes calldata report) external override {
-        if (msg.sender != forwarder) revert InvalidForwarder(msg.sender, forwarder);
+    function onReport(
+        bytes calldata metadata,
+        bytes calldata report
+    ) external override {
+        if (msg.sender != forwarder)
+            revert InvalidForwarder(msg.sender, forwarder);
 
         // metadata carries (workflowId, workflowName, workflowOwner) per the
         // CRE report envelope — decode and pin it, same reasoning as pinning
@@ -79,16 +85,23 @@ contract CREKeeperReceiver is IReceiver {
             metadata,
             (bytes32, bytes10, address)
         );
-        if (workflowId != expectedWorkflowId || workflowOwner != expectedWorkflowOwner) {
+        if (
+            workflowId != expectedWorkflowId ||
+            workflowOwner != expectedWorkflowOwner
+        ) {
             revert InvalidWorkflow();
         }
 
         // The report itself is just the ABI-encoded Call3[] the workflow
         // computed off-chain — same shape as what evm_keeper.rs builds by
         // hand today, just decoded here instead of constructed in Rust.
-        IMulticall3.Call3[] memory calls = abi.decode(report, (IMulticall3.Call3[]));
+        IMulticall3.Call3[] memory calls = abi.decode(
+            report,
+            (IMulticall3.Call3[])
+        );
 
-        IMulticall3.Result[] memory results = IMulticall3(multicall3).aggregate3(calls);
+        IMulticall3.Result[] memory results = IMulticall3(multicall3)
+            .aggregate3(calls);
 
         bool[] memory successes = new bool[](results.length);
         for (uint256 i = 0; i < results.length; i++) {

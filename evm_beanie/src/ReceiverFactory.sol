@@ -14,7 +14,7 @@ interface IChainXReceiver {
     ) external;
 }
 
-contract MerchantFactory {
+contract ReceiverFactory {
     using Clones for address;
 
     uint256 public constant MAX_RECEIVERS_PER_MERCHANT = 32;

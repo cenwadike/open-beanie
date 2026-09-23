@@ -7,7 +7,7 @@ Smart contracts for Beanie's EVM leg. Handles deterministic merchant receiver de
 ## Contracts Overview
 
 * **`ChainXReceiver.sol`**: Merchant-specific receiver clone implementation. Receives USDC deposits, calculates fee splits (0.50% total: 90% protocol treasury, 10% caller/keeper incentive), and executes atomic settlement—either via same-chain `ERC20.transfer` or cross-chain CCTP `depositForBurn`.
-* **`MerchantFactory.sol`**: Deploys deterministic ERC-1167 minimal proxies (`ChainXReceiver`) per merchant using `CREATE2`. Tracks merchant receiver registries, nonce counts, and domain validation across supported chains (`STARKNET`, `BASE`, `SOLANA`, `ETHEREUM`).
+* **`ReceiverFactory.sol`**: Deploys deterministic ERC-1167 minimal proxies (`ChainXReceiver`) per merchant using `CREATE2`. Tracks merchant receiver registries, nonce counts, and domain validation across supported chains (`STARKNET`, `BASE`, `SOLANA`, `ETHEREUM`).
 * **`MerchantWebhookRegistry.sol`**: Global registry contract mapping merchant addresses to custom HTTP notification endpoint URLs.
 
 ---

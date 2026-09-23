@@ -1,4 +1,4 @@
-// MerchantFactory — Cairo port aligned with ChainX MerchantFactory.sol
+// ReceiverFactory — Cairo port aligned with ChainX ReceiverFactory.sol
 //
 // Deploys single StarknetReceiver instances per merchant and initializes them
 // with pinned destinations and settlement targets.
@@ -19,7 +19,7 @@ pub trait IStarknetReceiver<T> {
 }
 
 #[starknet::interface]
-pub trait IMerchantFactory<T> {
+pub trait IReceiverFactory<T> {
     fn register_merchant(
         ref self: T, merchant: ContractAddress, cctp_mint_chain: felt252, cctp_mint_recipient: u256,
     ) -> ContractAddress;
@@ -35,7 +35,7 @@ pub trait IMerchantFactory<T> {
 }
 
 #[starknet::contract]
-pub mod MerchantFactory {
+pub mod ReceiverFactory {
     use core::num::traits::Zero;
     use core::poseidon::poseidon_hash_span;
     use core::traits::TryInto;
@@ -46,7 +46,7 @@ pub mod MerchantFactory {
     };
     use starknet::syscalls::deploy_syscall;
     use starknet::{ClassHash, ContractAddress, get_contract_address};
-    use super::{IMerchantFactory, IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
+    use super::{IReceiverFactory, IStarknetReceiverDispatcher, IStarknetReceiverDispatcherTrait};
 
     const MAX_RECEIVERS_PER_MERCHANT: u64 = 32;
 
@@ -155,7 +155,7 @@ pub mod MerchantFactory {
     }
 
     #[abi(embed_v0)]
-    pub impl MerchantFactoryImpl of IMerchantFactory<ContractState> {
+    pub impl ReceiverFactoryImpl of IReceiverFactory<ContractState> {
         fn register_merchant(
             ref self: ContractState,
             merchant: ContractAddress,
