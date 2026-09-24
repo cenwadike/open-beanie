@@ -1,16 +1,14 @@
 /*
 //! # Deposit Receiver Factory
 //!
-//! Solana doesn't need separate factory and receier implementation contracts
+//! Solana doesn't need separate factory and receiver implementation contracts
 //! One program instance can serve unlimited merchants by keying every
 //! account off PDA seeds. So the "factory" on this side isn't a deployer —
 //! it's a small set of PDA-seeded accounts (FactoryConfig, ReceiverConfig,
 //! MerchantRegistry) that play the same role:
 //!
-//! ## Still deliberately NOT in scope
-//! - No per-sweep caller incentive (ChainXReceiver's 10%-to-tx.origin cut)
-//!   — same as the original single-tenant program, unchanged.
 */
+
 #![allow(unexpected_cfgs)]
 #![allow(deprecated)]
 
@@ -34,7 +32,6 @@ pub const FACTORY_SEED: &[u8] = b"factory";
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const REGISTRY_SEED: &[u8] = b"registry";
 
-// ── CCTP V2 (Solana) ─────────────────────────────────────────────────────
 pub const CCTP_TOKEN_MESSENGER_MINTER_V2: &str = "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe";
 pub const CCTP_MESSAGE_TRANSMITTER_V2: &str = "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC";
 
@@ -68,6 +65,7 @@ pub struct CctpDepositForBurnParams {
 pub mod sol {
     use super::*;
 
+    // ── Initialize factory (run once) ──────────────────────────────────────
     #[inline(never)]
     pub fn initialize_factory(
         ctx: Context<InitializeFactory>,
@@ -165,18 +163,6 @@ pub mod sol {
     /// but deliberately never reassigns AccountOwner — the caller is
     /// expected to discard `ephemeral_owner`'s private key after this
     /// confirms, same trust assumption as the single-tenant version.
-    ///
-    /// Neither `receiver_token_account` nor `cctp_burn_staging_account` is
-    /// created here — both must already exist. `receiver_token_account`'s
-    /// address depends on `ephemeral_owner` (generated off-chain, the same
-    /// way the single-tenant deploy script always worked);
-    /// `cctp_burn_staging_account`'s address is the ATA of
-    /// (receiver_config PDA, mint), fully derivable off-chain before
-    /// `receiver_config` itself is initialized. Whoever provisions a
-    /// merchant creates both up front (e.g. with the associated-token
-    /// program's own idempotent `create` instruction) and this program
-    /// only ever checks them, the same way it already checks
-    /// `receiver_token_account` today.
     #[inline(never)]
     pub fn register_merchant(
         ctx: Context<RegisterMerchant>,
@@ -187,7 +173,7 @@ pub mod sol {
         {
             let registry = &ctx.accounts.merchant_registry;
             require!(
-                (registry.receiver_count as usize) < MAX_RECEIVERS_PER_MERCHANT,
+                (registry.receivers.len() as usize) < MAX_RECEIVERS_PER_MERCHANT,
                 DepositError::MaxReceiversExceeded
             );
         }
@@ -248,9 +234,8 @@ pub mod sol {
         if registry.merchant == Pubkey::default() {
             registry.merchant = merchant;
         }
-        let idx = registry.receiver_count as usize;
+        let idx = registry.receivers.len() as usize;
         registry.receivers[idx] = ctx.accounts.receiver_config.key();
-        registry.receiver_count += 1;
 
         emit!(MerchantRegistered {
             merchant,
@@ -271,14 +256,14 @@ pub mod sol {
     }
 
     // ── Sweep — one instruction, one Accounts struct ───────────────────────
-    /// Fee math and the caller/protocol payouts happen exactly once,
-    /// regardless of route. Only the `net` destination branches: local
-    /// transfer to `merchant_vault_token_account`, or a same-account
-    /// transfer to `cctp_burn_staging_account` (via the delegate approved
-    /// in register_merchant) followed by the CCTP burn from there — CCTP's
-    /// `has_one = owner` needs a literal owner, which `receiver_config` is
-    /// only for the staging account, never for `receiver_token_account`
-    /// itself. The 15 CCTP accounts are `Option<...>`, absent (client
+    /// Only the `net` destination branches:
+    /// - **same_chain** transfer to `merchant_vault_token_account`,
+    /// - cctp transfer to `cctp_burn_staging_account` followed by the CCTP burn  
+    ///
+    /// — CCTP's `has_one = owner` needs a literal owner, which `receiver_config` is
+    /// only for the staging account, n
+    ///
+    /// The 15 CCTP accounts are `Option<...>`, absent (client
     /// passes `crate::ID`) on a same-chain sweep.
     #[inline(never)]
     pub fn sweep(
@@ -334,9 +319,7 @@ pub mod sol {
         ];
         let signer = &[signer_seeds];
 
-        // ── shared payouts: caller cut + both protocol wallets. Authorized
-        // by receiver_config acting as the *delegate* on
-        // receiver_token_account (never the owner) — same as before. ──────
+        // ── shared payouts: caller cut + both protocol wallets.
         if fee_to_caller > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
@@ -380,7 +363,7 @@ pub mod sol {
             )?;
         }
 
-        // ── branch: local settlement vs. CCTP burn ─────────────────────────
+        // ── branch: same_chain settlement vs. CCTP burn ─────────────────────────
         if !cross_chain {
             let vault = ctx
                 .accounts
@@ -473,9 +456,9 @@ pub mod sol {
             .cctp_token_minter
             .as_ref()
             .ok_or(DepositError::MissingCctpAccounts)?;
-        let cctp_local_token = ctx
+        let cctp_same_chain_token = ctx
             .accounts
-            .cctp_local_token
+            .cctp_same_chain_token
             .as_ref()
             .ok_or(DepositError::MissingCctpAccounts)?;
         let cctp_event_authority = ctx
@@ -510,9 +493,6 @@ pub mod sol {
             DepositError::WrongStagingAccount
         );
 
-        // ── net → staging account, via the same delegate every other
-        // transfer here uses. receiver_token_account's AccountOwner is
-        // untouched. ─────────────────────────────────────────────────────
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -532,9 +512,6 @@ pub mod sol {
             .checked_div(BPS_DENOM)
             .ok_or(DepositError::ArithmeticOverflow)?;
 
-        // ── staging account → CCTP depositForBurn. receiver_config is this
-        // account's genuine AccountOwner (set at creation, off-chain), so
-        // it satisfies CCTP's has_one = owner constraint directly. ─────────
         let params = CctpDepositForBurnParams {
             amount: net,
             destination_domain: ctx.accounts.receiver_config.cctp_domain_id,
@@ -561,7 +538,7 @@ pub mod sol {
             AccountMeta::new_readonly(cctp_token_messenger.key(), false),
             AccountMeta::new_readonly(cctp_remote_token_messenger.key(), false),
             AccountMeta::new_readonly(cctp_token_minter.key(), false),
-            AccountMeta::new(cctp_local_token.key(), false),
+            AccountMeta::new(cctp_same_chain_token.key(), false),
             AccountMeta::new(burn_token_mint.key(), false),
             AccountMeta::new(message_sent_event_data.key(), true),
             AccountMeta::new_readonly(cctp_message_transmitter_program.key(), false),
@@ -590,7 +567,7 @@ pub mod sol {
                 cctp_token_messenger.to_account_info(),
                 cctp_remote_token_messenger.to_account_info(),
                 cctp_token_minter.to_account_info(),
-                cctp_local_token.to_account_info(),
+                cctp_same_chain_token.to_account_info(),
                 burn_token_mint.to_account_info(),
                 message_sent_event_data.to_account_info(),
                 cctp_message_transmitter_program.to_account_info(),
@@ -676,8 +653,6 @@ pub struct RegisterMerchant<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Real, on-curve keypair currently owning `receiver_token_account`.
-    /// Discard this key after the transaction confirms.
     pub ephemeral_owner: Signer<'info>,
 
     #[account(seeds = [FACTORY_SEED], bump = factory_config.bump)]
@@ -702,13 +677,6 @@ pub struct RegisterMerchant<'info> {
     )]
     pub receiver_config: Account<'info, ReceiverConfig>,
 
-    /// Must already exist as the ATA of (receiver_config, factory_config.mint)
-    /// — created off-chain (e.g. via the associated-token program's own
-    /// idempotent `create` instruction) before this call, not by this
-    /// program. receiver_config is its real, native owner from the moment
-    /// it was created — no delegate, no SetAuthority, ever, for this
-    /// account, which is what lets sweep()'s cross-chain branch burn
-    /// straight out of it.
     #[account(
         mut,
         constraint = cctp_burn_staging_account.mint == factory_config.mint @ DepositError::WrongMint,
@@ -793,7 +761,7 @@ pub struct Sweep<'info> {
     pub cctp_remote_token_messenger: Option<UncheckedAccount<'info>>,
     pub cctp_token_minter: Option<UncheckedAccount<'info>>,
     #[account(mut)]
-    pub cctp_local_token: Option<UncheckedAccount<'info>>,
+    pub cctp_same_chain_token: Option<UncheckedAccount<'info>>,
     pub cctp_event_authority: Option<UncheckedAccount<'info>>,
     pub cctp_message_transmitter_program: Option<UncheckedAccount<'info>>,
     pub cctp_token_messenger_minter_program: Option<UncheckedAccount<'info>>,
@@ -830,11 +798,13 @@ pub struct ReceiverConfig {
     pub bump: u8,
 }
 
+/// One per merchant. Fixed 32-slot array of receivers
+/// pre-pays rent for the full 32 slots on a merchant's *first*
+/// registration rather than growing incrementally.
 #[account]
 #[derive(InitSpace)]
 pub struct MerchantRegistry {
     pub merchant: Pubkey,
-    pub receiver_count: u16,
     pub receivers: [Pubkey; MAX_RECEIVERS_PER_MERCHANT],
 }
 
