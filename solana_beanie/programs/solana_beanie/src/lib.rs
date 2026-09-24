@@ -1,12 +1,26 @@
 /*
-//! # Deposit Receiver Factory
+//! # Deposit Receiver Factory (receiver-keyed, pre-signed registration)
 //!
-//! Solana doesn't need separate factory and receiver implementation contracts
-//! One program instance can serve unlimited merchants by keying every
-//! account off PDA seeds. So the "factory" on this side isn't a deployer —
-//! it's a small set of PDA-seeded accounts (FactoryConfig, ReceiverConfig,
-//! MerchantRegistry) that play the same role:
+//! The `receiver` is the identity: the on-curve address handed to exchanges and
+//! wallets. Everything else derives from it:
+//!   receiver_token_account = ATA(receiver, mint)
+//!   receiver_config        = PDA [config,  receiver]   (exists  <=>  registered)
+//!   pending_registration   = PDA [pending, receiver]   (pinned blob holder)
+//!   staging account        = ATA(receiver_config, mint)
 //!
+//! Lifecycle
+//!   1. announce_merchant
+//!        - stores the fully signed registration tx in `pending_registration`
+//!        - emits every derived address
+//!        - creates NO config and touches NO shared state
+//!   2. register_merchant  (the stored tx, broadcast by anyone, once)
+//!        - `init`s receiver_config  -> a second registration cannot succeed
+//!        - approve(config, u64::MAX) + CloseAccount authority -> config
+//!        - appends to MerchantRegistry
+//!        - closes pending_registration (rent -> payer)
+//!   3. sweep              (permissionless; needs the config to exist)
+//!
+//! If `[config, receiver]` exists with data, the receiver is registered.
 */
 
 #![allow(unexpected_cfgs)]
@@ -19,21 +33,34 @@ use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::{self, Approve, Mint, Token, TokenAccount, Transfer};
 use std::str::FromStr;
 
-declare_id!("3M36pB7qKJhmictctHYYfzV5sy6PWAbUNU6rbPuTjSpc");
+declare_id!("BsiBBPjkAiLJgQDNmjfajHeJjpFMzJqCNz2FtzZa2Hpg");
 
 // ── Constants ─────────────────────────────────────────────────────────────
-pub const FEE_BPS: u64 = 50; // 0.50% fee on each sweep — same rate as the EVM/Starknet legs
+pub const FEE_BPS: u64 = 50; // 0.50%
 pub const BPS_DENOM: u64 = 10_000;
-pub const CALLER_SHARE_BPS: u64 = 1_000; // 10% of the fee, not of gross — matches ChainXReceiver.sol / StarknetReceiver
-pub const WALLET_A_SHARE_PCT: u64 = 60; // of the *remaining* 90% of fee, after the caller's cut
-pub const MAX_RECEIVERS_PER_MERCHANT: usize = 32; // matches MerchantFactory.sol / ReceiverFactory (Cairo)
+pub const CALLER_SHARE_BPS: u64 = 1_000; // 10% of the fee
+pub const MAX_RECEIVERS_PER_MERCHANT: usize = 32;
+
+// CCTP V2 Fast Transfer ceiling for Solana as source chain: Circle's published
+// 1 bps plus a 2 bps buffer. Re-check https://developers.circle.com/cctp before relying on it.
+pub const CCTP_MAX_FEE_BPS: u64 = 3;
+pub const CCTP_MIN_FINALITY_THRESHOLD: u32 = 1000;
+
+/// Sanity cap on the stored pre-signed tx. The real limit is the 1232-byte
+/// packet that has to carry it inside the announce tx.
+pub const MAX_REG_TX_BYTES: usize = 1024;
+/// bump u8 + Vec length prefix u32 (excluding the 8-byte discriminator and the blob).
+pub const PENDING_FIXED_LEN: usize = 1 + 4;
 
 pub const FACTORY_SEED: &[u8] = b"factory";
 pub const CONFIG_SEED: &[u8] = b"config";
+pub const PENDING_SEED: &[u8] = b"pending";
 pub const REGISTRY_SEED: &[u8] = b"registry";
 
 pub const CCTP_TOKEN_MESSENGER_MINTER_V2: &str = "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe";
 pub const CCTP_MESSAGE_TRANSMITTER_V2: &str = "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC";
+
+pub const SAME_CHAIN_DOMAIN_SENTINEL: u32 = u32::MAX;
 
 fn cctp_token_messenger_minter_id() -> Pubkey {
     Pubkey::from_str(CCTP_TOKEN_MESSENGER_MINTER_V2).expect("valid pubkey literal")
@@ -72,96 +99,101 @@ pub mod sol {
         starknet_domain: u32,
         base_domain: u32,
         ethereum_domain: u32,
+        monad_domain: u32,
+        arbitrum_domain: u32,
     ) -> Result<()> {
-        require!(
-            starknet_domain != base_domain
-                && starknet_domain != ethereum_domain
-                && base_domain != ethereum_domain,
-            DepositError::DuplicateDomains
-        );
+        let domains = [
+            starknet_domain,
+            base_domain,
+            ethereum_domain,
+            monad_domain,
+            arbitrum_domain,
+        ];
+        let all_distinct = domains
+            .iter()
+            .enumerate()
+            .all(|(i, a)| domains.iter().skip(i + 1).all(|b| a != b));
+        require!(all_distinct, DepositError::DuplicateDomains);
 
         let cfg = &mut ctx.accounts.factory_config;
         cfg.mint = ctx.accounts.mint.key();
-        cfg.wallet_a_token_account = ctx.accounts.wallet_a_token_account.key();
-        cfg.wallet_b_token_account = ctx.accounts.wallet_b_token_account.key();
+        cfg.treasury_token_account = ctx.accounts.treasury_token_account.key();
         cfg.starknet_domain = starknet_domain;
         cfg.base_domain = base_domain;
         cfg.ethereum_domain = ethereum_domain;
+        cfg.monad_domain = monad_domain;
+        cfg.arbitrum_domain = arbitrum_domain;
         cfg.bump = ctx.bumps.factory_config;
 
         emit!(FactoryInitialized {
             mint: cfg.mint,
-            wallet_a_token_account: cfg.wallet_a_token_account,
-            wallet_b_token_account: cfg.wallet_b_token_account,
+            treasury_token_account: cfg.treasury_token_account,
             starknet_domain,
             base_domain,
             ethereum_domain,
+            monad_domain,
+            arbitrum_domain,
         });
         Ok(())
     }
 
-    // ── Announce — mirrors announceReceiver()/announce_receiver(). ─────────
-    /// Touches no state, creates nothing. `receiver_config`'s PDA is
-    /// derivable off-chain from (merchant, chain, recipient) alone; the
-    /// customer-facing `receiver_token_account` address is NOT derivable
-    /// this way (it depends on whatever `ephemeral_owner` keypair gets
-    /// generated for this route — see register_merchant), so this event
-    /// only announces `receiver_config`, same information density as
-    /// `predictReceiverAddress` gives on the EVM leg for a not-yet-deployed
-    /// clone.
+    // ── Announce ───────────────────────────────────────────────────────────
+    /// Stores the fully signed registration tx in a small PDA pinned to
+    /// `receiver` and emits the derived addresses. No receiver signature: the
+    /// client verifies the stored blob and the derivations before disclosing
+    /// the address, and a tampered or squatted announce just means the address
+    /// is discarded unseen. Creates no config and touches no shared state.
     #[inline(never)]
     pub fn announce_merchant(
         ctx: Context<AnnounceMerchant>,
         merchant: Pubkey,
         cctp_mint_chain: [u8; 32],
         cctp_mint_recipient: [u8; 32],
+        receiver: Pubkey,
+        reg_tx: Vec<u8>,
     ) -> Result<()> {
-        if cctp_mint_chain != [0u8; 32] {
-            require!(
-                cctp_mint_recipient != [0u8; 32],
-                DepositError::CrossChainRequiresRecipient
-            );
-            resolve_domain(&ctx.accounts.factory_config, &cctp_mint_chain)
-                .ok_or(DepositError::InvalidDomain)?;
-        } else {
-            require!(
-                cctp_mint_recipient == [0u8; 32],
-                DepositError::SameChainRecipientMustBeZero
-            );
-        }
-
-        let (receiver_config, _) = Pubkey::find_program_address(
-            &[
-                CONFIG_SEED,
-                merchant.as_ref(),
-                cctp_mint_chain.as_ref(),
-                cctp_mint_recipient.as_ref(),
-            ],
-            &crate::ID,
+        require!(!reg_tx.is_empty(), DepositError::EmptyRegTx);
+        require!(
+            reg_tx.len() <= MAX_REG_TX_BYTES,
+            DepositError::RegTxTooLarge
         );
-        // cctp_burn_staging_account IS derivable in advance (owner =
-        // receiver_config PDA), so we can still announce it — just not
-        // receiver_token_account, which depends on ephemeral_owner.
-        let cctp_burn_staging_account =
-            get_associated_token_address(&receiver_config, &ctx.accounts.factory_config.mint);
+
+        // Fail fast on a bad route; register_merchant validates the same rules.
+        validate_route(
+            &ctx.accounts.factory_config,
+            &cctp_mint_chain,
+            &cctp_mint_recipient,
+        )?;
+
+        let mint = ctx.accounts.factory_config.mint;
+        let receiver_token_account = get_associated_token_address(&receiver, &mint);
+        let (receiver_config, _) =
+            Pubkey::find_program_address(&[CONFIG_SEED, receiver.as_ref()], &crate::ID);
+        let cctp_burn_staging_account = get_associated_token_address(&receiver_config, &mint);
+        let pending_registration = ctx.accounts.pending_registration.key();
+
+        let pending = &mut ctx.accounts.pending_registration;
+        pending.bump = ctx.bumps.pending_registration;
+        pending.reg_tx = reg_tx;
+
         emit!(MerchantAnnounced {
             merchant,
+            receiver,
+            receiver_token_account,
             receiver_config,
             cctp_burn_staging_account,
+            pending_registration,
             cctp_mint_chain,
             cctp_mint_recipient,
         });
         Ok(())
     }
 
-    // ── Register merchant ────────────────────────────────────────────────
-    /// `ephemeral_owner` is a real, on-curve keypair — required so
-    /// `receiver_token_account` passes ordinary CEX merchants
-    ///
-    /// This instruction delegates spending authority to `receiver_config` and
-    /// hands it CloseAccount authority
-    ///
-    /// Discard `ephemeral_owner`'s private key after this or users should supply the key
+    // ── Register (broadcast from the stored, pre-signed tx) ────────────────
+    /// `receiver` and `payer` signed this off-chain. `init` on
+    /// `[config, receiver]` makes it succeed exactly once. Delegates spending
+    /// to `receiver_config`, hands it CloseAccount authority, never reassigns
+    /// AccountOwner, appends to the registry, closes the pending blob.
     #[inline(never)]
     pub fn register_merchant(
         ctx: Context<RegisterMerchant>,
@@ -169,38 +201,24 @@ pub mod sol {
         cctp_mint_chain: [u8; 32],
         cctp_mint_recipient: [u8; 32],
     ) -> Result<()> {
-        {
-            let registry = &ctx.accounts.merchant_registry;
-            require!(
-                (registry.receivers.len() as usize) < MAX_RECEIVERS_PER_MERCHANT,
-                DepositError::MaxReceiversExceeded
-            );
-        }
+        require!(
+            (ctx.accounts.merchant_registry.receiver_count as usize) < MAX_RECEIVERS_PER_MERCHANT,
+            DepositError::MaxReceiversExceeded
+        );
 
-        let cctp_domain_id: u32 = if cctp_mint_chain != [0u8; 32] {
-            require!(
-                cctp_mint_recipient != [0u8; 32],
-                DepositError::CrossChainRequiresRecipient
-            );
-            resolve_domain(&ctx.accounts.factory_config, &cctp_mint_chain)
-                .ok_or(DepositError::InvalidDomain)?
-        } else {
-            require!(
-                cctp_mint_recipient == [0u8; 32],
-                DepositError::SameChainRecipientMustBeZero
-            );
-            0
-        };
+        let cctp_domain_id = validate_route(
+            &ctx.accounts.factory_config,
+            &cctp_mint_chain,
+            &cctp_mint_recipient,
+        )?;
 
-        // ── Delegate + CloseAccount handoff — receiver_token_account stays
-        // on-curve, owned by ephemeral_owner, the whole time. ──────────────
         token::approve(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
                 Approve {
                     to: ctx.accounts.receiver_token_account.to_account_info(),
                     delegate: ctx.accounts.receiver_config.to_account_info(),
-                    authority: ctx.accounts.ephemeral_owner.to_account_info(),
+                    authority: ctx.accounts.receiver.to_account_info(),
                 },
             ),
             u64::MAX,
@@ -211,65 +229,51 @@ pub mod sol {
                 ctx.accounts.token_program.to_account_info(),
                 token::SetAuthority {
                     account_or_mint: ctx.accounts.receiver_token_account.to_account_info(),
-                    current_authority: ctx.accounts.ephemeral_owner.to_account_info(),
+                    current_authority: ctx.accounts.receiver.to_account_info(),
                 },
             ),
             anchor_spl::token::spl_token::instruction::AuthorityType::CloseAccount,
             Some(ctx.accounts.receiver_config.key()),
         )?;
 
+        let receiver = ctx.accounts.receiver.key();
+        let receiver_config_key = ctx.accounts.receiver_config.key();
+        let receiver_token_account = ctx.accounts.receiver_token_account.key();
+        let merchant_token_account = ctx.accounts.merchant_token_account.key();
+        let mint = ctx.accounts.factory_config.mint;
+
         let cfg = &mut ctx.accounts.receiver_config;
+        cfg.receiver = receiver;
         cfg.merchant = merchant;
-        cfg.mint = ctx.accounts.factory_config.mint;
-        cfg.receiver_token_account = ctx.accounts.receiver_token_account.key();
-        cfg.merchant_token_account = ctx.accounts.merchant_token_account.key();
+        cfg.mint = mint;
+        cfg.merchant_token_account = merchant_token_account;
         cfg.cctp_mint_chain = cctp_mint_chain;
         cfg.cctp_mint_recipient = cctp_mint_recipient;
         cfg.cctp_domain_id = cctp_domain_id;
-        cfg.cctp_burn_staging_account = ctx.accounts.cctp_burn_staging_account.key();
         cfg.bump = ctx.bumps.receiver_config;
 
         let registry = &mut ctx.accounts.merchant_registry;
         if registry.merchant == Pubkey::default() {
             registry.merchant = merchant;
         }
-        let idx = registry.receivers.len() as usize;
-        registry.receivers[idx] = ctx.accounts.receiver_config.key();
+        let idx = registry.receiver_count as usize;
+        registry.receivers[idx] = receiver_config_key;
+        registry.receiver_count += 1;
 
         emit!(MerchantRegistered {
             merchant,
-            receiver_config: ctx.accounts.receiver_config.key(),
-            receiver_token_account: ctx.accounts.receiver_token_account.key(),
+            receiver,
+            receiver_config: receiver_config_key,
+            receiver_token_account,
             cctp_mint_chain,
             cctp_mint_recipient,
         });
-
-        msg!(
-            "register_merchant: merchant={} receiver_config={} receiver_token_account={} cross_chain={}",
-            merchant,
-            ctx.accounts.receiver_config.key(),
-            ctx.accounts.receiver_token_account.key(),
-            cctp_mint_chain != [0u8; 32],
-        );
         Ok(())
     }
 
-    // ── Sweep — one instruction, one Accounts struct ───────────────────────
-    /// Only the `net` destination branches:
-    /// - **same_chain** transfer to `merchant_token_account`,
-    /// - cctp transfer to `cctp_burn_staging_account` followed by the CCTP burn  
-    ///
-    /// — CCTP's `has_one = owner` needs a literal owner, which `receiver_config` is
-    /// only for the staging account
-    ///
-    /// The 15 CCTP accounts are `Option<...>`, absent (client
-    /// passes `crate::ID`) on a same-chain sweep.
+    // ── Sweep ──────────────────────────────────────────────────────────────
     #[inline(never)]
-    pub fn sweep(
-        ctx: Context<Sweep>,
-        max_fee_bps: Option<u64>,
-        min_finality_threshold: Option<u32>,
-    ) -> Result<()> {
+    pub fn sweep(ctx: Context<Sweep>) -> Result<()> {
         let cross_chain = ctx.accounts.receiver_config.cctp_mint_chain != [0u8; 32];
 
         ctx.accounts.receiver_token_account.reload()?;
@@ -293,32 +297,16 @@ pub mod sol {
             .ok_or(DepositError::ArithmeticOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(DepositError::ArithmeticOverflow)?;
-        let protocol_fee = fee
+        let fee_to_treasury = fee
             .checked_sub(fee_to_caller)
             .ok_or(DepositError::ArithmeticOverflow)?;
-        let to_a = protocol_fee
-            .checked_mul(WALLET_A_SHARE_PCT)
-            .ok_or(DepositError::ArithmeticOverflow)?
-            .checked_div(100)
-            .ok_or(DepositError::ArithmeticOverflow)?;
-        let to_b = protocol_fee
-            .checked_sub(to_a)
-            .ok_or(DepositError::ArithmeticOverflow)?;
 
-        let merchant = ctx.accounts.receiver_config.merchant;
-        let chain = ctx.accounts.receiver_config.cctp_mint_chain;
+        let receiver = ctx.accounts.receiver_config.receiver;
         let recipient = ctx.accounts.receiver_config.cctp_mint_recipient;
         let bump = ctx.accounts.receiver_config.bump;
-        let signer_seeds: &[&[u8]] = &[
-            CONFIG_SEED,
-            merchant.as_ref(),
-            chain.as_ref(),
-            recipient.as_ref(),
-            &[bump],
-        ];
+        let signer_seeds: &[&[u8]] = &[CONFIG_SEED, receiver.as_ref(), &[bump]];
         let signer = &[signer_seeds];
 
-        // ── shared payouts: caller cut + both protocol wallets.
         if fee_to_caller > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
@@ -333,46 +321,31 @@ pub mod sol {
                 fee_to_caller,
             )?;
         }
-        if to_a > 0 {
+        if fee_to_treasury > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     Transfer {
                         from: ctx.accounts.receiver_token_account.to_account_info(),
-                        to: ctx.accounts.wallet_a_token_account.to_account_info(),
+                        to: ctx.accounts.treasury_token_account.to_account_info(),
                         authority: ctx.accounts.receiver_config.to_account_info(),
                     },
                     signer,
                 ),
-                to_a,
-            )?;
-        }
-        if to_b > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: ctx.accounts.receiver_token_account.to_account_info(),
-                        to: ctx.accounts.wallet_b_token_account.to_account_info(),
-                        authority: ctx.accounts.receiver_config.to_account_info(),
-                    },
-                    signer,
-                ),
-                to_b,
+                fee_to_treasury,
             )?;
         }
 
-        // ── branch: same_chain settlement vs. CCTP burn ─────────────────────────
         if !cross_chain {
-            let vault = ctx
+            let merchant_token_account = ctx
                 .accounts
                 .merchant_token_account
                 .as_ref()
-                .ok_or(DepositError::MissingVaultAccount)?;
+                .ok_or(DepositError::MissingMerchantAccount)?;
             require_keys_eq!(
-                vault.key(),
+                merchant_token_account.key(),
                 ctx.accounts.receiver_config.merchant_token_account,
-                DepositError::WrongVault
+                DepositError::WrongMerchant
             );
 
             token::transfer(
@@ -380,7 +353,7 @@ pub mod sol {
                     ctx.accounts.token_program.to_account_info(),
                     Transfer {
                         from: ctx.accounts.receiver_token_account.to_account_info(),
-                        to: vault.to_account_info(),
+                        to: merchant_token_account.to_account_info(),
                         authority: ctx.accounts.receiver_config.to_account_info(),
                     },
                     signer,
@@ -390,21 +363,18 @@ pub mod sol {
 
             emit!(Swept {
                 receiver_config: ctx.accounts.receiver_config.key(),
+                receiver,
                 gross_amount: balance,
                 net_amount: net,
                 fee_amount: fee,
                 fee_to_caller,
-                fee_to_wallet_a: to_a,
-                fee_to_wallet_b: to_b,
+                fee_to_treasury,
                 slot: Clock::get()?.slot,
             });
             return Ok(());
         }
 
-        // ── cross-chain: unwrap the optional accounts/params ────────────────
-        let max_fee_bps = max_fee_bps.ok_or(DepositError::MissingCctpParams)?;
-        let min_finality_threshold =
-            min_finality_threshold.ok_or(DepositError::MissingCctpParams)?;
+        // ── cross-chain ────────────────────────────────────────────────────
         let cctp_burn_staging_account = ctx
             .accounts
             .cctp_burn_staging_account
@@ -455,9 +425,9 @@ pub mod sol {
             .cctp_token_minter
             .as_ref()
             .ok_or(DepositError::MissingCctpAccounts)?;
-        let cctp_same_chain_token = ctx
+        let cctp_local_token = ctx
             .accounts
-            .cctp_same_chain_token
+            .cctp_local_token
             .as_ref()
             .ok_or(DepositError::MissingCctpAccounts)?;
         let cctp_event_authority = ctx
@@ -486,9 +456,13 @@ pub mod sol {
             cctp_message_transmitter_id(),
             DepositError::WrongCctpProgram
         );
+        let expected_staging = get_associated_token_address(
+            &ctx.accounts.receiver_config.key(),
+            &ctx.accounts.factory_config.mint,
+        );
         require_keys_eq!(
             cctp_burn_staging_account.key(),
-            ctx.accounts.receiver_config.cctp_burn_staging_account,
+            expected_staging,
             DepositError::WrongStagingAccount
         );
 
@@ -505,8 +479,8 @@ pub mod sol {
             net,
         )?;
 
-        let max_fee = net
-            .checked_mul(max_fee_bps)
+        let max_fee = balance
+            .checked_mul(CCTP_MAX_FEE_BPS)
             .ok_or(DepositError::ArithmeticOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(DepositError::ArithmeticOverflow)?;
@@ -517,7 +491,7 @@ pub mod sol {
             mint_recipient: Pubkey::new_from_array(recipient),
             destination_caller: Pubkey::default(),
             max_fee,
-            min_finality_threshold,
+            min_finality_threshold: CCTP_MIN_FINALITY_THRESHOLD,
         };
 
         let mut data = anchor_discriminator("deposit_for_burn").to_vec();
@@ -531,21 +505,21 @@ pub mod sol {
             AccountMeta::new_readonly(ctx.accounts.receiver_config.key(), true), // owner
             AccountMeta::new(event_rent_payer.key(), true),
             AccountMeta::new_readonly(cctp_sender_authority_pda.key(), false),
-            AccountMeta::new(cctp_burn_staging_account.key(), false), // burn_token_account
+            AccountMeta::new(cctp_burn_staging_account.key(), false),
             AccountMeta::new_readonly(cctp_denylist_account.key(), false),
             AccountMeta::new(cctp_message_transmitter.key(), false),
             AccountMeta::new_readonly(cctp_token_messenger.key(), false),
             AccountMeta::new_readonly(cctp_remote_token_messenger.key(), false),
             AccountMeta::new_readonly(cctp_token_minter.key(), false),
-            AccountMeta::new(cctp_same_chain_token.key(), false),
+            AccountMeta::new(cctp_local_token.key(), false),
             AccountMeta::new(burn_token_mint.key(), false),
             AccountMeta::new(message_sent_event_data.key(), true),
             AccountMeta::new_readonly(cctp_message_transmitter_program.key(), false),
             AccountMeta::new_readonly(cctp_token_messenger_minter_program.key(), false),
             AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
             AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-            AccountMeta::new_readonly(cctp_event_authority.key(), false), // event_cpi
-            AccountMeta::new_readonly(cctp_token_messenger_minter_program.key(), false), // event_cpi
+            AccountMeta::new_readonly(cctp_event_authority.key(), false),
+            AccountMeta::new_readonly(cctp_token_messenger_minter_program.key(), false),
         ];
 
         let ix = Instruction {
@@ -566,7 +540,7 @@ pub mod sol {
                 cctp_token_messenger.to_account_info(),
                 cctp_remote_token_messenger.to_account_info(),
                 cctp_token_minter.to_account_info(),
-                cctp_same_chain_token.to_account_info(),
+                cctp_local_token.to_account_info(),
                 burn_token_mint.to_account_info(),
                 message_sent_event_data.to_account_info(),
                 cctp_message_transmitter_program.to_account_info(),
@@ -581,12 +555,12 @@ pub mod sol {
 
         emit!(SweptCrossChain {
             receiver_config: ctx.accounts.receiver_config.key(),
+            receiver,
             gross_amount: balance,
             net_amount: net,
             fee_amount: fee,
             fee_to_caller,
-            fee_to_wallet_a: to_a,
-            fee_to_wallet_b: to_b,
+            fee_to_treasury,
             destination_domain: ctx.accounts.receiver_config.cctp_domain_id,
             max_fee,
         });
@@ -595,7 +569,7 @@ pub mod sol {
     }
 }
 
-// ── Route/domain resolution ────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 pub fn chain_name_seed(name: &[u8]) -> [u8; 32] {
     let mut buf = [0u8; 32];
     let len = name.len().min(32);
@@ -610,8 +584,29 @@ fn resolve_domain(factory: &FactoryConfig, chain: &[u8; 32]) -> Option<u32> {
         Some(factory.base_domain)
     } else if *chain == chain_name_seed(b"ETHEREUM") {
         Some(factory.ethereum_domain)
+    } else if *chain == chain_name_seed(b"MONAD") {
+        Some(factory.monad_domain)
+    } else if *chain == chain_name_seed(b"ARBITRUM") {
+        Some(factory.arbitrum_domain)
     } else {
         None
+    }
+}
+
+/// Returns the CCTP domain id (SAME_CHAIN_DOMAIN_SENTINEL for same-chain routes).
+fn validate_route(factory: &FactoryConfig, chain: &[u8; 32], recipient: &[u8; 32]) -> Result<u32> {
+    if *chain != [0u8; 32] {
+        require!(
+            *recipient != [0u8; 32],
+            DepositError::CrossChainRequiresRecipient
+        );
+        resolve_domain(factory, chain).ok_or_else(|| error!(DepositError::InvalidDomain))
+    } else {
+        require!(
+            *recipient == [0u8; 32],
+            DepositError::SameChainRecipientMustBeZero
+        );
+        Ok(SAME_CHAIN_DOMAIN_SENTINEL)
     }
 }
 
@@ -622,13 +617,8 @@ pub struct InitializeFactory<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub mint: Box<Account<'info, Mint>>,
-    #[account(constraint = wallet_a_token_account.mint == mint.key() @ DepositError::WrongMint)]
-    pub wallet_a_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(
-        constraint = wallet_b_token_account.mint == mint.key() @ DepositError::WrongMint,
-        constraint = wallet_b_token_account.owner != wallet_a_token_account.owner @ DepositError::WalletsSame,
-    )]
-    pub wallet_b_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(constraint = treasury_token_account.mint == mint.key() @ DepositError::WrongMint)]
+    pub treasury_token_account: Box<Account<'info, TokenAccount>>,
     #[account(
         init,
         payer = payer,
@@ -641,45 +631,68 @@ pub struct InitializeFactory<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(merchant: Pubkey, cctp_mint_chain: [u8; 32], cctp_mint_recipient: [u8; 32], receiver: Pubkey, reg_tx: Vec<u8>)]
 pub struct AnnounceMerchant<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
     #[account(seeds = [FACTORY_SEED], bump = factory_config.bump)]
     pub factory_config: Account<'info, FactoryConfig>,
+
+    /// Small pinned holder of the signed registration tx, at [pending, receiver].
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + PENDING_FIXED_LEN + reg_tx.len(),
+        seeds = [PENDING_SEED, receiver.as_ref()],
+        bump,
+    )]
+    pub pending_registration: Account<'info, PendingRegistration>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 #[instruction(merchant: Pubkey, cctp_mint_chain: [u8; 32], cctp_mint_recipient: [u8; 32])]
 pub struct RegisterMerchant<'info> {
+    /// Fee payer of the pre-signed tx; pays the config/registry rent and
+    /// receives the pending account's rent back.
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    pub ephemeral_owner: Signer<'info>,
+    pub receiver: Signer<'info>,
 
     #[account(seeds = [FACTORY_SEED], bump = factory_config.bump)]
-    pub factory_config: Account<'info, FactoryConfig>,
+    pub factory_config: Box<Account<'info, FactoryConfig>>,
 
     #[account(
         mut,
         constraint = receiver_token_account.mint == factory_config.mint @ DepositError::WrongMint,
-        constraint = receiver_token_account.owner == ephemeral_owner.key() @ DepositError::WrongReceiver,
+        constraint = receiver_token_account.owner == receiver.key() @ DepositError::WrongReceiver,
+        constraint = receiver_token_account.key()
+            == get_associated_token_address(&receiver.key(), &factory_config.mint)
+            @ DepositError::NonCanonicalReceiverAta,
     )]
     pub receiver_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(constraint = merchant_token_account.mint == factory_config.mint @ DepositError::WrongMint)]
     pub merchant_token_account: Box<Account<'info, TokenAccount>>,
 
+    /// `init` here is what makes registration succeed exactly once.
     #[account(
         init,
         payer = payer,
         space = 8 + ReceiverConfig::INIT_SPACE,
-        seeds = [CONFIG_SEED, merchant.as_ref(), cctp_mint_chain.as_ref(), cctp_mint_recipient.as_ref()],
+        seeds = [CONFIG_SEED, receiver.key().as_ref()],
         bump,
     )]
     pub receiver_config: Account<'info, ReceiverConfig>,
 
     #[account(
-        mut,
         constraint = cctp_burn_staging_account.mint == factory_config.mint @ DepositError::WrongMint,
-        constraint = cctp_burn_staging_account.owner == receiver_config.key() @ DepositError::WrongStagingAccount,
+        constraint = cctp_burn_staging_account.key()
+            == get_associated_token_address(&receiver_config.key(), &factory_config.mint)
+            @ DepositError::WrongStagingAccount,
     )]
     pub cctp_burn_staging_account: Box<Account<'info, TokenAccount>>,
 
@@ -690,7 +703,15 @@ pub struct RegisterMerchant<'info> {
         seeds = [REGISTRY_SEED, merchant.as_ref()],
         bump,
     )]
-    pub merchant_registry: Account<'info, MerchantRegistry>,
+    pub merchant_registry: Box<Account<'info, MerchantRegistry>>,
+
+    #[account(
+        mut,
+        close = payer,
+        seeds = [PENDING_SEED, receiver.key().as_ref()],
+        bump = pending_registration.bump,
+    )]
+    pub pending_registration: Account<'info, PendingRegistration>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
@@ -709,7 +730,9 @@ pub struct Sweep<'info> {
 
     #[account(
         mut,
-        constraint = receiver_token_account.key() == receiver_config.receiver_token_account @ DepositError::WrongReceiver,
+        constraint = receiver_token_account.key()
+            == get_associated_token_address(&receiver_config.receiver, &factory_config.mint)
+            @ DepositError::WrongReceiver,
     )]
     pub receiver_token_account: Box<Account<'info, TokenAccount>>,
 
@@ -718,32 +741,22 @@ pub struct Sweep<'info> {
 
     #[account(
         mut,
-        constraint = wallet_a_token_account.key() == factory_config.wallet_a_token_account @ DepositError::WrongWalletA,
+        constraint = treasury_token_account.key() == factory_config.treasury_token_account @ DepositError::WrongTreasury,
     )]
-    pub wallet_a_token_account: Box<Account<'info, TokenAccount>>,
+    pub treasury_token_account: Box<Account<'info, TokenAccount>>,
 
+    /// Exists <=> registered. An unregistered receiver has no account here.
     #[account(
-        mut,
-        constraint = wallet_b_token_account.key() == factory_config.wallet_b_token_account @ DepositError::WrongWalletB,
-    )]
-    pub wallet_b_token_account: Box<Account<'info, TokenAccount>>,
-
-    #[account(
-        seeds = [
-            CONFIG_SEED,
-            receiver_config.merchant.as_ref(),
-            receiver_config.cctp_mint_chain.as_ref(),
-            receiver_config.cctp_mint_recipient.as_ref(),
-        ],
+        seeds = [CONFIG_SEED, receiver_config.receiver.as_ref()],
         bump = receiver_config.bump,
     )]
     pub receiver_config: Box<Account<'info, ReceiverConfig>>,
 
     // ── Same-chain only ─────────────────────────────────────────────────
+    #[account(mut)]
     pub merchant_token_account: Option<Box<Account<'info, TokenAccount>>>,
 
-    // ── Cross-chain only. Client passes `crate::ID` in place of any of
-    // these on a same-chain sweep to signal "None". ───────────────────────
+    // ── Cross-chain only. Client passes `crate::ID` for "None". ─────────
     #[account(mut)]
     pub cctp_burn_staging_account: Option<Box<Account<'info, TokenAccount>>>,
     #[account(mut)]
@@ -760,7 +773,7 @@ pub struct Sweep<'info> {
     pub cctp_remote_token_messenger: Option<UncheckedAccount<'info>>,
     pub cctp_token_minter: Option<UncheckedAccount<'info>>,
     #[account(mut)]
-    pub cctp_same_chain_token: Option<UncheckedAccount<'info>>,
+    pub cctp_local_token: Option<UncheckedAccount<'info>>,
     pub cctp_event_authority: Option<UncheckedAccount<'info>>,
     pub cctp_message_transmitter_program: Option<UncheckedAccount<'info>>,
     pub cctp_token_messenger_minter_program: Option<UncheckedAccount<'info>>,
@@ -775,35 +788,45 @@ pub struct Sweep<'info> {
 #[derive(InitSpace)]
 pub struct FactoryConfig {
     pub mint: Pubkey,
-    pub wallet_a_token_account: Pubkey,
-    pub wallet_b_token_account: Pubkey,
+    pub treasury_token_account: Pubkey,
     pub starknet_domain: u32,
     pub base_domain: u32,
     pub ethereum_domain: u32,
+    pub monad_domain: u32,
+    pub arbitrum_domain: u32,
     pub bump: u8,
 }
 
+/// PDA `[config, receiver]`. Created only by a successful registration, so
+/// its existence is the proof. `receiver_token_account` and the staging
+/// account are derivable from `receiver` + `mint`, so they are not stored.
 #[account]
 #[derive(InitSpace)]
 pub struct ReceiverConfig {
+    pub receiver: Pubkey,
     pub merchant: Pubkey,
     pub mint: Pubkey,
-    pub receiver_token_account: Pubkey,
     pub merchant_token_account: Pubkey,
     pub cctp_mint_chain: [u8; 32],
     pub cctp_mint_recipient: [u8; 32],
     pub cctp_domain_id: u32,
-    pub cctp_burn_staging_account: Pubkey,
     pub bump: u8,
 }
 
-/// One per merchant. Fixed 32-slot array of receivers
-/// pre-pays rent for the full 32 slots on a merchant's *first*
-/// registration rather than growing incrementally.
+/// PDA `[pending, receiver]`. Holds the fully signed registration tx until it
+/// is broadcast; closed by register_merchant. Size = 8 + PENDING_FIXED_LEN + reg_tx.len().
+#[account]
+pub struct PendingRegistration {
+    pub bump: u8,
+    pub reg_tx: Vec<u8>,
+}
+
+/// One per merchant. Appended at registration, in registration order.
 #[account]
 #[derive(InitSpace)]
 pub struct MerchantRegistry {
     pub merchant: Pubkey,
+    pub receiver_count: u16,
     pub receivers: [Pubkey; MAX_RECEIVERS_PER_MERCHANT],
 }
 
@@ -812,18 +835,22 @@ pub struct MerchantRegistry {
 #[event]
 pub struct FactoryInitialized {
     pub mint: Pubkey,
-    pub wallet_a_token_account: Pubkey,
-    pub wallet_b_token_account: Pubkey,
+    pub treasury_token_account: Pubkey,
     pub starknet_domain: u32,
     pub base_domain: u32,
     pub ethereum_domain: u32,
+    pub monad_domain: u32,
+    pub arbitrum_domain: u32,
 }
 
 #[event]
 pub struct MerchantAnnounced {
     pub merchant: Pubkey,
+    pub receiver: Pubkey,
+    pub receiver_token_account: Pubkey,
     pub receiver_config: Pubkey,
     pub cctp_burn_staging_account: Pubkey,
+    pub pending_registration: Pubkey,
     pub cctp_mint_chain: [u8; 32],
     pub cctp_mint_recipient: [u8; 32],
 }
@@ -831,6 +858,7 @@ pub struct MerchantAnnounced {
 #[event]
 pub struct MerchantRegistered {
     pub merchant: Pubkey,
+    pub receiver: Pubkey,
     pub receiver_config: Pubkey,
     pub receiver_token_account: Pubkey,
     pub cctp_mint_chain: [u8; 32],
@@ -840,24 +868,24 @@ pub struct MerchantRegistered {
 #[event]
 pub struct Swept {
     pub receiver_config: Pubkey,
+    pub receiver: Pubkey,
     pub gross_amount: u64,
     pub net_amount: u64,
     pub fee_amount: u64,
     pub fee_to_caller: u64,
-    pub fee_to_wallet_a: u64,
-    pub fee_to_wallet_b: u64,
+    pub fee_to_treasury: u64,
     pub slot: u64,
 }
 
 #[event]
 pub struct SweptCrossChain {
     pub receiver_config: Pubkey,
+    pub receiver: Pubkey,
     pub gross_amount: u64,
     pub net_amount: u64,
     pub fee_amount: u64,
     pub fee_to_caller: u64,
-    pub fee_to_wallet_a: u64,
-    pub fee_to_wallet_b: u64,
+    pub fee_to_treasury: u64,
     pub destination_domain: u32,
     pub max_fee: u64,
 }
@@ -868,18 +896,14 @@ pub struct SweptCrossChain {
 pub enum DepositError {
     #[msg("Arithmetic overflow in fee calculation")]
     ArithmeticOverflow,
-    #[msg("receiver_token_account does not match config")]
+    #[msg("receiver_token_account does not match config / receiver")]
     WrongReceiver,
     #[msg("merchant_token_account does not match config")]
-    WrongVault,
-    #[msg("wallet_a token account does not match factory config")]
-    WrongWalletA,
-    #[msg("wallet_b token account does not match factory config")]
-    WrongWalletB,
+    WrongMerchant,
+    #[msg("treasury token account does not match factory config")]
+    WrongTreasury,
     #[msg("Token account mint does not match configured mint")]
     WrongMint,
-    #[msg("wallet_a and wallet_b token accounts must have different owners")]
-    WalletsSame,
     #[msg("Unknown or unsupported destination chain")]
     InvalidDomain,
     #[msg("Cross-chain routes require a non-zero CCTP mint recipient")]
@@ -890,16 +914,20 @@ pub enum DepositError {
     DuplicateDomains,
     #[msg("This merchant already has the maximum number of registered receivers")]
     MaxReceiversExceeded,
-    #[msg("CCTP program account does not match the expected TokenMessengerMinterV2 / MessageTransmitterV2 id")]
+    #[msg("CCTP program account does not match the expected id")]
     WrongCctpProgram,
     #[msg("caller_token_account is not owned by the calling signer")]
     WrongCaller,
     #[msg("This route is same-chain but merchant_token_account was not supplied")]
-    MissingVaultAccount,
+    MissingMerchantAccount,
     #[msg("This route is cross-chain but one or more CCTP accounts were not supplied")]
     MissingCctpAccounts,
-    #[msg("This route is cross-chain but max_fee_bps / min_finality_threshold were not supplied")]
-    MissingCctpParams,
-    #[msg("cctp_burn_staging_account does not match the expected ATA for (mint, receiver_config)")]
+    #[msg("cctp_burn_staging_account is not ATA(receiver_config, mint)")]
     WrongStagingAccount,
+    #[msg("receiver_token_account is not ATA(receiver, mint)")]
+    NonCanonicalReceiverAta,
+    #[msg("reg_tx must not be empty")]
+    EmptyRegTx,
+    #[msg("reg_tx exceeds MAX_REG_TX_BYTES")]
+    RegTxTooLarge,
 }
