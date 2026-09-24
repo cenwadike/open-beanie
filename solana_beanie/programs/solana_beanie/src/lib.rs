@@ -156,13 +156,12 @@ pub mod sol {
 
     // ── Register merchant ────────────────────────────────────────────────
     /// `ephemeral_owner` is a real, on-curve keypair — required so
-    /// `receiver_token_account` passes ordinary CEX withdrawal
-    /// destination checks (an off-curve PDA-owned account has no private
-    /// key and fails those checks). This instruction delegates spending
-    /// authority to `receiver_config` and hands it CloseAccount authority,
-    /// but deliberately never reassigns AccountOwner — the caller is
-    /// expected to discard `ephemeral_owner`'s private key after this
-    /// confirms, same trust assumption as the single-tenant version.
+    /// `receiver_token_account` passes ordinary CEX merchants
+    ///
+    /// This instruction delegates spending authority to `receiver_config` and
+    /// hands it CloseAccount authority
+    ///
+    /// Discard `ephemeral_owner`'s private key after this or users should supply the key
     #[inline(never)]
     pub fn register_merchant(
         ctx: Context<RegisterMerchant>,
@@ -223,7 +222,7 @@ pub mod sol {
         cfg.merchant = merchant;
         cfg.mint = ctx.accounts.factory_config.mint;
         cfg.receiver_token_account = ctx.accounts.receiver_token_account.key();
-        cfg.merchant_vault_token_account = ctx.accounts.merchant_vault_token_account.key();
+        cfg.merchant_token_account = ctx.accounts.merchant_token_account.key();
         cfg.cctp_mint_chain = cctp_mint_chain;
         cfg.cctp_mint_recipient = cctp_mint_recipient;
         cfg.cctp_domain_id = cctp_domain_id;
@@ -257,11 +256,11 @@ pub mod sol {
 
     // ── Sweep — one instruction, one Accounts struct ───────────────────────
     /// Only the `net` destination branches:
-    /// - **same_chain** transfer to `merchant_vault_token_account`,
+    /// - **same_chain** transfer to `merchant_token_account`,
     /// - cctp transfer to `cctp_burn_staging_account` followed by the CCTP burn  
     ///
     /// — CCTP's `has_one = owner` needs a literal owner, which `receiver_config` is
-    /// only for the staging account, n
+    /// only for the staging account
     ///
     /// The 15 CCTP accounts are `Option<...>`, absent (client
     /// passes `crate::ID`) on a same-chain sweep.
@@ -367,12 +366,12 @@ pub mod sol {
         if !cross_chain {
             let vault = ctx
                 .accounts
-                .merchant_vault_token_account
+                .merchant_token_account
                 .as_ref()
                 .ok_or(DepositError::MissingVaultAccount)?;
             require_keys_eq!(
                 vault.key(),
-                ctx.accounts.receiver_config.merchant_vault_token_account,
+                ctx.accounts.receiver_config.merchant_token_account,
                 DepositError::WrongVault
             );
 
@@ -665,8 +664,8 @@ pub struct RegisterMerchant<'info> {
     )]
     pub receiver_token_account: Box<Account<'info, TokenAccount>>,
 
-    #[account(constraint = merchant_vault_token_account.mint == factory_config.mint @ DepositError::WrongMint)]
-    pub merchant_vault_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(constraint = merchant_token_account.mint == factory_config.mint @ DepositError::WrongMint)]
+    pub merchant_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init,
@@ -741,7 +740,7 @@ pub struct Sweep<'info> {
     pub receiver_config: Box<Account<'info, ReceiverConfig>>,
 
     // ── Same-chain only ─────────────────────────────────────────────────
-    pub merchant_vault_token_account: Option<Box<Account<'info, TokenAccount>>>,
+    pub merchant_token_account: Option<Box<Account<'info, TokenAccount>>>,
 
     // ── Cross-chain only. Client passes `crate::ID` in place of any of
     // these on a same-chain sweep to signal "None". ───────────────────────
@@ -790,7 +789,7 @@ pub struct ReceiverConfig {
     pub merchant: Pubkey,
     pub mint: Pubkey,
     pub receiver_token_account: Pubkey,
-    pub merchant_vault_token_account: Pubkey,
+    pub merchant_token_account: Pubkey,
     pub cctp_mint_chain: [u8; 32],
     pub cctp_mint_recipient: [u8; 32],
     pub cctp_domain_id: u32,
@@ -871,7 +870,7 @@ pub enum DepositError {
     ArithmeticOverflow,
     #[msg("receiver_token_account does not match config")]
     WrongReceiver,
-    #[msg("merchant_vault_token_account does not match config")]
+    #[msg("merchant_token_account does not match config")]
     WrongVault,
     #[msg("wallet_a token account does not match factory config")]
     WrongWalletA,
@@ -895,7 +894,7 @@ pub enum DepositError {
     WrongCctpProgram,
     #[msg("caller_token_account is not owned by the calling signer")]
     WrongCaller,
-    #[msg("This route is same-chain but merchant_vault_token_account was not supplied")]
+    #[msg("This route is same-chain but merchant_token_account was not supplied")]
     MissingVaultAccount,
     #[msg("This route is cross-chain but one or more CCTP accounts were not supplied")]
     MissingCctpAccounts,
