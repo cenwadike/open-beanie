@@ -3,6 +3,7 @@ use std::{cmp::min, time::Duration};
 use anyhow::{Context, Result, anyhow};
 use ethers::signers::Signer as EvmSignerTrait;
 use serde::Serialize;
+use solana_sdk::signer::Signer;
 use starknet::{core::types::Felt, signers::Signer as StarknetSignerTrait};
 use starknet_crypto::poseidon_hash_many;
 use tokio::time::sleep;
@@ -35,6 +36,11 @@ async fn sign_payload(cfg: &Config, data: &[u8]) -> Result<String> {
                 .context("failed signing Starknet payload")?;
 
             Ok(format!("{:#x}:{:#x}", signature.r, signature.s))
+        }
+
+        Config::Solana(solana_cfg) => {
+            let signature = solana_cfg.keeper_wallet.sign_message(data);
+            Ok(format!("0x{}", hex::encode(signature.as_ref())))
         }
     }
 }

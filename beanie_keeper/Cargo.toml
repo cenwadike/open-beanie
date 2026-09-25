@@ -30,3 +30,11 @@ apibara-dna-sdk = { version = "2.0.1", features = ["starknet"] }
 prost = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 governor = "0.10.4"
+solana-sdk = "4.1"
+spl-associated-token-account = "8.0.0"
+bs58 = "0.5.1"
+bincode = "1.3.3"
+spl-token = "9.0.0"
+solana-client = "4.3.0"
+anchor-lang = "1.2.0"
+async-trait = "0.1.92"
