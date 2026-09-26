@@ -216,17 +216,37 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
   }
 
   // ── derivations ──────────────────────────────────────────────────────────
-  const deriveConfig = (receiver: PublicKey) =>
-    PublicKey.findProgramAddressSync([CONFIG_SEED, receiver.toBuffer()], programId);
-  const derivePending = (receiver: PublicKey) =>
-    PublicKey.findProgramAddressSync([PENDING_SEED, receiver.toBuffer()], programId);
+  // ── derivations ──────────────────────────────────────────────────────────
+  const deriveConfig = (
+    merchant: PublicKey,
+    receiver: PublicKey,
+    chain: Buffer,
+    recipient: Buffer
+  ) =>
+    PublicKey.findProgramAddressSync(
+      [CONFIG_SEED, merchant.toBuffer(), receiver.toBuffer(), chain, recipient],
+      programId
+    );
+
+  const derivePending = (
+    merchant: PublicKey,
+    receiver: PublicKey,
+    chain: Buffer,
+    recipient: Buffer
+  ) =>
+    PublicKey.findProgramAddressSync(
+      [PENDING_SEED, merchant.toBuffer(), receiver.toBuffer(), chain, recipient],
+      programId
+    );
+
   const deriveRegistry = (merchant: PublicKey) =>
     PublicKey.findProgramAddressSync([REGISTRY_SEED, merchant.toBuffer()], programId);
 
   const factoryCfg = () => program.account.factoryConfig.fetch(factoryConfigPda);
   const configOf = (pda: PublicKey) => program.account.receiverConfig.fetch(pda);
   const pendingOf = (pda: PublicKey) => program.account.pendingRegistration.fetch(pda);
-  const registryOf = (merchant: PublicKey) => program.account.merchantRegistry.fetch(deriveRegistry(merchant)[0]);
+  const registryOf = (merchant: PublicKey) =>
+    program.account.merchantRegistry.fetch(deriveRegistry(merchant)[0]);
 
   async function assertFactoryStillUninitialized() {
     assert.isNull(await connection.getAccountInfo(factoryConfigPda), "factory_config must NOT exist yet");
@@ -278,15 +298,35 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
    * Everything that needs the receiver secret key happens in here: one
    * signature over one tx. The key is unreachable after return (unless keepKey).
    */
-  async function prepare(merchant: PublicKey, chain: Buffer, recipient: Buffer, opts: PrepareOpts = {}): Promise<Route> {
-    const receiverKp = Keypair.generate(); // stands in for the vanity-grind result
+  async function prepare(
+    merchant: PublicKey,
+    chain: Buffer,
+    recipient: Buffer,
+    opts: PrepareOpts = {}
+  ): Promise<Route> {
+    const receiverKp = Keypair.generate();
     const receiver = receiverKp.publicKey;
-    const [configPda] = deriveConfig(receiver);
-    const [pendingPda] = derivePending(receiver);
+
+    // config/pending stay route-keyed; the registry is merchant-keyed only.
+    const [configPda] = deriveConfig(merchant, receiver, chain, recipient);
+    const [pendingPda] = derivePending(merchant, receiver, chain, recipient);
     const [registryPda] = deriveRegistry(merchant);
-    const receiverTA = getAssociatedTokenAddressSync(usdtMint, receiver, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
-    const stagingTA = getAssociatedTokenAddressSync(usdtMint, configPda, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
-    const nonceKp = Keypair.generate(); // throwaway; only signs the account creation
+
+    const receiverTA = getAssociatedTokenAddressSync(
+      usdtMint,
+      receiver,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    const stagingTA = getAssociatedTokenAddressSync(
+      usdtMint,
+      configPda,
+      true,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    const nonceKp = Keypair.generate();
     const merchantTA = await newTokenAccount(usdtMint, Keypair.generate().publicKey);
 
     // tx1 — payer signs only; the receiver key is not involved.
@@ -624,7 +664,11 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
       await waitSlots(2);
       await expectFail(sendRaw(second)); // config already exists -> init fails
 
-      assert.equal((await registryOf(merchant)).receiverCount, 1, "no duplicate registry entry");
+      assert.equal(
+        (await registryOf(merchant)).receiverCount,
+        1,
+        "no duplicate registry entry"
+      );
       const acc1 = await getAccount(connection, r.receiverTA);
       assert.equal(acc1.delegate?.toBase58(), acc0.delegate?.toBase58(), "delegate not replaced");
       assert.equal(acc1.closeAuthority?.toBase58(), acc0.closeAuthority?.toBase58());
@@ -666,13 +710,18 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
       await expectFail(broadcastStored(r.pendingPda), "WrongMint");
     });
 
-    it("RM-SAD-6: register re-validates the route (signed args differ from announced) — CrossChainRequiresRecipient", async () => {
+    it("RM-SAD-6: a route mismatch between the pinned accounts and the signed args is caught by the seeds constraint (route-bound PDAs, not a logic re-check)", async () => {
       const r = await prepare(Keypair.generate().publicKey, ZERO_32, ZERO_32, {
         regRoute: { chain: chainNameSeed("BASE"), recipient: ZERO_32 },
       });
       await announce(r);
       await waitSlots(2);
-      await expectFail(broadcastStored(r.pendingPda), "CrossChainRequiresRecipient");
+      // receiver_config/pending_registration are seeded on the full route, so signing
+      // register_merchant with args that don't match what was pinned at announce time
+      // can't even resolve the accounts — it fails at ConstraintSeeds, before
+      // validate_route() runs. This is the intended anti-spoofing property: the account
+      // addresses are cryptographically bound to the route, not just checked in-handler.
+      await expectFail(broadcastStored(r.pendingPda), "ConstraintSeeds");
     });
 
     it("RM-SAD-7: staging account that is not ATA(config, mint) reverts WrongStagingAccount", async () => {
@@ -689,9 +738,15 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
     // that fills between announce and broadcast fails the tx (and on-chain that burns the nonce).
     it("RM-SAD-8: registry full — the 33rd registration reverts MaxReceiversExceeded (known residual)", async () => {
       const merchant = Keypair.generate().publicKey;
-      for (let i = 0; i < MAX_RECEIVERS_PER_MERCHANT; i++) await onboard(merchant, ZERO_32, ZERO_32);
-      assert.equal((await registryOf(merchant)).receiverCount, MAX_RECEIVERS_PER_MERCHANT);
-
+      let lastReceiver: PublicKey = PublicKey.default;
+      for (let i = 0; i < MAX_RECEIVERS_PER_MERCHANT; i++) {
+        const route = await onboard(merchant, ZERO_32, ZERO_32);
+        lastReceiver = route.receiver;
+      }
+      assert.equal(
+        (await registryOf(merchant)).receiverCount,
+        MAX_RECEIVERS_PER_MERCHANT
+      );
       const overflow = await prepare(merchant, ZERO_32, ZERO_32);
       await announce(overflow);
       await waitSlots(2);
@@ -1033,10 +1088,17 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
       const merchant = Keypair.generate().publicKey;
       const r1 = await onboard(merchant, ZERO_32, ZERO_32);
       const r2 = await onboard(merchant, ZERO_32, ZERO_32);
+
       const reg = await registryOf(merchant);
       assert.isAtMost(reg.receiverCount, MAX_RECEIVERS_PER_MERCHANT);
-      assert.equal(reg.receivers[0].toBase58(), deriveConfig(r1.receiver)[0].toBase58());
-      assert.equal(reg.receivers[1].toBase58(), deriveConfig(r2.receiver)[0].toBase58());
+      assert.equal(
+        reg.receivers[0].toBase58(),
+        deriveConfig(merchant, r1.receiver, ZERO_32, ZERO_32)[0].toBase58()
+      );
+      assert.equal(
+        reg.receivers[1].toBase58(),
+        deriveConfig(merchant, r2.receiver, ZERO_32, ZERO_32)[0].toBase58()
+      );
     });
 
     it("INV-5: CCTP max_fee is computed off gross at 3 bps", () => {

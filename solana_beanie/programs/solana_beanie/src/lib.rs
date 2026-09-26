@@ -1,11 +1,18 @@
 /*
-//! # Deposit Receiver Factory (receiver-keyed, pre-signed registration)
+//! # Deposit Receiver Factory (route-keyed, pinned pre-signed registration)
 //!
-//! The `receiver` is the identity: the on-curve address handed to exchanges and
-//! wallets. Everything else derives from it:
+//! The `receiver` is the public-facing identity handed to exchanges and
+//! wallets, but every PDA that gets *created* is bound to the full route
+//! `(merchant, receiver, cctp_mint_chain, cctp_mint_recipient)`, not just the
+//! receiver. This is deliberate: it means a `register_merchant` call can't be
+//! pointed at a pinned config/registry PDA while smuggling in different route
+//! args, because Anchor derives the expected address from the same args the
+//! instruction carries and rejects a mismatch (ConstraintSeeds) before any
+//! handler logic runs.
 //!   receiver_token_account = ATA(receiver, mint)
-//!   receiver_config        = PDA [config,  receiver]   (exists  <=>  registered)
-//!   pending_registration   = PDA [pending, receiver]   (pinned blob holder)
+//!   receiver_config        = PDA [config,  merchant, receiver, cctp_mint_chain, cctp_mint_recipient]
+//!   pending_registration   = PDA [pending, merchant, receiver, cctp_mint_chain, cctp_mint_recipient]
+//!   merchant_registry      = PDA [registry, merchant]                      (one per merchant)
 //!   staging account        = ATA(receiver_config, mint)
 //!
 //! Lifecycle
@@ -20,7 +27,8 @@
 //!        - closes pending_registration (rent -> payer)
 //!   3. sweep              (permissionless; needs the config to exist)
 //!
-//! If `[config, receiver]` exists with data, the receiver is registered.
+//! If `[config, merchant, receiver, cctp_mint_chain, cctp_mint_recipient]`
+//! exists with data, that exact route is registered.
 */
 
 #![allow(unexpected_cfgs)]
@@ -167,8 +175,16 @@ pub mod sol {
 
         let mint = ctx.accounts.factory_config.mint;
         let receiver_token_account = get_associated_token_address(&receiver, &mint);
-        let (receiver_config, _) =
-            Pubkey::find_program_address(&[CONFIG_SEED, receiver.as_ref()], &crate::ID);
+        let (receiver_config, _) = Pubkey::find_program_address(
+            &[
+                CONFIG_SEED,
+                merchant.as_ref(),
+                receiver.as_ref(),
+                cctp_mint_chain.as_ref(),
+                cctp_mint_recipient.as_ref(),
+            ],
+            &crate::ID,
+        );
         let cctp_burn_staging_account = get_associated_token_address(&receiver_config, &mint);
         let pending_registration = ctx.accounts.pending_registration.key();
 
@@ -302,9 +318,19 @@ pub mod sol {
             .ok_or(DepositError::ArithmeticOverflow)?;
 
         let receiver = ctx.accounts.receiver_config.receiver;
+        let merchant = ctx.accounts.receiver_config.merchant;
+        let cctp_mint_chain = ctx.accounts.receiver_config.cctp_mint_chain;
+        let cctp_mint_recipient = ctx.accounts.receiver_config.cctp_mint_recipient;
         let recipient = ctx.accounts.receiver_config.cctp_mint_recipient;
         let bump = ctx.accounts.receiver_config.bump;
-        let signer_seeds: &[&[u8]] = &[CONFIG_SEED, receiver.as_ref(), &[bump]];
+        let signer_seeds: &[&[u8]] = &[
+            CONFIG_SEED,
+            merchant.as_ref(),
+            receiver.as_ref(),
+            cctp_mint_chain.as_ref(),
+            cctp_mint_recipient.as_ref(),
+            &[bump],
+        ];
         let signer = &[signer_seeds];
 
         if fee_to_caller > 0 {
@@ -644,7 +670,7 @@ pub struct AnnounceMerchant<'info> {
         init,
         payer = payer,
         space = 8 + PENDING_FIXED_LEN + reg_tx.len(),
-        seeds = [PENDING_SEED, receiver.as_ref()],
+        seeds = [PENDING_SEED, merchant.key().as_ref(),  receiver.key().as_ref(), cctp_mint_chain.as_ref(), cctp_mint_recipient.as_ref()],
         bump,
     )]
     pub pending_registration: Account<'info, PendingRegistration>,
@@ -683,7 +709,7 @@ pub struct RegisterMerchant<'info> {
         init,
         payer = payer,
         space = 8 + ReceiverConfig::INIT_SPACE,
-        seeds = [CONFIG_SEED, receiver.key().as_ref()],
+        seeds = [CONFIG_SEED, merchant.key().as_ref(), receiver.key().as_ref(), cctp_mint_chain.as_ref(), cctp_mint_recipient.as_ref()],
         bump,
     )]
     pub receiver_config: Account<'info, ReceiverConfig>,
@@ -700,7 +726,7 @@ pub struct RegisterMerchant<'info> {
         init_if_needed,
         payer = payer,
         space = 8 + MerchantRegistry::INIT_SPACE,
-        seeds = [REGISTRY_SEED, merchant.as_ref()],
+        seeds = [REGISTRY_SEED, merchant.key().as_ref()],
         bump,
     )]
     pub merchant_registry: Box<Account<'info, MerchantRegistry>>,
@@ -708,7 +734,7 @@ pub struct RegisterMerchant<'info> {
     #[account(
         mut,
         close = payer,
-        seeds = [PENDING_SEED, receiver.key().as_ref()],
+        seeds = [PENDING_SEED, merchant.key().as_ref(),  receiver.key().as_ref(), cctp_mint_chain.as_ref(), cctp_mint_recipient.as_ref()],
         bump = pending_registration.bump,
     )]
     pub pending_registration: Account<'info, PendingRegistration>,
@@ -747,7 +773,13 @@ pub struct Sweep<'info> {
 
     /// Exists <=> registered. An unregistered receiver has no account here.
     #[account(
-        seeds = [CONFIG_SEED, receiver_config.receiver.as_ref()],
+        seeds = [
+            CONFIG_SEED,
+            receiver_config.merchant.as_ref(),
+            receiver_config.receiver.as_ref(),
+            receiver_config.cctp_mint_chain.as_ref(),
+            receiver_config.cctp_mint_recipient.as_ref()
+        ],
         bump = receiver_config.bump,
     )]
     pub receiver_config: Box<Account<'info, ReceiverConfig>>,
