@@ -1,6 +1,9 @@
 //! src/solana_indexer.rs
 //!
-//! Solana registry + deposit discovery.
+//! Solana registry + deposit discovery, backed directly by Subsquid Portal
+//! (https://portal.sqd.dev/datasets/solana-mainnet) — same vendor, same
+//! typed-struct + rate-limiter pattern as evm_indexer.rs. This module IS
+//! the vendor integration, same as evm_indexer.rs is for EVM.
 //!
 //! WHY ANNOUNCED IS A TRACKED STATE, NOT JUST REGISTERED
 //! -------------------------------------------------------
@@ -19,32 +22,24 @@
 //! pins whatever bytes it's given. Nothing stops an announce claiming
 //! `merchant = X` from actually carrying a `register_merchant` call for a
 //! *different* merchant, or for PDAs that don't match `receiver` at all.
-//! Anchor's seed constraints mean a forged `reg_tx` can never corrupt
-//! on-chain state (`register_merchant` simply fails at broadcast time if the
-//! accounts don't derive correctly), but an unvalidated announce can still
-//! poison OUR state: a deposit could get attributed to the wrong merchant's
-//! webhook, or we could waste the deposit scan watching a bogus ATA forever.
 //! `validate_announce` below re-derives every PDA/ATA from `receiver` and
 //! decodes the embedded `register_merchant` instruction to confirm its
 //! arguments and accounts agree with what the event claims, before the
 //! receiver is folded into `merchant_map`.
-//!
-//! TRANSPORT IS DELIBERATELY ABSTRACTED
-//! -------------------------------------------------------
-//! This module has no idea which gRPC vendor is behind it — same posture as
-//! `evm_indexer.rs` not knowing Subsquid Portal's wire format leaks past its
-//! `PortalBlock`/`PortalLog` structs. `SolanaEventSource` is the seam: it
-//! takes a program-owned account/log stream and a Token-Program transfer
-//! stream and returns them in the vendor-agnostic shapes below. The actual
-//! vendor client (Bitquery CoreCast or equivalent archive-gRPC) implements
-//! this trait in a separate module once picked; nothing here changes when
-//! it is.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use log::{debug, info, warn};
+use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::str::FromStr;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use crate::config::{Deposit, SolanaConfig};
 use crate::log_cache::LogCache;
@@ -54,19 +49,25 @@ pub const DEPOSITS_SCAN_ID: &str = "solana:deposits";
 
 const CONFIG_SEED: &[u8] = b"config";
 const PENDING_SEED: &[u8] = b"pending";
+const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const MAX_SLOTS_PER_REQUEST: u64 = 50_000;
 
-// ── Vendor-agnostic wire shapes ─────────────────────────────────────────────
+/// Same shape as evm_indexer.rs's `impl FnMut(...) -> Pin<Box<dyn Future...>>`
+/// pattern, just named so it's a single line at every use site instead of a
+/// multi-line generic that's easy to get wrong.
+pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
-/// One Anchor `emit!` event already extracted from a transaction's logs —
-/// `sol_log_data` line base64-decoded, the 8-byte Anchor discriminator
-/// stripped, `name` set from whichever discriminator matched. Slot and
-/// signature are carried through for checkpointing / dedup.
+// ── Our own decoded wire shapes (not Subsquid's — see PortalBlock below) ────
+
+/// One Anchor `emit!` event already extracted from a transaction's Portal
+/// logs — the `Program data: <base64>` line base64-decoded, the 8-byte
+/// Anchor discriminator stripped, `name` set from whichever discriminator
+/// matched. Slot is carried through for checkpointing.
 #[derive(Clone, Debug)]
 pub struct AnchorEvent {
     pub name: String,  // "MerchantAnnounced" | "MerchantRegistered"
     pub data: Vec<u8>, // borsh body, discriminator already stripped
     pub slot: u64,
-    pub signature: String,
 }
 
 /// One SPL Token `Transfer`/`TransferChecked` instruction matching our
@@ -77,32 +78,7 @@ pub struct TokenTransferEvent {
     pub destination: Pubkey,
     pub authority: Pubkey, // signer that authorized the transfer — our "from"
     pub amount: u64,
-    pub signature: String,
     pub slot: u64,
-}
-
-#[async_trait::async_trait]
-pub trait SolanaEventSource: Send + Sync {
-    /// All `MerchantAnnounced`/`MerchantRegistered` events logged by
-    /// `program_id` in `(from_slot, to_slot]`. Vendor implements pagination.
-    async fn fetch_program_events(
-        &self,
-        program_id: &Pubkey,
-        from_slot: u64,
-        to_slot: u64,
-    ) -> Result<(Vec<AnchorEvent>, u64 /* last_slot_seen */)>;
-
-    /// All token transfers into any of `destinations` in `(from_slot, to_slot]`.
-    async fn fetch_token_transfers(
-        &self,
-        mint: &Pubkey,
-        destinations: &[Pubkey],
-        from_slot: u64,
-        to_slot: u64,
-    ) -> Result<(Vec<TokenTransferEvent>, u64)>;
-
-    /// Current chain head, in slots.
-    async fn current_slot(&self) -> Result<u64>;
 }
 
 // ── Registry state ───────────────────────────────────────────────────────────
@@ -120,15 +96,11 @@ pub struct SolanaReceiverRecord {
     pub receiver_token_account: Pubkey,
     pub receiver_config: Pubkey,
     pub status: ReceiverStatus,
-    /// Present only while `Announced`. Cleared once `Registered` fires —
-    /// nothing downstream needs it after that, and there's no reason to
-    /// keep a stale broadcastable tx sitting in memory.
+    /// Present only while `Announced`. Cleared once `Registered` fires.
     pub reg_tx: Option<Vec<u8>>,
 }
 
-// ── Raw event bodies (fixed-size borsh — no Vec/String fields, so plain
-// byte-offset slicing is simpler and less dependency-fragile than pulling
-// in a full borsh derive here) ───────────────────────────────────────────────
+// ── Raw event bodies (fixed-size — plain byte-offset slicing) ───────────────
 
 struct RawMerchantAnnounced {
     merchant: Pubkey,
@@ -148,7 +120,6 @@ fn read_pubkey(buf: &[u8], off: usize) -> Result<Pubkey> {
 }
 
 fn decode_merchant_announced(data: &[u8]) -> Result<RawMerchantAnnounced> {
-    // 6 pubkeys (32B each) + 2 [u8;32] = 256 bytes, fixed.
     if data.len() != 256 {
         bail!(
             "MerchantAnnounced body is {} bytes, expected 256",
@@ -167,15 +138,14 @@ fn decode_merchant_announced(data: &[u8]) -> Result<RawMerchantAnnounced> {
     })
 }
 
-struct RawMerchantRegistered {
-    merchant: Pubkey,
-    receiver: Pubkey,
-    receiver_config: Pubkey,
-    receiver_token_account: Pubkey,
+pub struct RawMerchantRegistered {
+    pub merchant: Pubkey,
+    pub receiver: Pubkey,
+    pub receiver_config: Pubkey,
+    pub receiver_token_account: Pubkey,
 }
 
-fn decode_merchant_registered(data: &[u8]) -> Result<RawMerchantRegistered> {
-    // 4 pubkeys + 2 [u8;32] = 192 bytes; we only need the first 4 fields.
+pub fn decode_merchant_registered(data: &[u8]) -> Result<RawMerchantRegistered> {
     if data.len() < 128 {
         bail!(
             "MerchantRegistered body is {} bytes, expected >=128",
@@ -190,6 +160,8 @@ fn decode_merchant_registered(data: &[u8]) -> Result<RawMerchantRegistered> {
     })
 }
 
+/// Namespace is "global" for instruction discriminators, "event" for
+/// Anchor `emit!` discriminators.
 fn anchor_discriminator(namespace: &str, name: &str) -> [u8; 8] {
     let hash = solana_sdk::hash::hash(format!("{namespace}:{name}").as_bytes());
     let mut out = [0u8; 8];
@@ -199,11 +171,6 @@ fn anchor_discriminator(namespace: &str, name: &str) -> [u8; 8] {
 
 // ── Announce validation ─────────────────────────────────────────────────────
 
-/// Account order Anchor compiles `register_merchant`'s instruction into,
-/// matching `RegisterMerchant`'s field order in lib.rs exactly. If the
-/// on-chain IDL ever reorders that struct this must move with it — there is
-/// no way to derive this positionally at runtime, it has to track the
-/// source of truth by hand.
 #[allow(unused)]
 mod register_merchant_accounts {
     pub const PAYER: usize = 0;
@@ -217,18 +184,12 @@ mod register_merchant_accounts {
     pub const PENDING_REGISTRATION: usize = 8;
 }
 
-/// Re-derives every PDA/ATA from `receiver` alone and confirms the announce
-/// event's claimed addresses agree, then decodes the embedded
-/// `register_merchant` instruction inside `reg_tx` and confirms ITS
-/// arguments and accounts agree too. Only once both checks pass is a
-/// receiver safe to fold into `merchant_map`.
 fn validate_announce(
     ev: &RawMerchantAnnounced,
     reg_tx: &[u8],
     program_id: &Pubkey,
     mint: &Pubkey,
 ) -> Result<()> {
-    // 1. Re-derive from `receiver`, compare to what the event claims.
     let (expect_config, _) =
         Pubkey::find_program_address(&[CONFIG_SEED, ev.receiver.as_ref()], program_id);
     let (expect_pending, _) =
@@ -249,8 +210,6 @@ fn validate_announce(
         bail!("announce: cctp_burn_staging_account is not ATA(receiver_config, mint)");
     }
 
-    // 2. Decode the pinned reg_tx and confirm it actually registers THIS
-    // merchant/receiver/route, not a different one.
     let tx: Transaction =
         bincode::deserialize(reg_tx).context("reg_tx does not decode as a legacy Transaction")?;
 
@@ -310,90 +269,47 @@ fn validate_announce(
 
 // ── Registry discovery ──────────────────────────────────────────────────────
 
-/// Merges a batch of program events into `map`, validating every
-/// `MerchantAnnounced` before it's trusted and never downgrading a
-/// `Registered` receiver back to `Announced`.
-fn merge_events(
-    map: &mut HashMap<Pubkey, SolanaReceiverRecord>,
-    events: &[AnchorEvent],
-    program_id: &Pubkey,
-    mint: &Pubkey,
-) {
+fn merge_events(map: &mut HashMap<Pubkey, SolanaReceiverRecord>, events: &[AnchorEvent]) {
     for ev in events {
-        match ev.name.as_str() {
-            "MerchantAnnounced" => {
-                let Ok(raw) = decode_merchant_announced(&ev.data) else {
-                    log::warn!(
-                        "undecodable MerchantAnnounced at slot {} (sig {})",
-                        ev.slot,
-                        ev.signature
-                    );
-                    continue;
-                };
-                // reg_tx itself isn't in the event — the caller (registry
-                // scan) must separately fetch the pending PDA's contents
-                // (or the vendor may surface it inline; see fetch loop
-                // below) before validation can run. This function assumes
-                // it's already been attached — see `attach_reg_tx_and_merge`.
-                let _ = raw; // placeholder: real merge happens in
-                // attach_reg_tx_and_merge below, which has the
-                // blob in hand.
-            }
-            "MerchantRegistered" => {
-                let Ok(raw) = decode_merchant_registered(&ev.data) else {
-                    log::warn!(
-                        "undecodable MerchantRegistered at slot {} (sig {})",
-                        ev.slot,
-                        ev.signature
-                    );
-                    continue;
-                };
-                let entry = map.entry(raw.receiver).or_insert(SolanaReceiverRecord {
-                    merchant: raw.merchant,
-                    receiver: raw.receiver,
-                    receiver_token_account: raw.receiver_token_account,
-                    receiver_config: raw.receiver_config,
-                    status: ReceiverStatus::Registered,
-                    reg_tx: None,
-                });
-                entry.status = ReceiverStatus::Registered;
-                entry.reg_tx = None; // no longer needed once registered
-            }
-            other => {
-                log::debug!("ignoring unrecognized program event: {other}");
-            }
+        if ev.name != "MerchantRegistered" {
+            continue; // MerchantAnnounced handled in attach_reg_tx_and_merge
         }
+        let Ok(raw) = decode_merchant_registered(&ev.data) else {
+            log::warn!("undecodable MerchantRegistered at slot {}", ev.slot);
+            continue;
+        };
+        let entry = map.entry(raw.receiver).or_insert(SolanaReceiverRecord {
+            merchant: raw.merchant,
+            receiver: raw.receiver,
+            receiver_token_account: raw.receiver_token_account,
+            receiver_config: raw.receiver_config,
+            status: ReceiverStatus::Registered,
+            reg_tx: None,
+        });
+        entry.status = ReceiverStatus::Registered;
+        entry.reg_tx = None;
     }
-    let _ = (program_id, mint); // used by the caller's announce path
 }
 
 /// `MerchantAnnounced` needs the pinned `PendingRegistration.reg_tx` blob to
 /// validate against — the event itself doesn't carry it. `fetch_reg_tx` is
-/// the vendor-specific "read this account's data" call (an ordinary account
-/// read, not an event — any RPC or gRPC accounts-snapshot works).
-pub async fn attach_reg_tx_and_merge<F, Fut>(
+/// an ordinary on-chain account read (via solana_keeper's RPC client, not
+/// Portal — Portal doesn't serve current account state).
+pub async fn attach_reg_tx_and_merge(
     map: &mut HashMap<Pubkey, SolanaReceiverRecord>,
     events: &[AnchorEvent],
     program_id: &Pubkey,
     mint: &Pubkey,
-    mut fetch_reg_tx: F,
-) where
-    F: FnMut(Pubkey /* pending_registration PDA */) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
+    mut fetch_reg_tx: impl FnMut(Pubkey) -> BoxFuture<Result<Vec<u8>>>,
+) {
     for ev in events {
         if ev.name != "MerchantAnnounced" {
             continue;
         }
         let Ok(raw) = decode_merchant_announced(&ev.data) else {
-            log::warn!(
-                "undecodable MerchantAnnounced at slot {} (sig {})",
-                ev.slot,
-                ev.signature
-            );
+            log::warn!("undecodable MerchantAnnounced at slot {}", ev.slot);
             continue;
         };
-        // Registered already wins over Announced — never downgrade.
         if matches!(map.get(&raw.receiver), Some(r) if r.status == ReceiverStatus::Registered) {
             continue;
         }
@@ -437,37 +353,37 @@ pub struct SolanaCatchupSummary {
 pub async fn run_solana_catchup(
     cfg: &SolanaConfig,
     cache: &LogCache,
-    source: &dyn SolanaEventSource,
-    fetch_reg_tx: impl FnMut(
-        Pubkey,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send>,
-    >,
+    fetch_reg_tx: impl FnMut(Pubkey) -> BoxFuture<Result<Vec<u8>>>,
 ) -> Result<SolanaCatchupSummary> {
-    let head = source
-        .current_slot()
+    let head = current_slot(cfg)
         .await
-        .context("failed fetching Solana head slot")?;
+        .context("failed fetching Solana head slot from Subsquid Portal")?;
     let from_slot = cache
         .get_checkpoint(REGISTRY_SCAN_ID)?
         .map(|s| s + 1)
         .unwrap_or(cfg.registry_start_slot);
 
-    let (events, last_seen) = source
-        .fetch_program_events(&cfg.program_id, from_slot, head)
-        .await
-        .context("solana registry discovery failed")?;
+    debug!("Catching up on Beanie Solana Registry started, this may take a while");
+
+    let (events, last_seen) = fetch_program_events(cfg, cache, from_slot, head).await?;
 
     let mut map: HashMap<Pubkey, SolanaReceiverRecord> = HashMap::new();
-    merge_events(&mut map, &events, &cfg.program_id, &cfg.mint); // MerchantRegistered
-    attach_reg_tx_and_merge(&mut map, &events, &cfg.program_id, &cfg.mint, fetch_reg_tx).await; // MerchantAnnounced
+    merge_events(&mut map, &events);
+    attach_reg_tx_and_merge(&mut map, &events, &cfg.program_id, &cfg.mint, fetch_reg_tx).await;
 
-    cache.set_checkpoint(REGISTRY_SCAN_ID, last_seen)?;
+    if let Some(seen) = last_seen {
+        cache.set_checkpoint(REGISTRY_SCAN_ID, seen)?;
+    }
 
     let receivers: Vec<SolanaReceiverRecord> = map.into_values().collect();
     let receiver_tas: Vec<Pubkey> = receivers.iter().map(|r| r.receiver_token_account).collect();
 
-    let deposits = fetch_deposits_since_slot(cfg, cache, source, &receiver_tas, head).await?;
+    info!(
+        "Catching up on Beanie Solana Registry: COMPLETED ({} receiver(s) found, through slot {head})",
+        receivers.len()
+    );
+
+    let deposits = fetch_deposits_since_slot(cfg, cache, &receiver_tas, head).await?;
 
     cache
         .flush()
@@ -482,16 +398,15 @@ pub async fn run_solana_catchup(
 
 /// `receiver_token_accounts` must be the Announced ∪ Registered set — a
 /// deposit into an announced-but-unregistered receiver still needs to be
-/// seen (see module doc). Checkpoint written once, after the full scan
-/// returns — same reasoning as `evm:deposits:v2`.
+/// seen (see module doc).
 pub async fn fetch_deposits_since_slot(
     cfg: &SolanaConfig,
     cache: &LogCache,
-    source: &dyn SolanaEventSource,
     receiver_token_accounts: &[Pubkey],
     to_slot: u64,
 ) -> Result<Vec<Deposit>> {
     if receiver_token_accounts.is_empty() {
+        debug!("Beanie Solana deposit scan skipped: no receivers known");
         return Ok(Vec::new());
     }
     let from_slot = cache
@@ -502,15 +417,18 @@ pub async fn fetch_deposits_since_slot(
         return Ok(Vec::new());
     }
 
-    let (transfers, last_seen) = source
-        .fetch_token_transfers(&cfg.mint, receiver_token_accounts, from_slot, to_slot)
-        .await
-        .context("solana deposit discovery failed")?;
+    debug!(
+        "Catching up on Beanie Solana Deposits started ({} receiver(s)), this may take a while",
+        receiver_token_accounts.len()
+    );
+
+    let (transfers, last_seen) =
+        fetch_token_transfers(cfg, cache, receiver_token_accounts, from_slot, to_slot).await?;
 
     let deposits: Vec<Deposit> = transfers
         .into_iter()
         .map(|t| Deposit {
-            tx_hash: t.signature,
+            tx_hash: String::new(), // add "transaction": {"signatures": true} to fields if needed
             from_address: t.authority.to_string(),
             receiver: t.destination.to_string(),
             amount_raw: t.amount.to_string(),
@@ -518,6 +436,321 @@ pub async fn fetch_deposits_since_slot(
         })
         .collect();
 
-    cache.set_checkpoint(DEPOSITS_SCAN_ID, last_seen)?;
+    if let Some(seen) = last_seen {
+        cache.set_checkpoint(DEPOSITS_SCAN_ID, seen)?;
+    }
+
+    info!(
+        "Catching up on Beanie Solana Deposits: COMPLETED ({} deposit(s) found, through slot {to_slot})",
+        deposits.len()
+    );
     Ok(deposits)
+}
+
+// ── Subsquid Portal — the actual vendor integration ─────────────────────────
+//
+// Same typed-struct + rate-limiter pattern as evm_indexer.rs. "type":
+// "solana" and slot-shaped fields instead of "type": "evm".
+
+pub static SQD_SOLANA_RATE_LIMITER: LazyLock<DefaultDirectRateLimiter> = LazyLock::new(|| {
+    let quota = Quota::with_period(Duration::from_millis(500))
+        .unwrap()
+        .allow_burst(NonZeroU32::new(20).unwrap());
+    RateLimiter::direct(quota)
+});
+
+fn portal_http_client() -> &'static reqwest::Client {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("failed building shared Subsquid Portal HTTP client (Solana)")
+    });
+    &CLIENT
+}
+
+#[derive(Deserialize)]
+struct PortalBlock {
+    header: PortalHeader,
+    #[serde(default)]
+    logs: Vec<PortalLog>,
+    #[serde(default)]
+    instructions: Vec<PortalInstruction>,
+}
+
+#[derive(Deserialize)]
+struct PortalHeader {
+    number: u64,
+}
+
+#[derive(Deserialize)]
+struct PortalLog {
+    #[allow(unused)]
+    #[serde(rename = "programId")]
+    program_id: String,
+    #[allow(unused)]
+    kind: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct PortalInstruction {
+    accounts: Vec<String>,
+    data: String,
+}
+
+/// Same "/head then fall back to a 1-block stream + response header"
+/// pattern as evm_indexer.rs's `current_head`.
+pub async fn current_slot(cfg: &SolanaConfig) -> Result<u64> {
+    let base_url = cfg.subsquid_portal_url.trim_end_matches('/');
+    let client = portal_http_client();
+
+    let head_url = format!("{base_url}/head");
+    if let Ok(resp) = client.get(&head_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(num) = val
+                        .as_u64()
+                        .or_else(|| val.get("height").and_then(|h| h.as_u64()))
+                        .or_else(|| val.get("number").and_then(|h| h.as_u64()))
+                    {
+                        return Ok(num);
+                    }
+                }
+            }
+        }
+    }
+
+    let stream_url = format!("{base_url}/stream");
+    let body = serde_json::json!({
+        "type": "solana",
+        "fromBlock": 0,
+        "toBlock": 0,
+        "fields": { "block": { "number": true } }
+    });
+    let resp = client
+        .post(&stream_url)
+        .json(&body)
+        .send()
+        .await
+        .context("Subsquid Portal Solana stream request failed for head query")?;
+
+    if let Some(head_hdr) = resp.headers().get("x-sqd-head-number") {
+        if let Ok(head_str) = head_hdr.to_str() {
+            if let Ok(head) = head_str.parse::<u64>() {
+                return Ok(head);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Could not fetch current slot from Subsquid Portal (Solana)"
+    ))
+}
+
+/// Streams `from_slot..=to_slot` from Portal, calling `on_block` for every
+/// block line as it arrives. Returns the last slot actually observed.
+async fn stream_solana(
+    cfg: &SolanaConfig,
+    from_slot: u64,
+    to_slot: u64,
+    extra_fields: serde_json::Value,
+    mut on_block: impl FnMut(&PortalBlock),
+) -> Result<Option<u64>> {
+    if from_slot > to_slot {
+        return Ok(None);
+    }
+
+    let client = portal_http_client();
+    let stream_url = format!("{}/stream", cfg.subsquid_portal_url.trim_end_matches('/'));
+    let mut cursor = from_slot;
+    let mut last_seen: Option<u64> = None;
+
+    while cursor <= to_slot {
+        let ceiling = std::cmp::min(cursor + MAX_SLOTS_PER_REQUEST - 1, to_slot);
+
+        let mut body = serde_json::json!({
+            "type": "solana",
+            "fromBlock": cursor,
+            "toBlock": ceiling,
+        });
+        if let (serde_json::Value::Object(extra), serde_json::Value::Object(b)) =
+            (extra_fields.clone(), &mut body)
+        {
+            b.extend(extra);
+        }
+
+        SQD_SOLANA_RATE_LIMITER.until_ready().await;
+        let resp = client
+            .post(&stream_url)
+            .json(&body)
+            .send()
+            .await
+            .context("Subsquid Portal Solana stream request failed")?;
+
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            break;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                warn!("Subsquid Portal Solana rate-limited, retrying in 1s...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            bail!("Subsquid Portal Solana stream HTTP {status}: {text}");
+        }
+
+        let text = resp
+            .text()
+            .await
+            .context("failed reading Portal response body")?;
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            break;
+        }
+
+        let mut batch_last = None;
+        for line in &lines {
+            let block: PortalBlock = serde_json::from_str(line)
+                .with_context(|| format!("failed decoding Portal Solana NDJSON line: {line}"))?;
+            batch_last = Some(block.header.number);
+            on_block(&block);
+        }
+
+        let Some(batch_last) = batch_last else { break };
+        last_seen = Some(batch_last);
+        cursor = batch_last + 1;
+
+        if batch_last >= to_slot {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Ok(last_seen)
+}
+
+/// MerchantAnnounced/MerchantRegistered are Anchor `emit!` lines — `kind:
+/// "data"` log rows ("Program data: <base64>"). Filtered by emitting
+/// program_id; discriminator match happens client-side.
+pub async fn fetch_program_events(
+    cfg: &SolanaConfig,
+    _cache: &LogCache,
+    from_slot: u64,
+    to_slot: u64,
+) -> Result<(Vec<AnchorEvent>, Option<u64>)> {
+    let announced_disc = anchor_discriminator("event", "MerchantAnnounced");
+    let registered_disc = anchor_discriminator("event", "MerchantRegistered");
+    let program_str = cfg.program_id.to_string();
+
+    let extra = serde_json::json!({
+        "fields": {
+            "block": { "number": true },
+            "log": { "programId": true, "kind": true, "message": true }
+        },
+        "logs": [{ "programId": [program_str], "kind": ["data"] }]
+    });
+
+    let mut events = Vec::new();
+    let last_seen = stream_solana(cfg, from_slot, to_slot, extra, |block| {
+        let slot = block.header.number;
+        for log in &block.logs {
+            let Some(b64) = log.message.strip_prefix("Program data: ") else {
+                continue;
+            };
+            let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+                warn!("undecodable base64 in Program data log: {}", log.message);
+                continue;
+            };
+            if raw.len() < 8 {
+                continue;
+            }
+            let (disc, data) = raw.split_at(8);
+            let name = if disc == announced_disc {
+                "MerchantAnnounced"
+            } else if disc == registered_disc {
+                "MerchantRegistered"
+            } else {
+                continue;
+            };
+            events.push(AnchorEvent {
+                name: name.to_string(),
+                data: data.to_vec(),
+                slot,
+            });
+        }
+    })
+    .await
+    .with_context(|| "solana registry discovery via Subsquid Portal failed")?;
+
+    Ok((events, last_seen))
+}
+
+/// `a1` filters by the account at instruction-account position 1 — Portal
+/// documents this for instruction filters. SPL Transfer/TransferChecked
+/// account order is [source, destination, authority, ...], so `a1` =
+/// destination.
+async fn fetch_token_transfers(
+    cfg: &SolanaConfig,
+    _cache: &LogCache,
+    destinations: &[Pubkey],
+    from_slot: u64,
+    to_slot: u64,
+) -> Result<(Vec<TokenTransferEvent>, Option<u64>)> {
+    if destinations.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let dest_strs: Vec<String> = destinations.iter().map(|p| p.to_string()).collect();
+
+    let extra = serde_json::json!({
+        "fields": {
+            "block": { "number": true },
+            "instruction": { "accounts": true, "data": true, "d1": true }
+        },
+        "instructions": [
+            { "programId": [SPL_TOKEN_PROGRAM], "d1": ["0x03"], "a1": dest_strs.clone() }, // Transfer
+            { "programId": [SPL_TOKEN_PROGRAM], "d1": ["0x0c"], "a1": dest_strs }          // TransferChecked
+        ]
+    });
+
+    let mut transfers = Vec::new();
+    let last_seen = stream_solana(cfg, from_slot, to_slot, extra, |block| {
+        let slot = block.header.number;
+        for ix in &block.instructions {
+            let get_pubkey = |i: usize| -> Option<Pubkey> {
+                ix.accounts.get(i).and_then(|s| Pubkey::from_str(s).ok())
+            };
+            let (Some(source), Some(destination), Some(authority)) =
+                (get_pubkey(0), get_pubkey(1), get_pubkey(2))
+            else {
+                continue;
+            };
+            let clean = ix.data.trim_start_matches("0x");
+            let Ok(raw) = (0..clean.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&clean[i..i + 2], 16))
+                .collect::<std::result::Result<Vec<u8>, _>>()
+            else {
+                continue;
+            };
+            if raw.len() < 9 {
+                continue;
+            }
+            let amount = u64::from_le_bytes(raw[1..9].try_into().unwrap());
+            transfers.push(TokenTransferEvent {
+                source,
+                destination,
+                authority,
+                amount,
+                slot,
+            });
+        }
+    })
+    .await
+    .with_context(|| "solana deposit discovery via Subsquid Portal failed")?;
+
+    Ok((transfers, last_seen))
 }

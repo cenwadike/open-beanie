@@ -236,11 +236,8 @@ pub struct SolanaConfig {
     pub deposit_start_slot: u64,
     pub poll_interval: Duration,
 
-    /// Archive gRPC vendor — sole source for both catch-up and live tips
-    /// (see solana_indexer.rs / solana_ws.rs doc comments for why this is
-    /// one source here, unlike EVM's Portal-HTTP/Portal-stream split).
-    pub grpc_url: String,
-    pub grpc_api_key: Option<String>,
+    pub subsquid_portal_url: String,
+    pub subsquid_portal_api_key: Option<String>,
 }
 
 impl SolanaConfig {
@@ -284,8 +281,9 @@ impl SolanaConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12),
             ),
-            grpc_url: env("SOLANA_GRPC_URL").context("missing SOLANA_GRPC_URL")?,
-            grpc_api_key: env("SOLANA_GRPC_API_KEY").ok(),
+            subsquid_portal_url: env("SOLANA_SUBSQUID_PORTAL_URL")
+                .unwrap_or_else(|_| "https://portal.sqd.dev/datasets/solana-mainnet".to_string()),
+            subsquid_portal_api_key: env("SOLANA_SUBSQUID_PORTAL_API_KEY").ok(),
         })
     }
 }
