@@ -17,14 +17,24 @@ use crate::config::{Deposit, EvmConfig};
 use crate::log_cache::{LogCache, chunk_ranges};
 
 /// Distinct from the Starknet scan IDs so the two chains' checkpoints
-/// never collide in the one shared `LogCache` both sides open.
-pub const REGISTRY_WEBHOOK_SCAN_ID: &str = "evm:registry_webhook";
+/// never collide in the one shared `LogCache` both sides open. Also
+/// scoped by `cfg.chain_name` — with a single EVM chain (Base) a bare
+/// constant was enough, but a second EVM chain (Arbitrum) sharing this
+/// same `LogCache` would otherwise read Base's checkpoint as its own
+/// starting block (wrong chain entirely) and the two would clobber each
+/// other's progress on every `set_checkpoint` call.
+pub fn registry_webhook_scan_id(cfg: &EvmConfig) -> String {
+    format!("evm:{}:registry_webhook", cfg.chain_name)
+}
 /// Bumped from "evm:deposits". Under the old flow that checkpoint advanced
 /// per HTTP batch while the deposits found were only handed back at the END of
 /// the scan, so a stopped/crashed first backfill left a checkpoint that had
 /// moved past deposits nobody ever swept or notified. A new id makes the next
-/// run rescan from `deposit_start_block` instead of skipping them.
-pub const DEPOSITS_SCAN_ID: &str = "evm:deposits:v2";
+/// run rescan from `deposit_start_block` instead of skipping them. See
+/// `registry_webhook_scan_id` above for why this is chain-scoped too.
+pub fn deposits_scan_id(cfg: &EvmConfig) -> String {
+    format!("evm:{}:deposits:v2", cfg.chain_name)
+}
 
 /// Portal's own worker-boundary batching already bounds how much a single
 /// HTTP response can cover, but there's no reason to invite an
@@ -671,7 +681,7 @@ pub async fn discover_registry_activity(
     // majority of calls find nothing new — see the conditional level below.
     debug!("Catching up on Beanie EVM Registry started, this may take a while");
     let from_block = cache
-        .get_checkpoint(REGISTRY_WEBHOOK_SCAN_ID)?
+        .get_checkpoint(&registry_webhook_scan_id(cfg))?
         .map(|b| b + 1)
         .unwrap_or_else(|| {
             std::cmp::min(cfg.registry_start_block, cfg.webhook_registry_start_block)
@@ -900,9 +910,9 @@ pub async fn rebuild_registry_state(
 
     // Keep the live path's checkpoint in step (forward only), so
     // `process_evm_tip` only scans what comes after this point.
-    let existing = cache.get_checkpoint(REGISTRY_WEBHOOK_SCAN_ID)?;
+    let existing = cache.get_checkpoint(&registry_webhook_scan_id(cfg))?;
     if existing.map_or(true, |cp| cp < scanned_to) {
-        cache.set_checkpoint(REGISTRY_WEBHOOK_SCAN_ID, scanned_to)?;
+        cache.set_checkpoint(&registry_webhook_scan_id(cfg), scanned_to)?;
     }
 
     info!(
@@ -952,7 +962,7 @@ async fn discover_registry_range(
         &handle.client,
         &handle.limiter,
         &cfg.subsquid_portal_url,
-        REGISTRY_WEBHOOK_SCAN_ID,
+        &registry_webhook_scan_id(cfg),
         cache,
         from_block,
         to_block,
@@ -1066,7 +1076,7 @@ pub async fn fetch_deposits_since_block(
     );
 
     let from_block = cache
-        .get_checkpoint(DEPOSITS_SCAN_ID)?
+        .get_checkpoint(&deposits_scan_id(cfg))?
         .map(|b| b + 1)
         .unwrap_or(cfg.deposit_start_block);
 
@@ -1091,7 +1101,7 @@ pub async fn fetch_deposits_since_block(
         &handle.client,
         &handle.limiter,
         &cfg.subsquid_portal_url,
-        DEPOSITS_SCAN_ID,
+        &deposits_scan_id(cfg),
         cache,
         from_block,
         to_block,
@@ -1129,7 +1139,7 @@ pub async fn fetch_deposits_since_block(
     .with_context(|| "evm deposit discovery via Subsquid Portal failed")?;
 
     if let Some(scanned_to) = last_seen {
-        cache.set_checkpoint(DEPOSITS_SCAN_ID, scanned_to)?;
+        cache.set_checkpoint(&deposits_scan_id(cfg), scanned_to)?;
     }
 
     deposits.sort_by_key(|d| d.block_number);

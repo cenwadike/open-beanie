@@ -182,36 +182,56 @@ pub struct EvmConfig {
 }
 
 impl EvmConfig {
-    pub fn from_env() -> Result<Self> {
+    /// `prefix` picks which env vars to read (`"BASE"` -> `BASE_RPC_URL`,
+    /// `"ARBITRUM"` -> `ARBITRUM_RPC_URL`, etc.); `chain_name` is the
+    /// human-readable name carried into webhook payloads and used to scope
+    /// this chain's `LogCache` checkpoints (see `evm_indexer.rs`'s
+    /// `registry_webhook_scan_id`/`deposits_scan_id`) apart from any other
+    /// EVM chain sharing the same cache file.
+    pub fn from_env(prefix: &str, chain_name: &str) -> Result<Self> {
         Ok(Self {
-            evm_rpc_url: env("BASE_RPC_URL")?,
-            ws_url: env("BASE_WS_URL").ok(),
-            chain_name: "base".into(),
-            token_address: addr(&env("BASE_TOKEN_ADDRESS")?)?,
-            factory_address: addr(&env("BASE_FACTORY_ADDRESS")?)?,
-            registry_start_block: env("BASE_REGISTRY_START_BLOCK")?
+            evm_rpc_url: env(&format!("{prefix}_RPC_URL"))?,
+            ws_url: env(&format!("{prefix}_WS_URL")).ok(),
+            chain_name: chain_name.into(),
+            token_address: addr(&env(&format!("{prefix}_TOKEN_ADDRESS"))?)?,
+            factory_address: addr(&env(&format!("{prefix}_FACTORY_ADDRESS"))?)?,
+            registry_start_block: env(&format!("{prefix}_REGISTRY_START_BLOCK"))?
                 .parse()
-                .context("BASE_REGISTRY_START_BLOCK must be a valid u64")?,
-            webhook_registry_address: addr(&env("BASE_WEBHOOK_REGISTRY_ADDRESS")?)?,
-            webhook_registry_start_block: env("BASE_WEBHOOK_REGISTRY_START_BLOCK")?
-                .parse()
-                .context("BASE_WEBHOOK_REGISTRY_START_BLOCK must be a valid u64")?,
-            keeper_wallet: load_keeper_wallet(&env("BASE_SWEEP_PRIVATE_KEY")?)?,
+                .with_context(|| format!("{prefix}_REGISTRY_START_BLOCK must be a valid u64"))?,
+            webhook_registry_address: addr(&env(&format!(
+                "{prefix}_WEBHOOK_REGISTRY_ADDRESS"
+            ))?)?,
+            webhook_registry_start_block: env(&format!(
+                "{prefix}_WEBHOOK_REGISTRY_START_BLOCK"
+            ))?
+            .parse()
+            .with_context(|| {
+                format!("{prefix}_WEBHOOK_REGISTRY_START_BLOCK must be a valid u64")
+            })?,
+            keeper_wallet: load_keeper_wallet(
+                prefix,
+                &env(&format!("{prefix}_SWEEP_PRIVATE_KEY"))?,
+            )?,
             poll_interval: Duration::from_secs(
-                env("BASE_POLL_INTERVAL_SECS")
+                env(&format!("{prefix}_POLL_INTERVAL_SECS"))
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(12),
             ),
-            deposit_start_block: env("BASE_DEPOSIT_START_BLOCK")?
+            deposit_start_block: env(&format!("{prefix}_DEPOSIT_START_BLOCK"))?
                 .parse()
-                .context("BASE_DEPOSIT_START_BLOCK must be a valid u64")?,
-            subsquid_portal_url: env("BASE_SUBSQUID_PORTAL_URL").context(
-                "missing BASE_SUBSQUID_PORTAL_URL (e.g. https://portal.sqd.dev/datasets/base-mainnet)",
+                .with_context(|| format!("{prefix}_DEPOSIT_START_BLOCK must be a valid u64"))?,
+            subsquid_portal_url: env(&format!("{prefix}_SUBSQUID_PORTAL_URL")).with_context(
+                || {
+                    format!(
+                        "missing {prefix}_SUBSQUID_PORTAL_URL (e.g. https://portal.sqd.dev/datasets/base-mainnet)"
+                    )
+                },
             )?,
-            subsquid_portal_api_key: env("BASE_SUBSQUID_PORTAL_API_KEY").context(
-                "missing BASE_SUBSQUID_PORTAL_API_KEY (Get one from https://portal.sqd.dev/)",
-            )?,
+            subsquid_portal_api_key: env(&format!("{prefix}_SUBSQUID_PORTAL_API_KEY"))
+                .with_context(|| {
+                    format!("missing {prefix}_SUBSQUID_PORTAL_API_KEY (Get one from https://portal.sqd.dev/)")
+                })?,
         })
     }
 }
@@ -308,12 +328,12 @@ fn addr(s: &str) -> Result<Address> {
         .with_context(|| format!("invalid address: {s}"))
 }
 
-/// WEBHOOK_ED25519_SEED_HEX is gone — same key as BASE_SWEEP_PRIVATE_KEY, parsed without a
-/// chain ID since personal_sign message signing doesn't bind to one.
-fn load_keeper_wallet(hex_key: &str) -> Result<EvmLocalWallet> {
+/// WEBHOOK_ED25519_SEED_HEX is gone — same key as `{prefix}_SWEEP_PRIVATE_KEY`,
+/// parsed without a chain ID since personal_sign message signing doesn't bind to one.
+fn load_keeper_wallet(prefix: &str, hex_key: &str) -> Result<EvmLocalWallet> {
     hex_key
         .parse::<EvmLocalWallet>()
-        .context("BASE_SWEEP_PRIVATE_KEY is not a valid private key")
+        .with_context(|| format!("{prefix}_SWEEP_PRIVATE_KEY is not a valid private key"))
 }
 
 pub fn now_unix() -> i64 {
