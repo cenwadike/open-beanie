@@ -38,7 +38,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use crate::config::{Deposit, SolanaConfig};
@@ -459,14 +459,33 @@ pub static SQD_SOLANA_RATE_LIMITER: LazyLock<DefaultDirectRateLimiter> = LazyLoc
     RateLimiter::direct(quota)
 });
 
-fn portal_http_client() -> &'static reqwest::Client {
-    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+/// One shared, timeout-bounded, `x-api-key`-carrying HTTP client for
+/// every Subsquid Portal request the Solana side makes — catch-up
+/// (`current_slot`, `stream_solana` below) and live tips
+/// (`solana_ws::run_solana_subscription`) alike, so `solana_ws.rs` no
+/// longer has to build its own bare, unauthenticated client per call.
+///
+/// Only one `SolanaConfig` exists per process today, so a single
+/// `OnceLock` (built from whichever `cfg` first calls this) is enough —
+/// unlike the EVM side's `evm_indexer::portal`, which is keyed per
+/// config because Base and Arbitrum are two distinct deployments.
+pub(crate) fn portal_http_client(cfg: &SolanaConfig) -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+        if let Some(key) = &cfg.subsquid_portal_api_key {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "x-api-key",
+                reqwest::header::HeaderValue::from_str(key)
+                    .expect("SOLANA_SUBSQUID_PORTAL_API_KEY is not a valid HTTP header value"),
+            );
+            builder = builder.default_headers(headers);
+        }
+        builder
             .build()
             .expect("failed building shared Subsquid Portal HTTP client (Solana)")
-    });
-    &CLIENT
+    })
 }
 
 #[derive(Deserialize)]
@@ -503,7 +522,7 @@ struct PortalInstruction {
 /// pattern as evm_indexer.rs's `current_head`.
 pub async fn current_slot(cfg: &SolanaConfig) -> Result<u64> {
     let base_url = cfg.subsquid_portal_url.trim_end_matches('/');
-    let client = portal_http_client();
+    let client = portal_http_client(cfg);
 
     let head_url = format!("{base_url}/head");
     if let Ok(resp) = client.get(&head_url).send().await {
@@ -562,7 +581,7 @@ async fn stream_solana(
         return Ok(None);
     }
 
-    let client = portal_http_client();
+    let client = portal_http_client(cfg);
     let stream_url = format!("{}/stream", cfg.subsquid_portal_url.trim_end_matches('/'));
     let mut cursor = from_slot;
     let mut last_seen: Option<u64> = None;

@@ -5,10 +5,12 @@ use ethers::utils::keccak256;
 
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use log::{debug, info, warn};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{Deposit, EvmConfig};
@@ -34,7 +36,7 @@ pub const DEPOSITS_SCAN_ID: &str = "evm:deposits:v2";
 ///
 /// This is the *starting* and maximum window size, not a fixed one —
 /// `stream_logs` shrinks below this adaptively when a window proves too
-/// heavy to answer within the client timeout (see `portal_http_client`),
+/// heavy to answer within the client timeout (see `portal()`'s doc comment),
 /// which is exactly the failure mode a high-log-volume contract like
 /// Base's native USDC hits: the registry scan's two low-traffic addresses
 /// never need to shrink, but a Transfer-event scan over USDC can.
@@ -116,40 +118,76 @@ fn parse_topic_addr(topic_hex: &str) -> Option<Address> {
     Some(Address::from_slice(&bytes[12..32]))
 }
 
-pub static SQD_RATE_LIMITER: LazyLock<DefaultDirectRateLimiter> = LazyLock::new(|| {
-    // Subsquid Portal's documented limit is 20 requests per 10 seconds —
-    // i.e. a sustained rate of 2 req/sec, same as before, but with a full
-    // 20-request burst allowance rather than the previous cap of 5. Capping
-    // burst below what the server actually grants was making us self-throttle
-    // before Portal would have, on top of whatever real throttling it does.
+/// A client + rate limiter for one Subsquid Portal deployment. One
+/// `EvmConfig` (Base, Arbitrum, ...) gets exactly one `PortalHandle`,
+/// looked up/created by `portal()` below and reused for every request
+/// that config makes.
+pub struct PortalHandle {
+    pub client: reqwest::Client,
+    pub limiter: DefaultDirectRateLimiter,
+}
+
+/// Keyed by `subsquid_portal_url`, not a single global `static`. Two EVM
+/// chains talking to two different Portal deployments (Base, Arbitrum)
+/// must not share one rate-limit bucket or one set of default headers —
+/// each gets its own `PortalHandle` here, built once and reused for
+/// every request `cfg` makes for the rest of the process's life.
+static PORTAL_CLIENTS: LazyLock<Mutex<HashMap<String, Arc<PortalHandle>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns this config's `PortalHandle`, building it on first use.
+///
+/// The client carries `x-api-key: cfg.subsquid_portal_api_key` as a
+/// default header on every request — see sqd.dev/developers'
+/// "Authentication" section: paths and payloads are identical between
+/// the public and an authenticated/dedicated Portal, so sending the key
+/// is the entire difference between sharing the public pool and getting
+/// this chain its own capacity.
+///
+/// The limiter quota mirrors what the shared public Portal documents (20
+/// requests per 10 seconds / 2 req/sec sustained, full burst). A
+/// dedicated portal may grant more than that, but Subsquid doesn't
+/// publish a fixed authenticated number, so each bucket stays at this
+/// conservative default until told otherwise — the win here is
+/// isolation (Base's pace no longer throttles Arbitrum's and vice
+/// versa), not a higher ceiling.
+///
+/// Every call site that used to reach for the old `portal_http_client()`
+/// / `SQD_RATE_LIMITER` statics should use `portal(cfg).client` /
+/// `portal(cfg).limiter` instead.
+pub fn portal(cfg: &EvmConfig) -> Arc<PortalHandle> {
+    let mut clients = PORTAL_CLIENTS
+        .lock()
+        .expect("Subsquid portal client registry mutex poisoned");
+
+    if let Some(handle) = clients.get(&cfg.subsquid_portal_url) {
+        return handle.clone();
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(&cfg.subsquid_portal_api_key)
+            .expect("BASE_SUBSQUID_PORTAL_API_KEY is not a valid HTTP header value"),
+    );
+
+    // Timeout-bounded, same reasoning as the old shared client: a single
+    // slow/stuck Portal response should surface as a retryable error, not
+    // hang indefinitely (reqwest's default is no timeout at all).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .default_headers(headers)
+        .build()
+        .expect("failed building Subsquid Portal HTTP client");
+
     let quota = Quota::with_period(Duration::from_millis(500))
         .unwrap()
         .allow_burst(NonZeroU32::new(20).unwrap());
+    let limiter = RateLimiter::direct(quota);
 
-    RateLimiter::direct(quota)
-});
-
-/// One shared, timeout-bounded HTTP client for every Subsquid Portal
-/// request this process makes.
-///
-/// Every call site here used to build its own `reqwest::Client::new()`,
-/// which carries reqwest's default of *no timeout at all*. Against a
-/// contract as busy as Base's native USDC (the deposits scan's target),
-/// a single slow or stuck Portal response for one block window could hang
-/// the request indefinitely — no error, no retry, no log line, just
-/// silence for as long as Portal took. That's indistinguishable from a
-/// genuine hang from the outside, which is exactly what made the deposits
-/// catch-up look stuck rather than slow. 60s is generous for a single
-/// window's response; anything slower than that is now treated the same
-/// as a rate-limit or availability error — retried, not silently stalled.
-fn portal_http_client() -> &'static reqwest::Client {
-    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("failed building shared Subsquid Portal HTTP client")
-    });
-    &CLIENT
+    let handle = Arc::new(PortalHandle { client, limiter });
+    clients.insert(cfg.subsquid_portal_url.clone(), handle.clone());
+    handle
 }
 
 /// Renders a duration in seconds as a short human string for progress
@@ -351,6 +389,7 @@ pub async fn handle_portal_response(
 /// return value equals `to_block`).
 async fn stream_logs(
     client: &reqwest::Client,
+    limiter: &DefaultDirectRateLimiter,
     portal_url: &str,
     scan_id: &str,
     cache: &LogCache,
@@ -388,7 +427,7 @@ async fn stream_logs(
 
     // Adaptive window: starts at the max and shrinks when a window proves
     // too heavy to answer within the client timeout (see
-    // `portal_http_client`'s doc comment for why that's the failure mode
+    // `portal()`'s doc comment for why that's the failure mode
     // this exists for — a high-log-volume contract like USDC on Base can
     // make a 50k-block window genuinely too much for Portal to answer
     // quickly, and retrying the *same* window size just walks into the
@@ -423,7 +462,7 @@ async fn stream_logs(
             "logs": filters.iter().map(LogFilter::to_json).collect::<Vec<_>>(),
         });
 
-        SQD_RATE_LIMITER.until_ready().await;
+        limiter.until_ready().await;
         let resp = match client.post(&stream_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) if e.is_timeout() || e.is_connect() => {
@@ -546,7 +585,7 @@ async fn stream_logs(
             break;
         }
 
-        // `SQD_RATE_LIMITER` already paces requests; this is only a short
+        // `limiter` already paces requests; this is only a short
         // courtesy pause (it used to be a flat 1s after every batch, even the
         // last, which alone capped a 1_000-block scan near 1_000 blocks/sec).
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -564,7 +603,7 @@ async fn stream_logs(
 /// Fetches current chain head directly from SQD Portal /head endpoint.
 pub async fn current_head(cfg: &EvmConfig) -> Result<u64> {
     let base_url = cfg.subsquid_portal_url.trim_end_matches('/');
-    let client = portal_http_client();
+    let client = &portal(cfg).client;
 
     // 1. First try the official dataset /head endpoint
     let head_url = format!("{base_url}/head");
@@ -908,9 +947,10 @@ async fn discover_registry_range(
     let mut merchants = Vec::new();
     let mut webhooks = Vec::new();
 
-    let client = portal_http_client();
+    let handle = portal(cfg);
     let last_seen = stream_logs(
-        client,
+        &handle.client,
+        &handle.limiter,
         &cfg.subsquid_portal_url,
         REGISTRY_WEBHOOK_SCAN_ID,
         cache,
@@ -1042,13 +1082,14 @@ pub async fn fetch_deposits_since_block(
     };
 
     let mut deposits = Vec::new();
-    let client = portal_http_client();
+    let handle = portal(cfg);
 
     // persist_checkpoint = false: the deposits found are only returned to the
     // caller when the whole scan finishes, so the checkpoint must not run
     // ahead of them. It is written once, below, after the scan completes.
     let last_seen = stream_logs(
-        client,
+        &handle.client,
+        &handle.limiter,
         &cfg.subsquid_portal_url,
         DEPOSITS_SCAN_ID,
         cache,

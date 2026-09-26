@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::config::SolanaConfig;
+use crate::solana_indexer::{SQD_SOLANA_RATE_LIMITER, portal_http_client};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SolanaTip {
@@ -113,9 +114,13 @@ async fn stream_solana_tips_once(
         "instructions": instructions_filter
     });
 
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(Duration::from_secs(15))
-        .build()?;
+    // Was building a brand-new, unauthenticated, unrate-limited client on
+    // every single call here — no `x-api-key`, no connection reuse, and
+    // (unlike the catch-up scans in solana_indexer.rs) no
+    // `SQD_SOLANA_RATE_LIMITER.until_ready()` at all. Now shares both with
+    // the catch-up path, same posture as evm_ws.rs sharing evm_indexer.rs's.
+    SQD_SOLANA_RATE_LIMITER.until_ready().await;
+    let client = portal_http_client(cfg);
 
     let url = format!("{}/stream", cfg.subsquid_portal_url.trim_end_matches('/'));
     let resp = client

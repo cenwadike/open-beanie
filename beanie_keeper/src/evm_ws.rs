@@ -4,6 +4,7 @@
 //! NDJSON stream (`POST /stream`), maintaining live push delivery to `transfer_workers.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address as AlloyAddress, Bytes as AlloyBytes};
@@ -17,7 +18,8 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
-use crate::evm_indexer::SQD_RATE_LIMITER;
+use crate::config::EvmConfig;
+use crate::evm_indexer::portal;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EvmTip {
@@ -100,8 +102,14 @@ struct SubsquidLog {
 }
 
 /// Streams block tips and contract activity from Subsquid Portal in real time.
+///
+/// Takes the full `EvmConfig` (not just its `subsquid_portal_url`) so it
+/// can look up *this chain's own* `PortalHandle` via `evm_indexer::portal`
+/// — same client (with its `x-api-key` header) and same rate-limit bucket
+/// the catch-up scans for this config use, isolated from any other EVM
+/// chain's (e.g. Base vs. Arbitrum).
 pub async fn run_evm_subscription(
-    subsquid_portal_url: String,
+    cfg: Arc<EvmConfig>,
     factory_address: AlloyAddress,
     webhook_registry_address: AlloyAddress,
     from_block: u64,
@@ -109,13 +117,15 @@ pub async fn run_evm_subscription(
 ) {
     let mut current_block = from_block;
     let mut backoff = Duration::from_secs(1);
+    let handle = portal(&cfg);
 
     loop {
-        SQD_RATE_LIMITER.until_ready().await;
+        handle.limiter.until_ready().await;
 
         let block_before = current_block;
         let result = stream_subsquid_once(
-            &subsquid_portal_url,
+            &handle.client,
+            &cfg.subsquid_portal_url,
             factory_address,
             webhook_registry_address,
             &mut current_block,
@@ -145,16 +155,13 @@ pub async fn run_evm_subscription(
 }
 
 async fn stream_subsquid_once(
+    client: &reqwest::Client,
     portal_url: &str,
     factory_address: AlloyAddress,
     webhook_registry_address: AlloyAddress,
     current_block: &mut u64,
     tips_tx: &mpsc::Sender<EvmTip>,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .tcp_keepalive(Duration::from_secs(15))
-        .build()?;
-
     let query = SubsquidStreamQuery {
         query_type: "evm".to_string(),
         from_block: *current_block,
