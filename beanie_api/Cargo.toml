@@ -29,3 +29,6 @@ alloy = "2.4.2"
 log = "0.4.34"
 simple_logger = "5.2.0"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+solana-client = "4.2.2"
+solana-sdk = "4.1"
+spl-associated-token-account = "8.0.0"

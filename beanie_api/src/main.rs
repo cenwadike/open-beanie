@@ -1,18 +1,3 @@
-//! Beanie API Server
-//!
-//! This is the main entry point for the Beanie API server.
-//! It provides HTTP endpoints for using with the Beanie.
-//! Supports payment and stealth systems.
-//!
-//! # Endpoints
-//!
-//! - `POST /api/v1/auth/register/start` - initiate passkey registration
-//! - `POST /api/v1/auth/register/finish` - complete passkey registration
-//! - `POST /api/v1/auth/start` - initiate WebAuthn authentication ceremony
-//! - `POST /api/v1/auth/finish` - complete WebAuthn authentication ceremony
-//! - `POST /api/v1/pay` - process gasless payment request
-//! - `POST /api/v1/stealth/claim` - process a stateless stealth account claim
-
 mod auth;
 mod config;
 mod create_routes;
@@ -34,7 +19,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
-use beanie_keeper::config::{EvmConfig, StarknetConfig};
+use beanie_keeper::config::{EvmConfig, SolanaConfig, StarknetConfig};
 use std::{sync::Arc, time::Duration};
 
 use tower::ServiceExt;
@@ -58,12 +43,10 @@ use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
 pub async fn serve_static(req: Request) -> Response {
     let path = req.uri().path().to_string();
 
-    // Serve root index page
     if path == "/" {
         return serve_file("public/beanie.html", Some("text/html"), req).await;
     }
 
-    // Handle clean HTML URLs without .html extension
     if let Some(clean) = path.strip_suffix(".html") {
         let candidate = format!("public{clean}.html");
         return if tokio::fs::metadata(&candidate).await.is_ok() {
@@ -79,7 +62,6 @@ pub async fn serve_static(req: Request) -> Response {
 
     let has_ext = path.rsplit('/').next().unwrap_or("").contains('.');
 
-    // Fall back to clean HTML file lookup if path doesn't contain a file extension or asset directory
     if !has_ext && !is_asset_dir {
         let candidate = format!("public{path}.html");
         return if tokio::fs::metadata(&candidate).await.is_ok() {
@@ -89,7 +71,6 @@ pub async fn serve_static(req: Request) -> Response {
         };
     }
 
-    // Serve raw static asset files
     let candidate = format!("public{path}");
     if tokio::fs::metadata(&candidate).await.is_ok() {
         serve_file(&candidate, None, req).await
@@ -102,7 +83,6 @@ pub async fn serve_static(req: Request) -> Response {
 pub async fn serve_file(path: &str, forced_content_type: Option<&str>, req: Request) -> Response {
     match ServeFile::new(path).oneshot(req).await {
         Ok(mut res) => {
-            // Infer or enforce correct Content-Type header
             let content_type = match forced_content_type {
                 Some(explicit_type) => explicit_type.to_string(),
                 None => mime_guess::from_path(path)
@@ -129,13 +109,13 @@ async fn main() -> anyhow::Result<()> {
 
     dotenvy::dotenv().ok();
 
-    // Initializes the logger at the 'Info' level by default
     simple_logger::init_with_level(log::Level::Info).unwrap();
 
     info!("[baeanie_api::main]: Starting up Beanie API");
     let cfg = Config::from_env()?;
     let starknet_cfg = StarknetConfig::from_env()?;
     let evm_cfg = EvmConfig::from_env()?;
+    let solana_cfg = SolanaConfig::from_env()?;
     debug!("[baeanie_api::main]: env loaded");
 
     // 1. Initialize EVM Provider & Signer Client
@@ -144,9 +124,16 @@ async fn main() -> anyhow::Result<()> {
     // 2. Initialize Starknet Account Client
     let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
 
+    // 3. Initialize Solana RPC client + keeper wallet. No separate vendor
+    // client to build — solana_indexer.rs/solana_ws.rs talk to Subsquid
+    // Portal directly using solana_cfg.
+    let solana_rpc = beanie_keeper::solana_keeper::build_client(&solana_cfg);
+    let solana_keeper_wallet = solana_cfg.keeper_wallet.clone();
+    let solana_cfg = Arc::new(solana_cfg);
+
     debug!("[baeanie_api::main]: clients loaded");
 
-    // 3. Setup Bounded Channels and Background Workers
+    // 4. Setup Bounded Channels and Background Workers
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
     let stealth_tx = Arc::new(stealth_tx);
 
@@ -209,16 +196,20 @@ async fn main() -> anyhow::Result<()> {
         webhook_tx.clone(),
     ));
 
-    // Spawn native transfer worker
+    // Spawn native transfer worker (EVM + Starknet + Solana)
     let evm_cfg_clone = state.evm_config.clone();
     let starknet_cfg_clone = state.starknet_config.clone();
+    let webhook_tx_for_transfer = webhook_tx.clone();
     tokio::spawn(async move {
         crate::transfer_workers::run_native_transfer_poller(
             transfer_evm_client_clone,
             transfer_starknet_account_clone,
+            solana_rpc,
+            solana_keeper_wallet,
             evm_cfg_clone,
             starknet_cfg_clone,
-            webhook_tx.clone(),
+            solana_cfg,
+            webhook_tx_for_transfer,
         )
         .await;
     });
