@@ -114,12 +114,17 @@ async fn main() -> anyhow::Result<()> {
     info!("[baeanie_api::main]: Starting up Beanie API");
     let cfg = Config::from_env()?;
     let starknet_cfg = StarknetConfig::from_env()?;
-    let evm_cfg = EvmConfig::from_env()?;
+    let evm_cfg = EvmConfig::from_env("BASE", "base")?;
+    let arbitrum_cfg = EvmConfig::from_env("ARBITRUM", "arbitrum")?;
     let solana_cfg = SolanaConfig::from_env()?;
     debug!("[baeanie_api::main]: env loaded");
 
-    // 1. Initialize EVM Provider & Signer Client
+    // 1. Initialize EVM Provider & Signer Clients — one per EVM chain.
+    // Base's client also backs the announce/payment/stealth flows below,
+    // which stay single-chain (Base only) for now; Arbitrum's client is
+    // only used by the native transfer poller further down.
     let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
+    let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
 
     // 2. Initialize Starknet Account Client
     let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
@@ -161,13 +166,13 @@ async fn main() -> anyhow::Result<()> {
         payment_tx: payment_tx.clone(),
         app_config: Arc::new(cfg.clone()),
         starknet_config: Arc::new(StarknetConfig::from_env()?),
-        evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env()?),
+        evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env("BASE", "base")?),
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
     let worker_state = Arc::new(state.clone());
     let announce_evm_client_clone = evm_client.clone();
     let payment_evm_client_clone = evm_client.clone();
-    let transfer_evm_client_clone = evm_client.clone();
+    let base_client = evm_client.clone();
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
     let transfer_starknet_account_clone = starknet_account.clone();
@@ -196,17 +201,24 @@ async fn main() -> anyhow::Result<()> {
         webhook_tx.clone(),
     ));
 
-    // Spawn native transfer worker (EVM + Starknet + Solana)
-    let evm_cfg_clone = state.evm_config.clone();
+    // Spawn native transfer worker (EVM chains + Starknet + Solana).
+    // `evm_chains` is where a third EVM-compatible chain would be added —
+    // one more `EvmConfig::from_env(prefix, name)` + `build_client` call
+    // above, one more tuple pushed on here. `evm_indexer::portal` and the
+    // chain-scoped `LogCache` scan ids handle keeping each chain's rate
+    // limit, Portal client, and checkpoint isolated from the others.
+    let evm_chains = vec![
+        (base_client, state.evm_config.clone()),
+        (arbitrum_client, Arc::new(arbitrum_cfg)),
+    ];
     let starknet_cfg_clone = state.starknet_config.clone();
     let webhook_tx_for_transfer = webhook_tx.clone();
     tokio::spawn(async move {
         crate::transfer_workers::run_native_transfer_poller(
-            transfer_evm_client_clone,
+            evm_chains,
             transfer_starknet_account_clone,
             solana_rpc,
             solana_keeper_wallet,
-            evm_cfg_clone,
             starknet_cfg_clone,
             solana_cfg,
             webhook_tx_for_transfer,

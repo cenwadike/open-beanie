@@ -32,3 +32,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 solana-client = "4.2.2"
 solana-sdk = "4.1"
 spl-associated-token-account = "8.0.0"
+futures-util = "0.3.34"

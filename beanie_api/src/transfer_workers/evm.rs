@@ -1,4 +1,8 @@
-//! EVM (Base) native transfer worker.
+//! EVM native transfer worker — one instance per EVM-compatible chain
+//! (Base, Arbitrum, ...), each given its own `EvmConfig`/`SignerProvider`
+//! by `transfer_workers/mod.rs`'s `evm_chains` list. Nothing in this file
+//! is Base-specific; everything chain-identifying comes from the `cfg`
+//! passed in.
 //!
 //! Pipeline: historical catch-up -> live push-tip loop (registry/webhook
 //! discovery + deposit scan, combined where possible into one
@@ -253,7 +257,7 @@ pub(super) async fn run_evm_worker(
     let webhook_addr_alloy = alloy::primitives::Address::from(evm_cfg.webhook_registry_address.0);
 
     tokio::spawn(beanie_keeper::evm_ws::run_evm_subscription(
-        evm_cfg.subsquid_portal_url.clone(),
+        evm_cfg.clone(),
         factory_addr_alloy,
         webhook_addr_alloy,
         ws_start_block,
@@ -354,9 +358,9 @@ async fn process_evm_tip(
     // flag alone would let us skip a whole unscanned range and mark it
     // "empty" forever. Only rely on the flag when there's no backlog to
     // lose; otherwise scan for real.
-    let registry_webhook_checkpoint = match log_cache
-        .get_checkpoint(beanie_keeper::evm_indexer::REGISTRY_WEBHOOK_SCAN_ID)
-    {
+    let registry_webhook_checkpoint = match log_cache.get_checkpoint(
+        &beanie_keeper::evm_indexer::registry_webhook_scan_id(&**evm_cfg),
+    ) {
         Ok(cp) => cp,
         Err(e) => {
             error!(
@@ -404,9 +408,10 @@ async fn process_evm_tip(
     } else if registry_webhook_watermark == tip_bn {
         // The stream already reported no factory/webhook-registry logs in this
         // exact block and there's no gap behind it, so it's safe to mark scanned.
-        if let Err(e) =
-            log_cache.set_checkpoint(beanie_keeper::evm_indexer::REGISTRY_WEBHOOK_SCAN_ID, tip_bn)
-        {
+        if let Err(e) = log_cache.set_checkpoint(
+            &beanie_keeper::evm_indexer::registry_webhook_scan_id(&**evm_cfg),
+            tip_bn,
+        ) {
             error!("failed advancing registry/webhook checkpoint to {tip_bn}: {e:#}");
         }
     }
@@ -422,7 +427,7 @@ async fn process_evm_tip(
         return;
     }
     let deposit_watermark =
-        match log_cache.get_checkpoint(beanie_keeper::evm_indexer::DEPOSITS_SCAN_ID) {
+        match log_cache.get_checkpoint(&beanie_keeper::evm_indexer::deposits_scan_id(&**evm_cfg)) {
             Ok(cp) => cp,
             Err(e) => {
                 error!("failed reading deposit checkpoint: {e:#} — treating as no progress yet");
