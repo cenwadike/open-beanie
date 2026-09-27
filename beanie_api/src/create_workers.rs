@@ -13,8 +13,8 @@ use crate::models::{AnnounceTask, Chain, ReceiverFactory, derive_felt_from_forei
 use crate::payment_workers::StarknetAccount;
 
 // ---------------------------------------------------------------------------
-// CCTP route encoding. Unchanged from before — Arbitrum slots into the same
-// EVM branch as Base/Ethereum since it's the same ABI, just a different
+// CCTP route encoding. Arbitrum and Monad both slot into the same EVM
+// branch as Base/Ethereum since it's the same ABI, just a different
 // deployment (and, correctly, its own client) — passed in via
 // `evm_targets` below, keyed by chain.
 // ---------------------------------------------------------------------------
@@ -25,6 +25,7 @@ fn same_chain(a: &Chain, b: &Chain) -> bool {
         (Chain::Base, Chain::Base)
             | (Chain::Ethereum, Chain::Ethereum)
             | (Chain::Arbitrum, Chain::Arbitrum)
+            | (Chain::Monad, Chain::Monad)
             | (Chain::Starknet, Chain::Starknet)
             | (Chain::Solana, Chain::Solana)
     )
@@ -35,6 +36,7 @@ fn chain_key(chain: &Chain) -> Option<&'static str> {
         Chain::Base => Some("BASE"),
         Chain::Ethereum => Some("ETHEREUM"),
         Chain::Arbitrum => Some("ARBITRUM"),
+        Chain::Monad => Some("MONAD"),
         Chain::Starknet => Some("STARKNET"),
         Chain::Solana => Some("SOLANA"),
     }
@@ -42,7 +44,7 @@ fn chain_key(chain: &Chain) -> Option<&'static str> {
 
 fn recipient_bytes32(target: &Chain, recipient: &str) -> Option<[u8; 32]> {
     match target {
-        Chain::Base | Chain::Ethereum | Chain::Arbitrum => {
+        Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad => {
             let addr: Address = recipient.parse().ok()?;
             let mut out = [0u8; 32];
             out[12..].copy_from_slice(addr.as_bytes());
@@ -153,7 +155,7 @@ pub async fn run_announce_worker(
 
     while let Some(task) = rx.recv().await {
         match task.chain {
-            Chain::Base | Chain::Ethereum | Chain::Arbitrum => {
+            Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad => {
                 let merchant: Address = task.merchant_address.parse().unwrap_or_else(|_| {
                     let hash = keccak256(task.merchant_address.as_bytes());
                     Address::from_slice(&hash[12..32])

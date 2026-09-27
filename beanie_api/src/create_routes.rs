@@ -86,14 +86,16 @@ fn parse_and_sanitize_solana_addr(input: &str) -> Result<String, &'static str> {
     Ok(pubkey.to_string())
 }
 
-/// Per-chain address canonicalization. Arbitrum shares Base/Ethereum's EVM
-/// hex-address parsing (same address format, different deployment); Solana
-/// gets its own base58 pubkey parsing. No wildcard arm on purpose — adding a
-/// `Chain` variant without a case here is now a compile error, not a
-/// silent 400.
+/// Per-chain address canonicalization. Arbitrum and Monad share Base/
+/// Ethereum's EVM hex-address parsing (same address format, different
+/// deployments); Solana gets its own base58 pubkey parsing. No wildcard arm
+/// on purpose — adding a `Chain` variant without a case here is now a
+/// compile error, not a silent 400.
 fn sanitize_address_for_chain(chain: Chain, input: &str) -> Result<String, &'static str> {
     match chain {
-        Chain::Base | Chain::Ethereum | Chain::Arbitrum => parse_and_sanitize_evm_addr(input),
+        Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad => {
+            parse_and_sanitize_evm_addr(input)
+        }
         Chain::Starknet => parse_and_sanitize_felt(input),
         Chain::Solana => parse_and_sanitize_solana_addr(input),
     }

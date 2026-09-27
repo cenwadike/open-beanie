@@ -73,7 +73,7 @@ pub async fn run_native_transfer_poller(
 
     // One `run_evm_worker` future per configured EVM chain, run
     // concurrently via `join_all` rather than `tokio::join!` since the
-    // count isn't known until runtime (1 chain today, N once Arbitrum
+    // count isn't known until runtime (1 chain today, N once Ethereum,
     // etc. are added to `main.rs`'s `evm_chains` vec).
     let evm_futures = evm_chains.into_iter().map(|(evm_client, evm_cfg)| {
         let chain_name = evm_cfg.chain_name.clone();

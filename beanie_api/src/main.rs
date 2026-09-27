@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
     let starknet_cfg = StarknetConfig::from_env()?;
     let evm_cfg = EvmConfig::from_env("BASE", "base")?;
     let arbitrum_cfg = EvmConfig::from_env("ARBITRUM", "arbitrum")?;
+    let monad_cfg = EvmConfig::from_env("MONAD", "monad")?;
     let solana_cfg = SolanaConfig::from_env()?;
     debug!("[baeanie_api::main]: env loaded");
 
@@ -125,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // transfer poller further down.
     let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
+    let monad_client = beanie_keeper::evm_keeper::build_client(&monad_cfg).await?;
 
     // 2. Initialize Starknet Account Client
     let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
@@ -159,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
         (
             Chain::Arbitrum,
             (arbitrum_client.clone(), arbitrum_cfg.factory_address),
+        ),
+        (
+            Chain::Monad,
+            (monad_client.clone(), monad_cfg.factory_address),
         ),
     ]);
 
@@ -199,6 +205,9 @@ async fn main() -> anyhow::Result<()> {
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
     let transfer_starknet_account_clone = starknet_account.clone();
+    // solana_rpc/solana_keeper_wallet are moved into the transfer poller
+    // below, so the announce worker needs its own clone of each (both are
+    // Arc, so this is just a refcount bump).
     let announce_solana_rpc_clone = solana_rpc.clone();
     let announce_solana_keeper_clone = solana_keeper_wallet.clone();
 
@@ -233,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
     let evm_chains = vec![
         (base_client, state.evm_config.clone()),
         (arbitrum_client, Arc::new(arbitrum_cfg)),
+        (monad_client, Arc::new(monad_cfg)),
     ];
     let starknet_cfg_clone = state.starknet_config.clone();
     let webhook_tx_for_transfer = webhook_tx.clone();

@@ -42,6 +42,7 @@ pub enum Chain {
     Ethereum,
     Solana,
     Arbitrum,
+    Monad,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +148,7 @@ pub(crate) fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
         Chain::Base => "BASE",
         Chain::Ethereum => "ETHEREUM",
         Chain::Arbitrum => "ARBITRUM",
+        Chain::Monad => "MONAD",
         Chain::Starknet => "STARKNET",
         Chain::Solana => "SOLANA",
     };
@@ -159,6 +161,7 @@ pub(crate) fn chain_to_felt(chain: Chain) -> Felt {
         Chain::Base => Felt::from_hex(&hex::encode("BASE")).unwrap(),
         Chain::Ethereum => Felt::from_hex(&hex::encode("ETHEREUM")).unwrap(),
         Chain::Arbitrum => Felt::from_hex(&hex::encode("ARBITRUM")).unwrap(),
+        Chain::Monad => Felt::from_hex(&hex::encode("MONAD")).unwrap(),
         Chain::Solana => Felt::from_hex(&hex::encode("SOLANA")).unwrap(),
         Chain::Starknet => Felt::from_hex(&hex::encode("STARKNET")).unwrap(),
     }
