@@ -41,6 +41,7 @@ pub enum Chain {
     Starknet,
     Ethereum,
     Solana,
+    Arbitrum,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,13 @@ pub struct CallDto {
     pub calldata: Vec<String>,
 }
 
+/// Chain-agnostic on purpose. Solana does NOT get extra fields here: the
+/// `receiver` keypair its on-chain `announce_merchant` wants is a disposable
+/// signer generated and discarded by the worker (see
+/// `tests/solana_beanie.ts`'s `prepare()` and `create_workers.rs`'s Solana
+/// arm), never something the client produces or that needs to survive past
+/// the worker's own function call. `merchant_address` here is that stable
+/// merchant identity for every chain, Solana included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceTask {
     pub chain: Chain,
@@ -110,8 +118,6 @@ pub struct StealthTask {
     pub calls: Vec<CallDataPayload>,
 }
 
-// WebhookJob moved to `webhook_worker.rs` to keep payment workers focused
-// Webhook job type used across workers (kept in models so library modules can refer to it)
 #[derive(Debug, Clone)]
 pub struct WebhookJob {
     pub cfg: beanie_keeper::config::Config,
@@ -140,6 +146,7 @@ pub(crate) fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
     let name = match chain {
         Chain::Base => "BASE",
         Chain::Ethereum => "ETHEREUM",
+        Chain::Arbitrum => "ARBITRUM",
         Chain::Starknet => "STARKNET",
         Chain::Solana => "SOLANA",
     };
@@ -151,6 +158,7 @@ pub(crate) fn chain_to_felt(chain: Chain) -> Felt {
     match chain {
         Chain::Base => Felt::from_hex(&hex::encode("BASE")).unwrap(),
         Chain::Ethereum => Felt::from_hex(&hex::encode("ETHEREUM")).unwrap(),
+        Chain::Arbitrum => Felt::from_hex(&hex::encode("ARBITRUM")).unwrap(),
         Chain::Solana => Felt::from_hex(&hex::encode("SOLANA")).unwrap(),
         Chain::Starknet => Felt::from_hex(&hex::encode("STARKNET")).unwrap(),
     }
@@ -166,7 +174,6 @@ pub(crate) fn derive_felt_from_foreign_address(addr: &str) -> Felt {
 abigen!(
     ReceiverFactory,
     r#"[
-    
         function registerMerchant(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external returns (address)
         function getReceiverCount(address merchant) external view returns (uint256)
         function announceReceiver(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external

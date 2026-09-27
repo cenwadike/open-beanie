@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use beanie_keeper::config::{EvmConfig, SolanaConfig, StarknetConfig};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -31,7 +31,7 @@ use crate::auth::{
     AuthState, RateLimiter, auth_finish, auth_start, register_finish, register_start,
 };
 use crate::models::PaymentTask;
-use crate::models::{StealthTask, mpsc};
+use crate::models::{Chain, StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
 use crate::stealth_routes::execute_stealth_claim;
@@ -120,9 +120,9 @@ async fn main() -> anyhow::Result<()> {
     debug!("[baeanie_api::main]: env loaded");
 
     // 1. Initialize EVM Provider & Signer Clients — one per EVM chain.
-    // Base's client also backs the announce/payment/stealth flows below,
-    // which stay single-chain (Base only) for now; Arbitrum's client is
-    // only used by the native transfer poller further down.
+    // Base's client also backs the announce/payment/stealth flows below;
+    // Arbitrum's is used by both the announce worker (new) and the native
+    // transfer poller further down.
     let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
 
@@ -134,9 +134,33 @@ async fn main() -> anyhow::Result<()> {
     // Portal directly using solana_cfg.
     let solana_rpc = beanie_keeper::solana_keeper::build_client(&solana_cfg);
     let solana_keeper_wallet = solana_cfg.keeper_wallet.clone();
+    let solana_usdc_mint = solana_cfg.mint;
+    let solana_program_id = solana_cfg.program_id;
     let solana_cfg = Arc::new(solana_cfg);
 
     debug!("[baeanie_api::main]: clients loaded");
+
+    // Every EVM-family chain the announce worker can target, each with its
+    // own signer client. `Chain::Ethereum` has no separate client built
+    // anywhere in this file yet, so it's pointed at Base's for now — same
+    // behavior the pre-Solana code had by lumping Base|Ethereum together.
+    let evm_targets: HashMap<
+        Chain,
+        (
+            Arc<beanie_keeper::evm_keeper::SignerProvider>,
+            ethers::types::Address,
+        ),
+    > = HashMap::from([
+        (Chain::Base, (evm_client.clone(), evm_cfg.factory_address)),
+        (
+            Chain::Ethereum,
+            (evm_client.clone(), evm_cfg.factory_address),
+        ),
+        (
+            Chain::Arbitrum,
+            (arbitrum_client.clone(), arbitrum_cfg.factory_address),
+        ),
+    ]);
 
     // 4. Setup Bounded Channels and Background Workers
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
@@ -170,21 +194,25 @@ async fn main() -> anyhow::Result<()> {
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
     let worker_state = Arc::new(state.clone());
-    let announce_evm_client_clone = evm_client.clone();
     let payment_evm_client_clone = evm_client.clone();
     let base_client = evm_client.clone();
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
     let transfer_starknet_account_clone = starknet_account.clone();
+    let announce_solana_rpc_clone = solana_rpc.clone();
+    let announce_solana_keeper_clone = solana_keeper_wallet.clone();
 
     debug!("[baeanie_api::main]: app state loaded");
 
     // Spawn announce workers
     tokio::spawn(run_announce_worker(
-        announce_evm_client_clone,
+        evm_targets,
         announce_starknet_account_clone,
-        evm_cfg.factory_address,
+        announce_solana_rpc_clone,
+        announce_solana_keeper_clone,
         starknet_cfg.factory_address,
+        solana_program_id,
+        solana_usdc_mint,
         announce_rx,
     ));
 
@@ -202,11 +230,6 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Spawn native transfer worker (EVM chains + Starknet + Solana).
-    // `evm_chains` is where a third EVM-compatible chain would be added —
-    // one more `EvmConfig::from_env(prefix, name)` + `build_client` call
-    // above, one more tuple pushed on here. `evm_indexer::portal` and the
-    // chain-scoped `LogCache` scan ids handle keeping each chain's rate
-    // limit, Portal client, and checkpoint isolated from the others.
     let evm_chains = vec![
         (base_client, state.evm_config.clone()),
         (arbitrum_client, Arc::new(arbitrum_cfg)),

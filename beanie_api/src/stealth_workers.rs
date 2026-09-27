@@ -203,6 +203,7 @@ async fn fetch_lit_cosignature(state: &AppState, task: &StealthTask) -> Result<L
         Chain::Starknet => "starknet",
         Chain::Base => "base",
         Chain::Ethereum => "ethereum",
+        Chain::Arbitrum => "arbitrum",
         Chain::Solana => "solana",
     };
 

@@ -1,16 +1,29 @@
-// create_route.rs
+// create_routes.rs
 //
-// One route. It doesn't care whether `address` is the merchant's own wallet
-// (standard mode) or a client-derived stealth address (privacy mode) — in
-// both cases the job is identical: prove a passkey authorized announcing
-// *this* address on *this* chain, then enqueue the on-chain announce.
-// The distinction between standard/stealth lives entirely on the client;
-// this handler has no reason to know which one it's looking at.
+// One route, one shape, for every chain including Solana. `address` is always
+// the merchant identity the client wants announced (their own wallet in
+// standard mode, a client-derived stealth address in privacy mode); the
+// distinction between standard/stealth lives entirely on the client and this
+// handler never needs to know which one it's looking at.
 //
 // Every announce also names where the merchant is paid (`target_chain` +
-// `target_recipient`, both mandatory, chosen by the client). They are part of
-// the receiver's on-chain address, so the announce worker forwards them into
-// `announceReceiver` and the announce event carries them for the keeper.
+// `target_recipient`, both mandatory, chosen by the client).
+//
+// Solana note: earlier drafts of this route also asked the client for a
+// `solana_merchant` pubkey and a pre-signed `solana_reg_tx_hex` blob, on the
+// theory that Solana's on-chain `announce_merchant(merchant, ..., receiver,
+// reg_tx)` needs a `receiver` keypair's signature that only the client could
+// produce. That's wrong — see `tests/solana_beanie.ts`'s `prepare()`: the
+// `receiver` there is a keypair *generated on the spot, used to sign exactly
+// one tx, and discarded* ("the key is unreachable after return"). Nothing
+// about it is merchant-controlled or client-known; it's a disposable signer
+// invented purely to satisfy the program's account-creation requirements.
+// The keeper — which already pays for the nonce account, the ATAs, and the
+// announce tx itself — can generate that throwaway keypair, sign the
+// registration tx with it, and discard it, exactly like `prepare()` does in
+// the test. That whole dance now lives in `create_workers.rs`'s Solana arm.
+// So Solana needs nothing extra from the client: `address` carries the
+// merchant identity here too, same as every other chain.
 
 use axum::{
     Json,
@@ -62,6 +75,30 @@ fn parse_and_sanitize_felt(input: &str) -> Result<String, &'static str> {
     Ok(format!("{:#064x}", felt))
 }
 
+fn parse_and_sanitize_solana_addr(input: &str) -> Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Solana address cannot be empty");
+    }
+    let pubkey = trimmed
+        .parse::<solana_sdk::pubkey::Pubkey>()
+        .map_err(|_| "Invalid Solana base58 address")?;
+    Ok(pubkey.to_string())
+}
+
+/// Per-chain address canonicalization. Arbitrum shares Base/Ethereum's EVM
+/// hex-address parsing (same address format, different deployment); Solana
+/// gets its own base58 pubkey parsing. No wildcard arm on purpose — adding a
+/// `Chain` variant without a case here is now a compile error, not a
+/// silent 400.
+fn sanitize_address_for_chain(chain: Chain, input: &str) -> Result<String, &'static str> {
+    match chain {
+        Chain::Base | Chain::Ethereum | Chain::Arbitrum => parse_and_sanitize_evm_addr(input),
+        Chain::Starknet => parse_and_sanitize_felt(input),
+        Chain::Solana => parse_and_sanitize_solana_addr(input),
+    }
+}
+
 pub async fn announce_receiver(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -69,14 +106,11 @@ pub async fn announce_receiver(
 ) -> Response {
     // 1. Passkey verification — proves a real, verified passkey session
     //    authorized announcing exactly this chain+address, nothing else.
-
     let lane_id = payload.lane_id.trim();
     if lane_id.is_empty() || lane_id.len() > 128 {
         return err(StatusCode::BAD_REQUEST, "Invalid lane_id");
     }
 
-    // Bound to the lane as a whole now, not one chain+address, so a single
-    // ceremony can cover every chain announced for this lane.
     let binding = format!("create-lane:{lane_id}");
     let credential_id = match state
         .auth
@@ -91,38 +125,15 @@ pub async fn announce_receiver(
         }
     };
 
-    // 2. Canonicalize the address per chain.
-    let address = match payload.chain {
-        Chain::Base | Chain::Ethereum => match parse_and_sanitize_evm_addr(&payload.address) {
-            Ok(v) => v,
-            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid address: {e}")),
-        },
-        Chain::Starknet => match parse_and_sanitize_felt(&payload.address) {
-            Ok(v) => v,
-            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid address: {e}")),
-        },
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "Unsupported chain for receiver announcement",
-            );
-        }
+    // 2. Canonicalize the address per chain (same code path for all five now).
+    let address = match sanitize_address_for_chain(payload.chain, &payload.address) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid address: {e}")),
     };
 
     // 2b. Settlement target: must be a real address on the chosen chain.
-    let target_recipient = match payload.target_chain {
-        Chain::Base | Chain::Ethereum => {
-            match parse_and_sanitize_evm_addr(&payload.target_recipient) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid settlement address: {e}"),
-                    );
-                }
-            }
-        }
-        Chain::Starknet => match parse_and_sanitize_felt(&payload.target_recipient) {
+    let target_recipient =
+        match sanitize_address_for_chain(payload.target_chain, &payload.target_recipient) {
             Ok(v) => v,
             Err(e) => {
                 return err(
@@ -130,18 +141,16 @@ pub async fn announce_receiver(
                     &format!("Invalid settlement address: {e}"),
                 );
             }
-        },
-        _ => {
-            return err(StatusCode::BAD_REQUEST, "Unsupported settlement chain");
-        }
-    };
+        };
 
     // 3. Single rate-limit call site, now against a proven credential_id.
     if let Err(msg) = state.limiter.check(addr.ip(), &address, &credential_id) {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
-    // 4. Enqueue. Nothing else — worker does the actual on-chain announce.
+    // 4. Enqueue. Nothing else — worker does the actual on-chain announce,
+    //    including (for Solana) generating and discarding its own throwaway
+    //    receiver keypair. See create_workers.rs.
     let task = crate::models::AnnounceTask {
         chain: payload.chain,
         merchant_address: address,

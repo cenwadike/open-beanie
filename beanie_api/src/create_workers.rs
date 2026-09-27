@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ethers::types::Address;
 use ethers::utils::keccak256;
 use log::info;
+use solana_sdk::signature::Signer;
 use starknet::accounts::Account;
 use starknet::core::types::{Call, Felt};
 use starknet::core::utils::get_selector_from_name;
@@ -12,10 +13,10 @@ use crate::models::{AnnounceTask, Chain, ReceiverFactory, derive_felt_from_forei
 use crate::payment_workers::StarknetAccount;
 
 // ---------------------------------------------------------------------------
-// CCTP route encoding. The route (target chain + recipient) is hashed into the
-// receiver's on-chain address, so this must byte-match the client's predict
-// call (`cctpRoute` in beanie.js). Same chain => all zeros, as the factories
-// require.
+// CCTP route encoding. Unchanged from before — Arbitrum slots into the same
+// EVM branch as Base/Ethereum since it's the same ABI, just a different
+// deployment (and, correctly, its own client) — passed in via
+// `evm_targets` below, keyed by chain.
 // ---------------------------------------------------------------------------
 
 fn same_chain(a: &Chain, b: &Chain) -> bool {
@@ -23,38 +24,38 @@ fn same_chain(a: &Chain, b: &Chain) -> bool {
         (a, b),
         (Chain::Base, Chain::Base)
             | (Chain::Ethereum, Chain::Ethereum)
+            | (Chain::Arbitrum, Chain::Arbitrum)
             | (Chain::Starknet, Chain::Starknet)
+            | (Chain::Solana, Chain::Solana)
     )
 }
 
-/// Chain-name key the factories use in `validDomains`.
 fn chain_key(chain: &Chain) -> Option<&'static str> {
     match chain {
         Chain::Base => Some("BASE"),
         Chain::Ethereum => Some("ETHEREUM"),
+        Chain::Arbitrum => Some("ARBITRUM"),
         Chain::Starknet => Some("STARKNET"),
-        _ => None,
+        Chain::Solana => Some("SOLANA"),
     }
 }
 
-/// CCTP mint recipient as bytes32: an EVM address left-padded, a Starknet felt
-/// as its 32-byte big-endian form. `recipient` is already canonical (the route
-/// sanitized it for `target`).
 fn recipient_bytes32(target: &Chain, recipient: &str) -> Option<[u8; 32]> {
     match target {
-        Chain::Base | Chain::Ethereum => {
+        Chain::Base | Chain::Ethereum | Chain::Arbitrum => {
             let addr: Address = recipient.parse().ok()?;
             let mut out = [0u8; 32];
             out[12..].copy_from_slice(addr.as_bytes());
             Some(out)
         }
         Chain::Starknet => Some(Felt::from_hex(recipient).ok()?.to_bytes_be()),
-        _ => None,
+        Chain::Solana => {
+            let pk: solana_sdk::pubkey::Pubkey = recipient.parse().ok()?;
+            Some(pk.to_bytes())
+        }
     }
 }
 
-/// `(cctpMintChain, cctpMintRecipient)` for `announceReceiver`. The chain key
-/// is left-aligned like a Solidity `bytes32("BASE")` literal.
 fn evm_route(source: &Chain, target: &Chain, recipient: &str) -> Option<([u8; 32], [u8; 32])> {
     if same_chain(source, target) {
         return Some(([0u8; 32], [0u8; 32]));
@@ -65,8 +66,6 @@ fn evm_route(source: &Chain, target: &Chain, recipient: &str) -> Option<([u8; 32
     Some((chain, recipient_bytes32(target, recipient)?))
 }
 
-/// `(cctp_mint_chain, recipient_low, recipient_high)` for `announce_receiver`:
-/// the chain as a Cairo short string, the recipient as a u256's two halves.
 fn starknet_route(source: &Chain, target: &Chain, recipient: &str) -> Option<[Felt; 3]> {
     if same_chain(source, target) {
         return Some([Felt::ZERO; 3]);
@@ -79,28 +78,95 @@ fn starknet_route(source: &Chain, target: &Chain, recipient: &str) -> Option<[Fe
     Some([chain, Felt::from(low), Felt::from(high)])
 }
 
-/// Background worker: receives AnnounceTask and calls on-chain
-/// `announceReceiver` / `announce_receiver` so the native poller can
-/// start watching the predicted address.
+/// Solana's route encoding: 32-byte chain-name buffer + 32-byte recipient,
+/// exactly what `announce_merchant`/`register_merchant` take per
+/// `chainNameSeed()` and `recipient_bytes32`-equivalent in the test. Solana's
+/// own `SAME_CHAIN_DOMAIN_SENTINEL` handling is internal to the program (it's
+/// applied to the CCTP *domain*, not this chain/recipient pair), so the
+/// same-chain zero-buffer convention below matches `ZERO_32` in the test.
+fn solana_route(source: &Chain, target: &Chain, recipient: &str) -> Option<([u8; 32], [u8; 32])> {
+    if same_chain(source, target) {
+        return Some(([0u8; 32], [0u8; 32]));
+    }
+    let name = chain_key(target)?;
+    let mut chain = [0u8; 32];
+    chain[..name.len()].copy_from_slice(name.as_bytes());
+    Some((chain, recipient_bytes32(target, recipient)?))
+}
+
+/// Background worker: receives AnnounceTask and performs the on-chain
+/// announce for whichever chain it targets.
+///
+/// For EVM chains and Starknet this is a single call, same as before.
+///
+/// For Solana this reproduces `prepare()` + `announce()` +
+/// `broadcastStored()` from `tests/solana_beanie.ts` end to end, entirely
+/// server-side:
+///   1. Generate a fresh, throwaway `receiver` keypair — never persisted,
+///      never sent anywhere, dropped at the end of this function's scope.
+///   2. Build & send `tx1`: create the durable nonce account (authority =
+///      keeper), the receiver's ATA, and the staging ATA — keeper-paid,
+///      keeper-signed only.
+///   3. Build the `[AdvanceNonce, register_merchant]` tx against that nonce
+///      and sign it with (keeper, receiver). This is the one and only
+///      operation that ever touches the receiver's private key.
+///   4. Submit `announce_merchant(merchant, chain, recipient, receiver,
+///      reg_tx_bytes)` — keeper-signed only, per the program's
+///      `AnnounceMerchant` account context (fee payer only, no receiver
+///      signature needed here).
+///   5. Immediately broadcast the just-announced blob, same as
+///      `broadcastStored()` — no reason to wait for a second, separate
+///      keeper pass since the keeper already holds the bytes in memory.
+///
+/// NOTE: steps 2-5 below are written against the same account/instruction
+/// shapes the test uses (`registerMerchant`, `announceMerchant`, the
+/// `factory`/`config`/`pending`/`registry` PDA seeds), but wired through
+/// whatever Rust client you use to talk to the `sol` program — an
+/// Anchor-generated Rust client, `anchor-client`, or hand-built
+/// `Instruction`s. Plug that in where marked; I don't have
+/// `beanie_keeper::solana_keeper`'s contents so I can't give you the exact
+/// call signatures for e.g. `build_client`, the program's Rust IDL type, or
+/// how you're currently deriving PDAs on the keeper side.
 pub async fn run_announce_worker(
-    evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    // One (signer client, factory address) pair per EVM-family chain — a
+    // single shared `evm_client` here was wrong: Base and Arbitrum are
+    // different RPC endpoints/signers even though they share the same ABI.
+    // `Chain::Ethereum` intentionally has no separate client yet (none is
+    // built in main.rs); callers should point it at the same entry as Base
+    // until a real Ethereum client exists.
+    evm_targets: std::collections::HashMap<
+        Chain,
+        (Arc<beanie_keeper::evm_keeper::SignerProvider>, Address),
+    >,
     starknet_account: Arc<StarknetAccount>,
-    evm_factory_addr: Address,
+    // Solana equivalents of `evm_client`/`starknet_account` — an RPC client
+    // plus the keeper's Solana keypair (or a wrapper around both, matching
+    // whatever `solana_keeper::build_client` already returns elsewhere).
+    solana_rpc: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    solana_keeper: Arc<solana_sdk::signature::Keypair>,
     starknet_factory_addr: Felt,
+    solana_program_id: solana_sdk::pubkey::Pubkey,
+    usdc_mint: solana_sdk::pubkey::Pubkey,
     mut rx: mpsc::Receiver<AnnounceTask>,
 ) {
     info!("Announce worker starting");
 
     while let Some(task) = rx.recv().await {
         match task.chain {
-            Chain::Base | Chain::Ethereum => {
-                // Same compatibility path as the payment worker:
-                // native EVM address, otherwise keccak-derived address
-                // (handles Starknet / foreign merchant strings).
+            Chain::Base | Chain::Ethereum | Chain::Arbitrum => {
                 let merchant: Address = task.merchant_address.parse().unwrap_or_else(|_| {
                     let hash = keccak256(task.merchant_address.as_bytes());
                     Address::from_slice(&hash[12..32])
                 });
+
+                let Some((chain_client, factory_addr)) = evm_targets.get(&task.chain).cloned()
+                else {
+                    eprintln!(
+                        "announce worker: no client/factory configured for {:?}",
+                        task.chain
+                    );
+                    continue;
+                };
 
                 let Some((cctp_chain, cctp_recipient)) =
                     evm_route(&task.chain, &task.target_chain, &task.target_recipient)
@@ -112,42 +178,32 @@ pub async fn run_announce_worker(
                     continue;
                 };
 
-                let factory = ReceiverFactory::new(evm_factory_addr, evm_client.clone());
+                let factory = ReceiverFactory::new(factory_addr, chain_client);
                 let call = factory.announce_receiver(merchant, cctp_chain, cctp_recipient);
 
                 match call.send().await {
                     Ok(pending) => match pending.await {
-                        Ok(Some(receipt)) => {
-                            println!(
-                                "announceReceiver ok merchant={:?} (raw={}) tx={:#x}",
-                                merchant, task.merchant_address, receipt.transaction_hash
-                            );
-                        }
-                        Ok(None) => {
-                            eprintln!(
-                                "announceReceiver dropped for merchant {:?} (raw={})",
-                                merchant, task.merchant_address
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "announceReceiver confirmation failed for {:?} (raw={}): {e}",
-                                merchant, task.merchant_address
-                            );
-                        }
+                        Ok(Some(receipt)) => println!(
+                            "announceReceiver ok chain={:?} merchant={:?} tx={:#x}",
+                            task.chain, merchant, receipt.transaction_hash
+                        ),
+                        Ok(None) => eprintln!(
+                            "announceReceiver dropped chain={:?} merchant={:?}",
+                            task.chain, merchant
+                        ),
+                        Err(e) => eprintln!(
+                            "announceReceiver confirmation failed chain={:?} merchant={:?}: {e}",
+                            task.chain, merchant
+                        ),
                     },
-                    Err(e) => {
-                        eprintln!(
-                            "announceReceiver send failed for {:?} (raw={}): {e}",
-                            merchant, task.merchant_address
-                        );
-                    }
+                    Err(e) => eprintln!(
+                        "announceReceiver send failed chain={:?} merchant={:?}: {e}",
+                        task.chain, merchant
+                    ),
                 }
             }
 
             Chain::Starknet => {
-                // Same compatibility path as the payment worker:
-                // native felt, otherwise derive from foreign (EVM) address.
                 let merchant = Felt::from_hex(&task.merchant_address)
                     .unwrap_or_else(|_| derive_felt_from_foreign_address(&task.merchant_address));
 
@@ -176,23 +232,127 @@ pub async fn run_announce_worker(
                 };
 
                 match starknet_account.execute_v3(vec![call]).send().await {
-                    Ok(pending) => {
-                        println!(
-                            "announce_receiver ok merchant={:#x} (raw={}) tx={:#x}",
-                            merchant, task.merchant_address, pending.transaction_hash
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "announce_receiver failed for {:#x} (raw={}): {e}",
-                            merchant, task.merchant_address
-                        );
-                    }
+                    Ok(pending) => println!(
+                        "announce_receiver ok merchant={:#x} tx={:#x}",
+                        merchant, pending.transaction_hash
+                    ),
+                    Err(e) => eprintln!("announce_receiver failed for {:#x}: {e}", merchant),
                 }
             }
 
-            _ => {
-                eprintln!("announce worker: unsupported chain {:?}", task.chain);
+            Chain::Solana => {
+                let Ok(merchant) = task.merchant_address.parse::<solana_sdk::pubkey::Pubkey>()
+                else {
+                    eprintln!(
+                        "announce worker: bad solana merchant pubkey {}",
+                        task.merchant_address
+                    );
+                    continue;
+                };
+
+                let Some((chain_buf, recipient_buf)) =
+                    solana_route(&task.chain, &task.target_chain, &task.target_recipient)
+                else {
+                    eprintln!(
+                        "announce worker: unusable settlement route {:?} -> {:?} ({})",
+                        task.chain, task.target_chain, task.target_recipient
+                    );
+                    continue;
+                };
+
+                // --- 1. Throwaway receiver keypair. Lives only for this
+                //     iteration of the loop; nothing persists it, nothing
+                //     sends it anywhere, nothing needs it again after step 3.
+                let receiver_kp = solana_sdk::signature::Keypair::new();
+                let receiver = receiver_kp.pubkey();
+
+                // --- 2 & 3. TODO: wire to your actual Solana keeper helpers.
+                // This is the part that needs `solana_keeper`'s real API
+                // (PDA derivation, ATA creation, durable-nonce setup) to
+                // compile — mirroring `prepare()` in the test 1:1:
+                //   a. derive config_pda/pending_pda/registry_pda from
+                //      (program_id, "config"/"pending"/"registry" seeds,
+                //      merchant, receiver, chain_buf, recipient_buf)
+                //   b. create + fund a durable nonce account (keeper-signed)
+                //   c. create receiver's ATA + the config PDA's staging ATA
+                //      (keeper-signed)
+                //   d. build `register_merchant(merchant, chain_buf,
+                //      recipient_buf)` ix against the accounts above, put it
+                //      in a tx behind `AdvanceNonce`, sign with
+                //      (solana_keeper, receiver_kp) — this is the *only*
+                //      place `receiver_kp` is ever used
+                //   e. serialize that signed tx to bytes — this is what the
+                //      old code wrongly expected the client to hand over as
+                //      `solana_reg_tx_hex`
+                let reg_tx_bytes: Vec<u8> =
+                    match beanie_keeper::solana_keeper::prepare_registration(
+                        &solana_rpc,
+                        &solana_keeper,
+                        &receiver_kp,
+                        solana_program_id,
+                        merchant,
+                        chain_buf,
+                        recipient_buf,
+                        usdc_mint,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            eprintln!(
+                                "announce worker: solana prepare_registration failed for merchant {}: {e}",
+                                merchant
+                            );
+                            continue;
+                        }
+                    };
+                // `receiver_kp` is not touched again after this point —
+                // matches "the key is unreachable after return" in the test.
+
+                // --- 4. `announce_merchant(merchant, chain_buf, recipient_buf,
+                //     receiver, reg_tx_bytes)` — keeper-signed only.
+                let announce_sig = match beanie_keeper::solana_keeper::announce_merchant(
+                    &solana_rpc,
+                    &solana_keeper,
+                    solana_program_id,
+                    merchant,
+                    chain_buf,
+                    recipient_buf,
+                    receiver,
+                    &reg_tx_bytes,
+                )
+                .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        eprintln!(
+                            "announce worker: solana announce_merchant failed for merchant {}: {e}",
+                            merchant
+                        );
+                        continue;
+                    }
+                };
+                println!(
+                    "announce_merchant ok merchant={} receiver={} tx={}",
+                    merchant, receiver, announce_sig
+                );
+
+                // --- 5. Broadcast the just-pinned blob right away, same
+                //     effect as `broadcastStored()` in the test but without
+                //     waiting for a separate pass — the keeper already has
+                //     the bytes in hand.
+                match beanie_keeper::solana_keeper::broadcast_pending_registration(
+                    &solana_rpc,
+                    &reg_tx_bytes,
+                )
+                .await
+                {
+                    Ok(sig) => println!("register_merchant broadcast ok tx={}", sig),
+                    Err(e) => eprintln!(
+                        "announce worker: solana broadcast_pending_registration failed for merchant {}: {e}",
+                        merchant
+                    ),
+                }
             }
         }
     }
