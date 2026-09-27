@@ -71,7 +71,7 @@ fn derive_factory_config(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[FACTORY_SEED], program_id).0
 }
 
-fn derive_receiver_config(
+pub fn derive_receiver_config(
     program_id: &Pubkey,
     merchant: &Pubkey,
     receiver: &Pubkey,
@@ -91,7 +91,7 @@ fn derive_receiver_config(
     .0
 }
 
-fn derive_pending_registration(
+pub fn derive_pending_registration(
     program_id: &Pubkey,
     merchant: &Pubkey,
     receiver: &Pubkey,
