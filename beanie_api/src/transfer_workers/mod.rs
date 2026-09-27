@@ -21,10 +21,10 @@
 //! keyed per `cfg.chain_name`) — so adding a chain here never risks one
 //! chain's progress or pacing colliding with another's.
 
-mod common;
-mod evm;
-mod solana;
-mod starknet;
+pub mod common;
+pub mod evm;
+pub mod solana;
+pub mod starknet;
 
 use std::sync::Arc;
 

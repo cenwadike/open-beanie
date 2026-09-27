@@ -4,15 +4,24 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ethers::abi::{Token, encode};
 use ethers::types::{Address, H256, Signature, U256};
 use ethers::utils::keccak256;
 use serde::{Deserialize, Serialize};
+use solana_sdk::{
+    message::Message as SolanaMessage, pubkey::Pubkey as SolanaPubkey,
+    signature::Signature as SolanaSignature, signature::Signer as SolanaSigner,
+};
+use spl_associated_token_account::get_associated_token_address;
+use spl_token::instruction::TokenInstruction;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::OutsideExecutionDto;
-use crate::models::{AppState, Chain, EvmAuth, PaymentTask, SocketAddr, StarknetAuth, err};
+use crate::models::{
+    AppState, Chain, EvmAuth, PaymentTask, SocketAddr, SolanaAuth, StarknetAuth, err,
+};
 
 const BASE_CHAIN_ID: u64 = 8453;
 const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
@@ -51,6 +60,15 @@ enum SignaturePayload {
         signature: Vec<String>, // felt hex strings
         #[serde(rename = "userAddress")]
         user_address: String,
+    },
+    Solana {
+        /// Base64 bincode-serialized `solana_sdk::message::Message`, as
+        /// compiled client-side with Beanie's keeper as fee payer.
+        message: String,
+        /// Base64 ed25519 signature over `message`.
+        signature: String,
+        /// Base58 pubkey of the payer / transfer authority.
+        owner: String,
     },
 }
 
@@ -213,6 +231,141 @@ fn verify_starknet_outside_execution(
     Ok(())
 }
 
+/// Verifies a payer's gasless SPL-token transfer authorization for Solana.
+///
+/// Mirrors `verify_evm_authorization`/`verify_starknet_outside_execution`:
+/// the client compiles (but does not send) a `solana_sdk::message::Message`
+/// with Beanie's keeper set as fee payer, containing exactly one SPL Token
+/// `Transfer`/`TransferChecked` instruction moving `amount_raw` from the
+/// payer's own USDC ATA to `receiver_address`, and signs it. The keeper
+/// never rebuilds this message — it only checks it says what the request
+/// claims, then later co-signs the *exact same bytes* as fee payer.
+///
+/// This function does not submit anything or touch the network; the worker
+/// (`payment_workers.rs`) reconstructs the transaction from the returned
+/// `SolanaAuth`, adds the keeper's signature, and broadcasts it. Landing
+/// the deposit in `receiver_address` is as far as this flow goes — sweeping
+/// it on to the merchant is handled by the same indexer/poller-driven
+/// `sweep` path that already covers ordinary (non-gasless) Solana deposits,
+/// so there's no separate sweep step to verify or enqueue here.
+fn verify_solana_authorization(
+    payload: &IncomingPaymentRequest,
+    solana_cfg: &beanie_keeper::config::SolanaConfig,
+    message_b64: &str,
+    signature_b64: &str,
+    owner: &str,
+) -> Result<SolanaAuth, &'static str> {
+    if owner != payload.from_address {
+        return Err("signer does not match from_address");
+    }
+
+    let owner_pk = SolanaPubkey::from_str(owner).map_err(|_| "bad owner pubkey")?;
+    let receiver_pk =
+        SolanaPubkey::from_str(&payload.receiver_address).map_err(|_| "bad receiver_address")?;
+    let claimed_amount: u64 = payload
+        .amount_raw
+        .parse()
+        .map_err(|_| "amount_raw does not fit a Solana token amount (u64)")?;
+
+    let message_bytes = BASE64
+        .decode(message_b64)
+        .map_err(|_| "bad message encoding")?;
+    let message: SolanaMessage =
+        bincode::deserialize(&message_bytes).map_err(|_| "malformed solana message")?;
+
+    // Fee payer is always account index 0. It must be Beanie's keeper —
+    // the whole point is the payer never holds or spends SOL.
+    let fee_payer = message
+        .account_keys
+        .first()
+        .ok_or("message has no accounts")?;
+    if *fee_payer != solana_cfg.keeper_wallet.pubkey() {
+        return Err("fee payer is not Beanie's relayer — refusing to submit");
+    }
+
+    if message.instructions.len() != 1 {
+        return Err("expected exactly one instruction");
+    }
+    let ix = &message.instructions[0];
+    let ix_program = message
+        .account_keys
+        .get(ix.program_id_index as usize)
+        .ok_or("bad program id index")?;
+    if *ix_program != spl_token::ID {
+        return Err("instruction does not target the SPL Token program");
+    }
+
+    let token_ix =
+        TokenInstruction::unpack(&ix.data).map_err(|_| "unparseable token instruction")?;
+
+    // account index layout differs slightly between the two instruction
+    // kinds; resolve both to (source, destination, authority, amount, mint).
+    let (source_i, dest_i, authority_i, amount, mint_i) = match token_ix {
+        TokenInstruction::TransferChecked { amount, .. } => (
+            ix.accounts.first().copied(),
+            ix.accounts.get(2).copied(),
+            ix.accounts.get(3).copied(),
+            amount,
+            ix.accounts.get(1).copied(),
+        ),
+        TokenInstruction::Transfer { amount } => (
+            ix.accounts.first().copied(),
+            ix.accounts.get(1).copied(),
+            ix.accounts.get(2).copied(),
+            amount,
+            None,
+        ),
+        _ => return Err("instruction is not a token transfer"),
+    };
+
+    if amount != claimed_amount {
+        return Err("signed amount does not match amount_raw");
+    }
+
+    let account_at = |idx: Option<u8>| -> Result<&SolanaPubkey, &'static str> {
+        message
+            .account_keys
+            .get(idx.ok_or("instruction missing an expected account")? as usize)
+            .ok_or("account index out of range")
+    };
+
+    let source = account_at(source_i)?;
+    let destination = account_at(dest_i)?;
+    let authority = account_at(authority_i)?;
+
+    if *authority != owner_pk {
+        return Err("transfer authority does not match from_address");
+    }
+    let expected_source = get_associated_token_address(&owner_pk, &solana_cfg.mint);
+    if *source != expected_source {
+        return Err("source token account is not the signer's USDC account");
+    }
+    if *destination != receiver_pk {
+        return Err("destination does not match receiver_address");
+    }
+    if let Some(mint_i) = mint_i {
+        let mint = account_at(Some(mint_i))?;
+        if *mint != solana_cfg.mint {
+            return Err("mint does not match configured USDC");
+        }
+    }
+
+    let sig_bytes = BASE64
+        .decode(signature_b64)
+        .map_err(|_| "bad signature encoding")?;
+    let signature =
+        SolanaSignature::try_from(sig_bytes.as_slice()).map_err(|_| "bad signature bytes")?;
+    if !signature.verify(owner_pk.as_ref(), &message_bytes) {
+        return Err("signature does not authorize this transfer");
+    }
+
+    Ok(SolanaAuth {
+        message: message_b64.to_string(),
+        signature: signature_b64.to_string(),
+        owner: owner.to_string(),
+    })
+}
+
 pub async fn receive_payment(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -251,7 +404,7 @@ pub async fn receive_payment(
         Err(_) => return err(StatusCode::BAD_REQUEST, "malformed signature payload"),
     };
 
-    let (evm_auth, starknet_auth) = match (payload.chain, &parsed) {
+    let (evm_auth, starknet_auth, solana_auth) = match (payload.chain, &parsed) {
         (
             Chain::Base | Chain::Ethereum,
             SignaturePayload::Evm {
@@ -274,7 +427,7 @@ pub async fn receive_payment(
                 nonce,
                 signature,
             ) {
-                Ok(auth) => (Some(auth), None),
+                Ok(auth) => (Some(auth), None, None),
                 Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
             }
         }
@@ -311,7 +464,27 @@ pub async fn receive_payment(
                     signature: signature.clone(),
                     user_address: user_address.clone(),
                 }),
+                None,
             )
+        }
+        (
+            Chain::Solana,
+            SignaturePayload::Solana {
+                message,
+                signature,
+                owner,
+            },
+        ) => {
+            match verify_solana_authorization(
+                &payload,
+                &state.solana_config,
+                message,
+                signature,
+                owner,
+            ) {
+                Ok(auth) => (None, None, Some(auth)),
+                Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
+            }
         }
         _ => {
             return err(
@@ -334,6 +507,7 @@ pub async fn receive_payment(
         create_if_missing: true,
         evm_auth,
         starknet_auth,
+        solana_auth,
     };
 
     if state.payment_tx.send(task).await.is_err() {

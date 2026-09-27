@@ -25,6 +25,7 @@ pub struct AppState {
     pub app_config: Arc<Config>,
     pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
     pub evm_config: Arc<beanie_keeper::config::EvmConfig>,
+    pub solana_config: Arc<beanie_keeper::config::SolanaConfig>,
     pub limiter: Arc<RateLimiter>,
     pub announce_tx: Arc<mpsc::Sender<AnnounceTask>>,
     pub stealth_tx: Arc<mpsc::Sender<StealthTask>>,
@@ -58,6 +59,24 @@ pub struct StarknetAuth {
     pub outside_execution: OutsideExecutionDto,
     pub signature: Vec<String>,
     pub user_address: String,
+}
+
+/// Everything needed to complete and submit the payer's gasless SPL-token
+/// transfer. `message` is the exact bytes the payer signed — Beanie's
+/// keeper must not rebuild or alter it, only add its own fee-payer
+/// signature, or `signature` no longer verifies against what's broadcast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolanaAuth {
+    /// Base64-encoded, bincode-serialized `solana_sdk::message::Message`,
+    /// exactly as compiled client-side (fee payer = Beanie's keeper at
+    /// account index 0, one SPL Token `Transfer`/`TransferChecked`
+    /// instruction).
+    pub message: String,
+    /// Base64-encoded ed25519 signature the payer produced over `message`.
+    pub signature: String,
+    /// Base58 pubkey of the payer / token transfer authority. Must match
+    /// `from_address` on the surrounding `IncomingPaymentRequest`.
+    pub owner: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -107,6 +126,7 @@ pub struct PaymentTask {
     pub create_if_missing: bool,
     pub evm_auth: Option<EvmAuth>,
     pub starknet_auth: Option<StarknetAuth>,
+    pub solana_auth: Option<SolanaAuth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

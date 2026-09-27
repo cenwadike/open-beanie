@@ -19,7 +19,7 @@ use crate::payment_workers::StarknetAccount;
 // `evm_targets` below, keyed by chain.
 // ---------------------------------------------------------------------------
 
-fn same_chain(a: &Chain, b: &Chain) -> bool {
+pub(crate) fn same_chain(a: &Chain, b: &Chain) -> bool {
     matches!(
         (a, b),
         (Chain::Base, Chain::Base)
@@ -31,7 +31,7 @@ fn same_chain(a: &Chain, b: &Chain) -> bool {
     )
 }
 
-fn chain_key(chain: &Chain) -> Option<&'static str> {
+pub(crate) fn chain_key(chain: &Chain) -> Option<&'static str> {
     match chain {
         Chain::Base => Some("BASE"),
         Chain::Ethereum => Some("ETHEREUM"),
@@ -42,7 +42,7 @@ fn chain_key(chain: &Chain) -> Option<&'static str> {
     }
 }
 
-fn recipient_bytes32(target: &Chain, recipient: &str) -> Option<[u8; 32]> {
+pub(crate) fn recipient_bytes32(target: &Chain, recipient: &str) -> Option<[u8; 32]> {
     match target {
         Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad => {
             let addr: Address = recipient.parse().ok()?;
@@ -86,7 +86,11 @@ fn starknet_route(source: &Chain, target: &Chain, recipient: &str) -> Option<[Fe
 /// own `SAME_CHAIN_DOMAIN_SENTINEL` handling is internal to the program (it's
 /// applied to the CCTP *domain*, not this chain/recipient pair), so the
 /// same-chain zero-buffer convention below matches `ZERO_32` in the test.
-fn solana_route(source: &Chain, target: &Chain, recipient: &str) -> Option<([u8; 32], [u8; 32])> {
+pub(crate) fn solana_route(
+    source: &Chain,
+    target: &Chain,
+    recipient: &str,
+) -> Option<([u8; 32], [u8; 32])> {
     if same_chain(source, target) {
         return Some(([0u8; 32], [0u8; 32]));
     }

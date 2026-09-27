@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     info!("[baeanie_api::main]: Starting up Beanie API");
     let cfg = Config::from_env()?;
     let starknet_cfg = StarknetConfig::from_env()?;
-    let evm_cfg = EvmConfig::from_env("BASE", "base")?;
+    let base_cfg = EvmConfig::from_env("BASE", "base")?;
     let arbitrum_cfg = EvmConfig::from_env("ARBITRUM", "arbitrum")?;
     let monad_cfg = EvmConfig::from_env("MONAD", "monad")?;
     let solana_cfg = SolanaConfig::from_env()?;
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // Base's client also backs the announce/payment/stealth flows below;
     // Arbitrum's is used by both the announce worker (new) and the native
     // transfer poller further down.
-    let evm_client = beanie_keeper::evm_keeper::build_client(&evm_cfg).await?;
+    let evm_client = beanie_keeper::evm_keeper::build_client(&base_cfg).await?;
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
     let monad_client = beanie_keeper::evm_keeper::build_client(&monad_cfg).await?;
 
@@ -153,10 +153,10 @@ async fn main() -> anyhow::Result<()> {
             ethers::types::Address,
         ),
     > = HashMap::from([
-        (Chain::Base, (evm_client.clone(), evm_cfg.factory_address)),
+        (Chain::Base, (evm_client.clone(), base_cfg.factory_address)),
         (
             Chain::Ethereum,
-            (evm_client.clone(), evm_cfg.factory_address),
+            (evm_client.clone(), base_cfg.factory_address),
         ),
         (
             Chain::Arbitrum,
@@ -167,6 +167,16 @@ async fn main() -> anyhow::Result<()> {
             (monad_client.clone(), monad_cfg.factory_address),
         ),
     ]);
+
+    let evm_payments: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)> =
+        HashMap::from([
+            (Chain::Base, (evm_client.clone(), base_cfg.clone())),
+            (
+                Chain::Arbitrum,
+                (arbitrum_client.clone(), arbitrum_cfg.clone()),
+            ),
+            (Chain::Monad, (monad_client.clone(), monad_cfg.clone())),
+        ]);
 
     // 4. Setup Bounded Channels and Background Workers
     let (stealth_tx, stealth_rx) = mpsc::channel::<StealthTask>(2048);
@@ -197,10 +207,10 @@ async fn main() -> anyhow::Result<()> {
         app_config: Arc::new(cfg.clone()),
         starknet_config: Arc::new(StarknetConfig::from_env()?),
         evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env("BASE", "base")?),
+        solana_config: solana_cfg.clone(),
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
     };
     let worker_state = Arc::new(state.clone());
-    let payment_evm_client_clone = evm_client.clone();
     let base_client = evm_client.clone();
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
@@ -210,6 +220,17 @@ async fn main() -> anyhow::Result<()> {
     // Arc, so this is just a refcount bump).
     let announce_solana_rpc_clone = solana_rpc.clone();
     let announce_solana_keeper_clone = solana_keeper_wallet.clone();
+    let payment_solana_rpc_clone = solana_rpc.clone();
+    let payment_solana_keeper_clone = solana_keeper_wallet.clone();
+    let payment_solana_cfg_clone = solana_cfg.clone();
+
+    let evm_chains = vec![
+        (base_client, Arc::new(base_cfg)),
+        (arbitrum_client, Arc::new(arbitrum_cfg)),
+        (monad_client, Arc::new(monad_cfg)),
+    ];
+    let starknet_cfg_clone = state.starknet_config.clone();
+    let webhook_tx_for_transfer = webhook_tx.clone();
 
     debug!("[baeanie_api::main]: app state loaded");
 
@@ -230,22 +251,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn payment worker
     tokio::spawn(run_payment_worker(
-        payment_evm_client_clone,
+        evm_payments,
         payment_starknet_account_clone,
-        state.evm_config.clone(),
         state.starknet_config.clone(),
+        payment_solana_rpc_clone,
+        payment_solana_keeper_clone,
+        payment_solana_cfg_clone,
         payment_rx,
         webhook_tx.clone(),
     ));
 
     // Spawn native transfer worker (EVM chains + Starknet + Solana).
-    let evm_chains = vec![
-        (base_client, state.evm_config.clone()),
-        (arbitrum_client, Arc::new(arbitrum_cfg)),
-        (monad_client, Arc::new(monad_cfg)),
-    ];
-    let starknet_cfg_clone = state.starknet_config.clone();
-    let webhook_tx_for_transfer = webhook_tx.clone();
     tokio::spawn(async move {
         crate::transfer_workers::run_native_transfer_poller(
             evm_chains,

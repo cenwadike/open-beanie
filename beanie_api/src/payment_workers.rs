@@ -1,4 +1,16 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use beanie_keeper::{
+    config::EvmConfig,
+    solana_indexer::{ReceiverStatus, SolanaReceiverRecord},
+};
 use log::info;
+use solana_sdk::{
+    message::Message as SolanaMessage,
+    program_pack::Pack as SolanaPack,
+    pubkey::Pubkey as SolanaPubkey,
+    signature::{Keypair as SolanaKeypair, Signature as SolanaSignature},
+    transaction::Transaction as SolanaTransaction,
+};
 use starknet::{
     accounts::{Account, ConnectedAccount, SingleOwnerAccount},
     core::types::{BlockId, BlockTag, Call, Felt, FunctionCall},
@@ -21,10 +33,11 @@ use ethers::{
     types::U256,
 };
 use ethers::{types::Address, utils::keccak256};
+use spl_associated_token_account::get_associated_token_address;
 
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, StarknetWallet>;
 
-use crate::models::{ChainXReceiverLocal, ReceiverFactory};
+use crate::models::{Chain, ChainXReceiverLocal, ReceiverFactory};
 use crate::models::{chain_to_bytes32, chain_to_felt, derive_felt_from_foreign_address};
 
 use std::str::FromStr;
@@ -73,21 +86,23 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 /// Payment worker: processes incoming payment notifications, performs JIT
 /// receiver creation if missing, and triggers `sweep()` on the receiver.
-
-/// Payment worker: processes incoming payment notifications, performs JIT
-/// receiver creation if missing, and triggers `sweep()` on the receiver.
 pub async fn run_payment_worker(
-    evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    evm_targets: std::collections::HashMap<
+        Chain,
+        (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig),
+    >,
     starknet_account: Arc<StarknetAccount>,
-    evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
+    // evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
+    solana_rpc: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    solana_keeper: Arc<SolanaKeypair>,
+    solana_cfg: Arc<beanie_keeper::config::SolanaConfig>,
     mut rx: mpsc::Receiver<crate::models::PaymentTask>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
 ) {
     info!("Payment worker starting");
 
     let starknet_factory_addr = starknet_cfg.factory_address;
-    let evm_factory_addr = evm_cfg.factory_address;
 
     // Local abigen is declared at top-level
 
@@ -95,12 +110,24 @@ pub async fn run_payment_worker(
         task.attempts += 1;
 
         match task.source_chain {
-            crate::models::Chain::Base | crate::models::Chain::Ethereum => {
+            Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad => {
                 // EVM flow
                 match task.receiver_address.parse::<Address>() {
                     Ok(receiver_addr) => {
+                        let Some((chain_client, evm_cfg)) =
+                            evm_targets.get(&task.source_chain).cloned()
+                        else {
+                            eprintln!(
+                                "announce worker: no client/factory configured for {:?}",
+                                task.source_chain
+                            );
+                            continue;
+                        };
+
+                        let evm_factory_addr = evm_cfg.factory_address;
+
                         // Check whether contract exists by code size
-                        let code = evm_client.provider().get_code(receiver_addr, None).await;
+                        let code = chain_client.provider().get_code(receiver_addr, None).await;
 
                         let exists = match code {
                             Ok(bytes) => !bytes.0.is_empty(),
@@ -159,7 +186,7 @@ pub async fn run_payment_worker(
                                 };
 
                             let reg_call =
-                                ReceiverFactory::new(evm_factory_addr, evm_client.clone())
+                                ReceiverFactory::new(evm_factory_addr, chain_client.clone())
                                     .register_merchant(
                                         merchant_addr,
                                         cctp_chain_bytes,
@@ -214,7 +241,7 @@ pub async fn run_payment_worker(
                         };
 
                         let usdc_addr: Address = evm_cfg.token_address;
-                        let transfer_call = Erc3009Usdc::new(usdc_addr, evm_client.clone())
+                        let transfer_call = Erc3009Usdc::new(usdc_addr, chain_client.clone())
                             .transfer_with_authorization(
                                 from_addr,
                                 receiver_addr,
@@ -241,7 +268,7 @@ pub async fn run_payment_worker(
 
                         // sweep calldata
                         let receiver_contract =
-                            ChainXReceiverLocal::new(receiver_addr, evm_client.clone());
+                            ChainXReceiverLocal::new(receiver_addr, chain_client.clone());
                         let sweep_calldata = match receiver_contract.sweep().calldata() {
                             Some(b) => b,
                             None => {
@@ -258,11 +285,11 @@ pub async fn run_payment_worker(
 
                         let multicall_addr: Address =
                             MULTICALL3_ADDRESS.parse().expect("valid multicall addr");
-                        let multicall = Multicall3::new(multicall_addr, evm_client.clone());
+                        let multicall = Multicall3::new(multicall_addr, chain_client.clone());
 
                         let mut agg = multicall.aggregate_3(calls);
 
-                        let (suggested_max_fee, suggested_priority_fee) = evm_client
+                        let (suggested_max_fee, suggested_priority_fee) = chain_client
                             .estimate_eip1559_fees(None)
                             .await
                             .unwrap_or((U256::zero(), U256::zero()));
@@ -302,7 +329,7 @@ pub async fn run_payment_worker(
                                         };
 
                                         let keeper_cfg =
-                                            beanie_keeper::config::Config::Evm((*evm_cfg).clone());
+                                            beanie_keeper::config::Config::Evm((evm_cfg).clone());
 
                                         let job = crate::models::WebhookJob {
                                             cfg: keeper_cfg,
@@ -550,12 +577,269 @@ pub async fn run_payment_worker(
                     Err(e) => eprintln!("Invalid Starknet receiver felt: {}", e),
                 }
             }
-            _ => {
-                eprintln!(
-                    "Unsupported chain for payment task: {:?}",
-                    task.source_chain
-                );
+            crate::models::Chain::Solana => {
+                // `receiver_address` is always an already-live USDC ATA by
+                // the time a payment can reference it (created up front in
+                // `prepare_registration`, see create_workers.rs's Solana
+                // arm) — but the receiver's on-chain *registration*
+                // (`receiver_config`) may still be pending. Unlike
+                // EVM/Starknet, that register step can't be bundled into
+                // the same transaction as the gasless transfer: `reg_tx` is
+                // a separate, already-fully-signed `Transaction` pinned at
+                // announce time (see
+                // `solana_keeper::broadcast_pending_registration`'s doc
+                // comment) and can't be merged into the payer's message
+                // after the fact. So this arm submits the transfer first,
+                // then — same-chain destinations only — JIT-registers (if
+                // needed) and sweeps inline right after, via
+                // `sweep_after_solana_payment` below, instead of waiting
+                // for the next indexer/reconciliation pass. Cross-chain
+                // (CCTP) destinations still fall back to that existing
+                // poller path, since `multicall_sweep_same_chain` doesn't
+                // cover CCTP sweeps yet.
+                let auth = match &task.solana_auth {
+                    Some(a) => a,
+                    None => {
+                        eprintln!("Solana payment task missing verified authorization, dropping");
+                        continue;
+                    }
+                };
+
+                let message_bytes = match BASE64.decode(&auth.message) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("bad solana message encoding on task: {e}");
+                        continue;
+                    }
+                };
+                let message: SolanaMessage = match bincode::deserialize(&message_bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("bad solana message on task: {e}");
+                        continue;
+                    }
+                };
+                let owner_pk: SolanaPubkey = match auth.owner.parse() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("bad solana owner pubkey on task: {e}");
+                        continue;
+                    }
+                };
+                let owner_sig_bytes = match BASE64.decode(&auth.signature) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("bad solana signature encoding on task: {e}");
+                        continue;
+                    }
+                };
+                let owner_sig = match SolanaSignature::try_from(owner_sig_bytes.as_slice()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("bad solana signature bytes on task: {e}");
+                        continue;
+                    }
+                };
+
+                // Fee payer (Beanie's keeper) is always account index 0;
+                // the payer's own signature slot is wherever their pubkey
+                // landed among the required signers.
+                let num_sigs = message.header.num_required_signatures as usize;
+                let Some(owner_idx) = message.account_keys.iter().position(|k| *k == owner_pk)
+                else {
+                    eprintln!("solana payment task: owner not present in message account keys");
+                    continue;
+                };
+                if owner_idx >= num_sigs {
+                    eprintln!("solana payment task: owner is not a required signer");
+                    continue;
+                }
+
+                let mut signatures = vec![SolanaSignature::default(); num_sigs];
+                signatures[owner_idx] = owner_sig;
+                let mut tx = SolanaTransaction {
+                    signatures,
+                    message,
+                };
+
+                // Same blockhash the payer already signed over, so this
+                // only fills the keeper's own signer slot(s) rather than
+                // wiping and re-signing everything.
+                let recent_blockhash = tx.message.recent_blockhash;
+                if let Err(e) = tx.try_partial_sign(&[solana_keeper.as_ref()], recent_blockhash) {
+                    eprintln!("failed keeper co-sign for solana payment: {e}");
+                    continue;
+                }
+
+                if let Err(e) = tx.verify() {
+                    eprintln!("solana payment tx failed signature verification: {e}");
+                    continue;
+                }
+
+                match solana_rpc.send_and_confirm_transaction(&tx).await {
+                    Ok(sig) => {
+                        let tx_sig = sig.to_string();
+                        println!(
+                            "Solana gasless transfer executed {} -> {}",
+                            task.receiver_address, tx_sig
+                        );
+
+                        // Register (if not already) and sweep right away,
+                        // same-chain only — see the doc comment on this
+                        // match arm for why register can't be bundled into
+                        // the transfer tx itself, and why cross-chain
+                        // destinations skip this and fall back to the
+                        // poller.
+                        let sweep_tx = if task.destination_chain == task.source_chain {
+                            match sweep_after_solana_payment(
+                                &solana_rpc,
+                                &solana_keeper,
+                                &solana_cfg,
+                                &task,
+                            )
+                            .await
+                            {
+                                Ok(tx) => tx,
+                                Err(e) => {
+                                    eprintln!(
+                                        "solana register/sweep after payment failed for {}: {e:#}",
+                                        task.receiver_address
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(url) = &task.webhook_url {
+                            let deposit = beanie_keeper::config::Deposit {
+                                tx_hash: tx_sig.clone(),
+                                from_address: task.from_address.clone(),
+                                receiver: task.receiver_address.clone(),
+                                amount_raw: task.amount_raw.clone(),
+                                block_number: 0,
+                            };
+
+                            let keeper_cfg =
+                                beanie_keeper::config::Config::Solana((*solana_cfg).clone());
+
+                            let job = crate::models::WebhookJob {
+                                cfg: keeper_cfg,
+                                webhook_url: url.clone(),
+                                deposit,
+                                sweep_tx,
+                                max_retries: 5,
+                            };
+
+                            if let Err(e) = webhook_tx.send(job).await {
+                                eprintln!("failed enqueuing webhook job: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Solana gasless transfer failed: {}", e),
+                }
             }
         }
     }
+}
+
+/// Register-if-needed + same-chain sweep for a receiver that just landed a
+/// gasless-transfer payment, run inline right after that transfer confirms
+/// instead of waiting for the next indexer/reconciliation pass.
+///
+/// The receiver's owning pubkey — what `receiver_config` and
+/// `pending_registration` are actually keyed on, distinct from its token
+/// account — isn't present anywhere in the payment request. It's read
+/// straight off the receiver token account itself, which
+/// `solana_keeper::prepare_registration` guarantees already exists by the
+/// time any payment can reference it.
+///
+/// Same-chain only (`chain`/`recipient` zeroed, same convention as the EVM
+/// arm's `task.destination_chain == task.source_chain` case) — mirrors
+/// `multicall_sweep_same_chain`'s restriction. Callers must skip this for
+/// cross-chain destinations and let the existing indexer/poller sweep
+/// handle those once CCTP sweep support lands.
+async fn sweep_after_solana_payment(
+    solana_rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    solana_keeper: &Arc<SolanaKeypair>,
+    solana_cfg: &Arc<beanie_keeper::config::SolanaConfig>,
+    task: &crate::models::PaymentTask,
+) -> anyhow::Result<Option<String>> {
+    use beanie_keeper::solana_keeper::{
+        broadcast_pending_registration, derive_pending_registration, derive_receiver_config,
+        multicall_sweep_same_chain,
+    };
+
+    let receiver_token_account: SolanaPubkey = task
+        .receiver_address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad solana receiver_address: {e}"))?;
+    let merchant: SolanaPubkey = task
+        .merchant_address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad solana merchant_address: {e}"))?;
+
+    let ta_account = solana_rpc
+        .get_account(&receiver_token_account)
+        .await
+        .map_err(|e| anyhow::anyhow!("receiver token account not found on-chain: {e}"))?;
+    let receiver_owner = spl_token::state::Account::unpack(&ta_account.data)
+        .map_err(|e| anyhow::anyhow!("receiver token account failed to unpack: {e}"))?
+        .owner;
+
+    // Same-chain: cctp_mint_chain/recipient are zeroed.
+    let chain = [0u8; 32];
+    let recipient = [0u8; 32];
+    let receiver_config = derive_receiver_config(
+        &solana_cfg.program_id,
+        &merchant,
+        &receiver_owner,
+        &chain,
+        &recipient,
+    );
+
+    if solana_rpc.get_account(&receiver_config).await.is_err() {
+        let pending_registration = derive_pending_registration(
+            &solana_cfg.program_id,
+            &merchant,
+            &receiver_owner,
+            &chain,
+            &recipient,
+        );
+        let pending_acct = solana_rpc
+            .get_account(&pending_registration)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("receiver not registered and no pending_registration on-chain: {e}")
+            })?;
+        // PendingRegistration layout: 8-byte Anchor discriminator + 1-byte
+        // bump + 4-byte Vec<u8> length prefix, then reg_tx (same layout
+        // solana.rs's box_fetch_reg_tx relies on).
+        anyhow::ensure!(
+            pending_acct.data.len() > 13,
+            "pending_registration account too short"
+        );
+        let reg_tx = &pending_acct.data[13..];
+        let sig = broadcast_pending_registration(solana_rpc, reg_tx).await?;
+        println!("Solana JIT register (payment path) {receiver_owner} -> {sig}");
+    }
+
+    let merchant_token_account = get_associated_token_address(&merchant, &solana_cfg.mint);
+    let rec = SolanaReceiverRecord {
+        merchant,
+        receiver: receiver_owner,
+        receiver_token_account,
+        receiver_config,
+        status: ReceiverStatus::Registered,
+        reg_tx: None,
+    };
+
+    multicall_sweep_same_chain(
+        solana_rpc,
+        &solana_keeper.insecure_clone(),
+        solana_cfg,
+        &[(rec, merchant_token_account)],
+    )
+    .await
 }
