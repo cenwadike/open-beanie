@@ -21,7 +21,6 @@ Beanie never holds merchant funds. Settlement rules are fixed on-chain when a re
 9. [Running locally](#running-locally)
 10. [Repository layout](#repository-layout)
 11. [Testing](#testing)
-12. [Status and known limitations](#status-and-known-limitations)
 
 ---
 
