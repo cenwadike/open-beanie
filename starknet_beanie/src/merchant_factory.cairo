@@ -38,7 +38,6 @@ pub trait IReceiverFactory<T> {
 pub mod ReceiverFactory {
     use core::num::traits::Zero;
     use core::poseidon::poseidon_hash_span;
-    use core::traits::TryInto;
     use openzeppelin::utils::deployments::calculate_contract_address_from_deploy_syscall;
     use starknet::storage::{
         Map, MutableVecTrait, StorageMapReadAccess, StorageMapWriteAccess, StoragePathEntry,

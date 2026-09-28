@@ -1,8 +1,12 @@
 // StealthAccount — minimal SNIP-6 account, single-purpose: owns a
-// stealth pubkey derived off-chain, and execute claims.
+// stealth pubkey derived off-chain, and executes claims.
 //
-// The account is a "dual-signer" design: the stealth pubkey is the
-// "client" signer, and the paymaster is the "cosigner" signer.
+// Dual-signer design: the stealth pubkey (STARK curve) is the "client"
+// signer. The cosigner is verified over secp256k1 via ECDSA public-key
+// recovery, compared against a stored Ethereum address — the exact
+// pattern used in Starknet's own docs (docs.starknet.io, Starknet by
+// Example, "ECDSA Verification"). This avoids constructing/storing a
+// raw curve point, which was the source of the last two compile errors.
 
 use starknet::ContractAddress;
 
@@ -29,6 +33,10 @@ pub struct Call {
 pub mod StealthAccount {
     use core::ecdsa::check_ecdsa_signature;
     use core::num::traits::Zero;
+    use starknet::eth_address::EthAddress;
+    use starknet::eth_signature::public_key_point_to_eth_address;
+    use starknet::secp256_trait::{Signature, recover_public_key, signature_from_vrs};
+    use starknet::secp256k1::Secp256k1Point;
     use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
     use starknet::syscalls::call_contract_syscall;
     use starknet::{SyscallResultTrait, get_caller_address, get_tx_info};
@@ -40,22 +48,29 @@ pub mod StealthAccount {
     #[storage]
     struct Storage {
         client_pubkey: felt252,
-        cosigner_pubkey: felt252,
+        // Cosigner identified by its Ethereum address (20 bytes), not a
+        // raw curve point. Verification recovers the signer's pubkey
+        // from the signature and compares its derived address to this.
+        cosigner_eth_address: EthAddress,
     }
 
     pub mod Errors {
         pub const INVALID_CALLER: felt252 = 'INVALID_CALLER';
         pub const INVALID_SIGNATURE: felt252 = 'INVALID_SIGNATURE';
         pub const ZERO_PUBKEY: felt252 = 'ZERO_PUBKEY';
+        pub const BAD_SIGNATURE_LEN: felt252 = 'BAD_SIGNATURE_LEN';
     }
 
     #[constructor]
-    fn constructor(ref self: ContractState, client_pubkey: felt252, cosigner_pubkey: felt252) {
-        // Enforce both keys must be non-zero — single-key fallback strictly prohibited
+    fn constructor(
+        ref self: ContractState, client_pubkey: felt252, cosigner_eth_address: EthAddress,
+    ) {
         assert(client_pubkey != 0, Errors::ZERO_PUBKEY);
-        assert(cosigner_pubkey != 0, Errors::ZERO_PUBKEY);
+        let cosigner_felt: felt252 = cosigner_eth_address.into();
+        assert(cosigner_felt != 0, Errors::ZERO_PUBKEY);
+
         self.client_pubkey.write(client_pubkey);
-        self.cosigner_pubkey.write(cosigner_pubkey);
+        self.cosigner_eth_address.write(cosigner_eth_address);
     }
 
     #[abi(embed_v0)]
@@ -101,7 +116,7 @@ pub mod StealthAccount {
         class_hash: felt252,
         contract_address_salt: felt252,
         client_pubkey: felt252,
-        cosigner_pubkey: felt252,
+        cosigner_eth_address: EthAddress,
     ) -> felt252 {
         assert(get_caller_address().is_zero(), Errors::INVALID_CALLER);
         let tx_info = get_tx_info().unbox();
@@ -131,24 +146,43 @@ pub mod StealthAccount {
         fn _is_valid_signature(
             self: @ContractState, hash: felt252, signature: Span<felt252>,
         ) -> bool {
-            // Strictly require 4 signature elements [r1, s1, r2, s2]
-            if signature.len() != 4 {
+            // Layout: [r1, s1, r2_low, r2_high, s2_low, s2_high, v2]
+            // r1/s1: STARK-curve client signature, unchanged.
+            // r2/s2: secp256k1 cosigner signature, each a u256 packed as
+            //        two felt252 limbs (low, then high).
+            // v2: recovery id / parity (0 or 1, or raw 27/28 — must match
+            //     whatever signature_from_vrs expects; confirm against
+            //     what your worker actually sends).
+            if signature.len() != 7 {
                 return false;
             }
 
             let r1 = *signature.at(0);
             let s1 = *signature.at(1);
-            let r2 = *signature.at(2);
-            let s2 = *signature.at(3);
 
-            // 1. Verify Client Signature (s1)
             let valid_client = check_ecdsa_signature(hash, self.client_pubkey.read(), r1, s1);
             if !valid_client {
                 return false;
             }
 
-            // 2. Verify Cosigner/TEE Signature (s2)
-            check_ecdsa_signature(hash, self.cosigner_pubkey.read(), r2, s2)
+            let r2_low: u128 = (*signature.at(2)).try_into().unwrap();
+            let r2_high: u128 = (*signature.at(3)).try_into().unwrap();
+            let s2_low: u128 = (*signature.at(4)).try_into().unwrap();
+            let s2_high: u128 = (*signature.at(5)).try_into().unwrap();
+            let v2: u32 = (*signature.at(6)).try_into().unwrap();
+
+            let r2: u256 = u256 { low: r2_low, high: r2_high };
+            let s2: u256 = u256 { low: s2_low, high: s2_high };
+            let msg_hash: u256 = hash.into();
+
+            let cosigner_sig: Signature = signature_from_vrs(v2, r2, s2);
+            if let Option::Some(recovered_point) =
+                recover_public_key::<Secp256k1Point>(msg_hash, cosigner_sig) {
+                let recovered_address = public_key_point_to_eth_address(recovered_point);
+                recovered_address == self.cosigner_eth_address.read()
+            } else {
+                false
+            }
         }
     }
 }
