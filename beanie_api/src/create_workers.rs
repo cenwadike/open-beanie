@@ -9,7 +9,10 @@ use starknet::core::types::{Call, Felt};
 use starknet::core::utils::get_selector_from_name;
 use tokio::sync::mpsc;
 
-use crate::models::{AnnounceTask, Chain, ReceiverFactory, derive_felt_from_foreign_address};
+use crate::models::{
+    AnnounceTask, Chain, ReceiverFactory, derive_felt_from_foreign_address,
+    derive_pubkey_from_foreign_address,
+};
 use crate::payment_workers::StarknetAccount;
 
 // ---------------------------------------------------------------------------
@@ -247,14 +250,17 @@ pub async fn run_announce_worker(
             }
 
             Chain::Solana => {
-                let Ok(merchant) = task.merchant_address.parse::<solana_sdk::pubkey::Pubkey>()
-                else {
-                    eprintln!(
-                        "announce worker: bad solana merchant pubkey {}",
-                        task.merchant_address
-                    );
-                    continue;
-                };
+                // Native base58 pubkey when address was announced on Solana
+                // directly; derived otherwise (address came from a
+                // different chain's format as a CCTP leg) — mirrors the
+                // EVM keccak256 fallback and the Starknet
+                // derive_felt_from_foreign_address fallback above. Derived
+                // pubkeys don't need to be valid curve points; Pubkey is
+                // just 32 bytes used for PDA seeding.
+                let merchant = task
+                    .merchant_address
+                    .parse::<solana_sdk::pubkey::Pubkey>()
+                    .unwrap_or_else(|_| derive_pubkey_from_foreign_address(&task.merchant_address));
 
                 let Some((chain_buf, recipient_buf)) =
                     solana_route(&task.chain, &task.target_chain, &task.target_recipient)

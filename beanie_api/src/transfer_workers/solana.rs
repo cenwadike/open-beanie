@@ -28,8 +28,21 @@ use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
 use solana_sdk::pubkey::Pubkey as SolanaPubkey;
 use solana_sdk::signature::Keypair as SolanaKeypair;
 use spl_associated_token_account::get_associated_token_address;
+use tokio::sync::RwLock as AsyncRwLock;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
+
+/// What `payment_workers.rs` reads. Same map contents as `SolanaState`'s
+/// own `merchant_map` — republished after every mutation rather than
+/// threaded through as the live map itself, so this worker's own hot path
+/// stays a plain, lock-free `HashMap` exactly as before. A clone of a
+/// receiver-keyed map is cheap relative to an RPC round trip, so this is
+/// not a meaningful cost on any path that already talks to Solana.
+pub type SharedSolanaRegistry = Arc<AsyncRwLock<HashMap<SolanaPubkey, SolanaReceiverRecord>>>;
+
+async fn publish_solana_registry(state: &SolanaState, shared: &SharedSolanaRegistry) {
+    *shared.write().await = state.merchant_map.clone();
+}
 
 use beanie_keeper::log_cache::LogCache;
 use beanie_keeper::solana_indexer::{self, ReceiverStatus, SolanaReceiverRecord};
@@ -54,14 +67,24 @@ struct SolanaState {
 /// tracked at all (JIT registration).
 fn remember_solana_receiver(
     map: &mut HashMap<SolanaPubkey, SolanaReceiverRecord>,
-    rec: SolanaReceiverRecord,
+    mut rec: SolanaReceiverRecord,
 ) {
     match map.get(&rec.receiver) {
         Some(existing) if existing.status == ReceiverStatus::Registered => {
             // Already registered — an announce arriving late (or replayed
             // by the reconciliation backstop) must not undo that.
         }
-        _ => {
+        Some(existing) => {
+            // Never let a route-less row (e.g. a `MerchantRegistered` seen
+            // before its own `MerchantAnnounced` was processed this same
+            // batch) erase a route already captured. Same "never downgrade
+            // what we already validated" rule as the status check above.
+            if rec.route.is_none() {
+                rec.route = existing.route;
+            }
+            map.insert(rec.receiver, rec);
+        }
+        None => {
             map.insert(rec.receiver, rec);
         }
     }
@@ -96,6 +119,7 @@ pub(super) async fn run_solana_worker(
     solana_cfg: Arc<beanie_keeper::config::SolanaConfig>,
     log_cache: Arc<LogCache>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
+    solana_registry: SharedSolanaRegistry,
 ) {
     let mut state = SolanaState {
         merchant_map: HashMap::new(),
@@ -134,6 +158,7 @@ pub(super) async fn run_solana_worker(
         "Solana worker state ready: {} receiver(s)",
         state.merchant_map.len()
     );
+    publish_solana_registry(&state, &solana_registry).await;
 
     act_on_solana_deposits(
         &solana_rpc,
@@ -143,6 +168,7 @@ pub(super) async fn run_solana_worker(
         &empty_webhook_map,
         &mut state,
         summary.deposits,
+        &solana_registry,
     )
     .await;
 
@@ -178,6 +204,7 @@ pub(super) async fn run_solana_worker(
                     &empty_webhook_map,
                     &mut state,
                     tip,
+                    &solana_registry,
                 ).await;
                 // Keep the live subscription's watch-list current — a
                 // receiver folded in during this tip's registry scan needs
@@ -197,6 +224,7 @@ pub(super) async fn run_solana_worker(
                         &empty_webhook_map,
                         &mut state,
                         SolanaTip { slot: head, registry_activity: true, deposit_activity: true },
+                        &solana_registry,
                     ).await;
 
                     let all_receivers: Vec<SolanaReceiverRecord> =
@@ -209,6 +237,7 @@ pub(super) async fn run_solana_worker(
                             &mut state,
                             all_receivers,
                         ).await;
+                        publish_solana_registry(&state, &solana_registry).await;
                     }
                 }
             }
@@ -225,6 +254,7 @@ async fn process_solana_tip(
     webhook_map: &HashMap<String, String>,
     state: &mut SolanaState,
     tip: SolanaTip,
+    solana_registry: &SharedSolanaRegistry,
 ) {
     let tip_slot = tip.slot;
 
@@ -255,6 +285,24 @@ async fn process_solana_tip(
         .await
         {
             Ok((events, last_seen)) => {
+                // Announced MUST be merged first — it's the only place
+                // `route` is ever captured, and it skips receivers already
+                // `Registered`. Doing the `MerchantRegistered` loop first
+                // would insert a route-less `Registered` row before this
+                // same batch's `MerchantAnnounced` for that receiver is
+                // ever looked at, permanently losing its route. See the
+                // identical ordering note in solana_indexer.rs's
+                // `run_solana_catchup`.
+                let fetch_reg_tx = box_fetch_reg_tx(solana_rpc.clone());
+                solana_indexer::attach_reg_tx_and_merge(
+                    &mut state.merchant_map,
+                    &events,
+                    &solana_cfg.program_id,
+                    &solana_cfg.mint,
+                    fetch_reg_tx,
+                )
+                .await;
+
                 for ev in &events {
                     if ev.name == "MerchantRegistered" {
                         if let Ok(raw) = solana_indexer::decode_merchant_registered(&ev.data) {
@@ -267,21 +315,15 @@ async fn process_solana_tip(
                                     receiver_config: raw.receiver_config,
                                     status: ReceiverStatus::Registered,
                                     reg_tx: None,
+                                    // remember_solana_receiver carries over
+                                    // whatever route attach_reg_tx_and_merge
+                                    // just captured above, if any.
+                                    route: None,
                                 },
                             );
                         }
                     }
                 }
-
-                let fetch_reg_tx = box_fetch_reg_tx(solana_rpc.clone());
-                solana_indexer::attach_reg_tx_and_merge(
-                    &mut state.merchant_map,
-                    &events,
-                    &solana_cfg.program_id,
-                    &solana_cfg.mint,
-                    fetch_reg_tx,
-                )
-                .await;
 
                 if let Some(seen) = last_seen {
                     if let Err(e) = log_cache.set_checkpoint(solana_indexer::REGISTRY_SCAN_ID, seen)
@@ -296,6 +338,10 @@ async fn process_solana_tip(
         if let Err(e) = log_cache.set_checkpoint(solana_indexer::REGISTRY_SCAN_ID, tip_slot) {
             error!("failed advancing solana registry checkpoint to {tip_slot}: {e:#}");
         }
+    }
+
+    if registry_due {
+        publish_solana_registry(state, solana_registry).await;
     }
 
     if state.merchant_map.is_empty() {
@@ -334,6 +380,7 @@ async fn process_solana_tip(
         webhook_map,
         state,
         deposits,
+        solana_registry,
     )
     .await;
 }
@@ -358,6 +405,9 @@ fn merchant_token_account(
 /// `solana_keeper::broadcast_pending_registration`'s doc comment). A
 /// receiver promoted from Announced to Registered in this pass is only
 /// swept on the *next* call.
+///
+/// The sweep itself (same-chain vs CCTP, per receiver) is picked inside
+/// `solana_keeper::sweep_registered`.
 async fn sweep_solana_receivers(
     solana_rpc: &Arc<SolanaRpcClient>,
     solana_keeper_wallet: &Arc<SolanaKeypair>,
@@ -426,17 +476,7 @@ async fn sweep_solana_receivers(
         })
         .collect();
 
-    solana_keeper::multicall_sweep_same_chain(
-        solana_rpc,
-        &solana_keeper_wallet.insecure_clone(),
-        solana_cfg,
-        &sweepable,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        error!("solana multicall_sweep_same_chain failed: {e:#}");
-        None
-    })
+    solana_keeper::sweep_registered(solana_rpc, solana_keeper_wallet, solana_cfg, &sweepable).await
 }
 
 /// JIT-register/sweep/webhook pipeline for a batch of already-discovered
@@ -454,6 +494,7 @@ async fn act_on_solana_deposits(
     webhook_map: &HashMap<String, String>,
     state: &mut SolanaState,
     deposits: Vec<beanie_keeper::config::Deposit>,
+    solana_registry: &SharedSolanaRegistry,
 ) {
     if deposits.is_empty() {
         return;
@@ -479,6 +520,9 @@ async fn act_on_solana_deposits(
         candidates,
     )
     .await;
+    // sweep_solana_receivers may have flipped Announced -> Registered
+    // (JIT register) above — publish so payment_workers.rs sees it too.
+    publish_solana_registry(state, solana_registry).await;
 
     for d in &deposits {
         let Ok(receiver) = d.receiver.parse::<SolanaPubkey>() else {

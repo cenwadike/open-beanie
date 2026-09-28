@@ -12,10 +12,9 @@ use solana_sdk::{
     transaction::Transaction as SolanaTransaction,
 };
 use starknet::{
-    accounts::{Account, ConnectedAccount, SingleOwnerAccount},
-    core::types::{BlockId, BlockTag, Call, Felt, FunctionCall},
+    accounts::{Account, SingleOwnerAccount},
+    core::types::{Call, Felt},
     core::utils::get_selector_from_name,
-    providers::Provider,
     providers::jsonrpc::{HttpTransport, JsonRpcClient},
     signers::LocalWallet as StarknetWallet,
 };
@@ -24,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use ethers::providers::Middleware;
+use ethers::types::Address;
 #[allow(unused_imports)]
 use ethers::{
     contract::abigen,
@@ -32,14 +32,16 @@ use ethers::{
     signers::LocalWallet,
     types::U256,
 };
-use ethers::{types::Address, utils::keccak256};
 use spl_associated_token_account::get_associated_token_address;
 
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, StarknetWallet>;
 
 use crate::models::{Chain, ChainXReceiverLocal, ReceiverFactory};
-use crate::models::{chain_to_bytes32, chain_to_felt, derive_felt_from_foreign_address};
+use crate::transfer_workers::evm::EvmReceiverInfo;
+use crate::transfer_workers::starknet::StarknetReceiverInfo;
+use crate::transfer_workers::{SharedEvmRegistry, SharedSolanaRegistry, SharedStarknetRegistry};
 
+use std::collections::HashMap;
 use std::str::FromStr;
 abigen!(
     Erc3009Usdc,
@@ -86,17 +88,21 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 /// Payment worker: processes incoming payment notifications, performs JIT
 /// receiver creation if missing, and triggers `sweep()` on the receiver.
-pub async fn run_payment_worker(
-    evm_targets: std::collections::HashMap<
-        Chain,
-        (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig),
-    >,
+pub(crate) async fn run_payment_worker(
+    evm_targets: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)>,
+    // One shared, read-only registry per chain — populated by
+    // transfer_workers' own worker for that chain from
+    // ReceiverAnnounced/MerchantRegistered, never by this worker. JIT
+    // register/sweep params below are looked up here, never derived from
+    // the payment request itself.
+    evm_registries: HashMap<Chain, SharedEvmRegistry>,
     starknet_account: Arc<StarknetAccount>,
-    // evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
+    starknet_registry: SharedStarknetRegistry,
     solana_rpc: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
     solana_keeper: Arc<SolanaKeypair>,
     solana_cfg: Arc<beanie_keeper::config::SolanaConfig>,
+    solana_registry: SharedSolanaRegistry,
     mut rx: mpsc::Receiver<crate::models::PaymentTask>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
 ) {
@@ -144,46 +150,36 @@ pub async fn run_payment_worker(
 
                         // If receiver doesn't exist, add factory.registerMerchant calldata
                         if !exists && task.create_if_missing {
-                            let merchant_addr: Address =
-                                task.merchant_address.parse().unwrap_or_else(|_| {
-                                    let hash = keccak256(task.merchant_address.as_bytes());
-                                    Address::from_slice(&hash[12..32])
-                                });
-
-                            // Build bytes32 params based on the specified destination_chain/merchant_address
-                            let (cctp_chain_bytes, recipient_bytes) =
-                                if task.destination_chain == task.source_chain {
-                                    ([0u8; 32], [0u8; 32])
-                                } else {
-                                    match task.destination_chain {
-                                        crate::models::Chain::Starknet => {
-                                            match Felt::from_hex(&task.merchant_address) {
-                                                Ok(f) => (
-                                                    chain_to_bytes32(task.destination_chain),
-                                                    f.to_bytes_be(),
-                                                ),
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "Invalid Starknet destination_address: {}",
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        _ => match task.merchant_address.parse::<Address>() {
-                                            Ok(addr) => {
-                                                let mut buf = [0u8; 32];
-                                                buf[12..].copy_from_slice(addr.as_bytes());
-                                                (chain_to_bytes32(task.destination_chain), buf)
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Invalid EVM destination_address: {}", e);
-                                                continue;
-                                            }
-                                        },
+                            // (merchant, route) come straight from what was
+                            // actually announced for THIS receiver address —
+                            // never derived from task.destination_chain /
+                            // task.merchant_address. If the announce hasn't
+                            // been indexed yet, don't guess: drop this
+                            // payment for now and let it retry once it has
+                            // (task.attempts already tracks retries).
+                            let info: Option<EvmReceiverInfo> =
+                                match evm_registries.get(&task.source_chain) {
+                                    Some(registry) => {
+                                        registry.read().await.get(&receiver_addr).copied()
                                     }
+                                    None => None,
                                 };
+                            let Some(info) = info else {
+                                eprintln!(
+                                    "no announced route yet for evm receiver {receiver_addr:?} on {:?} — skipping this pass",
+                                    task.source_chain
+                                );
+                                continue;
+                            };
+                            let Some(route) = info.route else {
+                                eprintln!(
+                                    "evm receiver {receiver_addr:?} known but has no announced route — skipping this pass"
+                                );
+                                continue;
+                            };
+                            let merchant_addr = info.merchant;
+                            let (cctp_chain_bytes, recipient_bytes) =
+                                (route.chain, route.recipient);
 
                             let reg_call =
                                 ReceiverFactory::new(evm_factory_addr, chain_client.clone())
@@ -357,47 +353,37 @@ pub async fn run_payment_worker(
             }
             crate::models::Chain::Starknet => {
                 match Felt::from_hex(&task.receiver_address) {
-                    Ok(_receiver_felt) => {
-                        let merchant_felt =
-                            Felt::from_hex(&task.merchant_address).unwrap_or_else(|_| {
-                                derive_felt_from_foreign_address(&task.merchant_address)
-                            });
-
-                        let predict_selector =
-                            match get_selector_from_name("predict_receiver_address") {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    eprintln!(
-                                        "Failed to get selector for predict_receiver_address: {}",
-                                        e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        let predict_call = FunctionCall {
-                            contract_address: starknet_factory_addr,
-                            entry_point_selector: predict_selector,
-                            calldata: vec![merchant_felt],
-                        };
-
-                        let predict_res = match starknet_account
-                            .provider()
-                            .call(predict_call, BlockId::Tag(BlockTag::Latest))
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Failed predicting receiver address: {}", e);
-                                continue;
-                            }
-                        };
-
-                        let predicted_receiver = predict_res.first().cloned().unwrap_or(Felt::ZERO);
+                    Ok(receiver_felt) => {
+                        // (merchant, route) come straight from the
+                        // announced record for THIS receiver — same
+                        // registry starknet.rs's own transfer worker
+                        // maintains, never re-derived from
+                        // task.destination_chain / task.merchant_address.
+                        // Also replaces the old on-chain
+                        // predict_receiver_address call: a registry hit
+                        // for receiver_felt already IS a real, previously
+                        // announced receiver, a stronger guarantee than a
+                        // same-tx prediction would give.
+                        let info: Option<StarknetReceiverInfo> =
+                            starknet_registry.read().await.get(&receiver_felt).copied();
 
                         let mut calls = Vec::new();
 
                         if task.create_if_missing {
+                            let Some(info) = info else {
+                                eprintln!(
+                                    "no announced route yet for starknet receiver {receiver_felt:#x} — skipping this pass"
+                                );
+                                continue;
+                            };
+                            let Some(route) = info.route else {
+                                eprintln!(
+                                    "starknet receiver {receiver_felt:#x} known but has no announced route — skipping this pass"
+                                );
+                                continue;
+                            };
+                            let merchant_felt = info.merchant;
+
                             let register_selector =
                                 match get_selector_from_name("register_merchant") {
                                     Ok(s) => s,
@@ -410,58 +396,14 @@ pub async fn run_payment_worker(
                                     }
                                 };
 
-                            let (cctp_mint_chain_felt, cctp_recipient_low, cctp_recipient_high) =
-                                if task.destination_chain == task.source_chain {
-                                    (Felt::ZERO, Felt::ZERO, Felt::ZERO)
-                                } else {
-                                    match task.destination_chain {
-                                        crate::models::Chain::Starknet => {
-                                            match Felt::from_hex(&task.merchant_address) {
-                                                Ok(dest_f) => {
-                                                    let be = dest_f.to_bytes_be();
-                                                    let high =
-                                                        Felt::from_bytes_be_slice(&be[0..16]);
-                                                    let low =
-                                                        Felt::from_bytes_be_slice(&be[16..32]);
-                                                    (
-                                                        chain_to_felt(task.destination_chain),
-                                                        low,
-                                                        high,
-                                                    )
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "Invalid Starknet destination_address: {}",
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        _ => match task.merchant_address.parse::<Address>() {
-                                            Ok(addr) => {
-                                                let mut buf = [0u8; 32];
-                                                buf[12..].copy_from_slice(addr.as_bytes());
-                                                let high = Felt::from_bytes_be_slice(&buf[0..16]);
-                                                let low = Felt::from_bytes_be_slice(&buf[16..32]);
-                                                (chain_to_felt(task.destination_chain), low, high)
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Invalid EVM destination_address: {}", e);
-                                                continue;
-                                            }
-                                        },
-                                    }
-                                };
-
                             let register_call = Call {
                                 to: starknet_factory_addr,
                                 selector: register_selector,
                                 calldata: vec![
                                     merchant_felt,
-                                    cctp_mint_chain_felt,
-                                    cctp_recipient_low,
-                                    cctp_recipient_high,
+                                    route.chain,
+                                    route.recipient_low,
+                                    route.recipient_high,
                                 ],
                             };
 
@@ -523,7 +465,7 @@ pub async fn run_payment_worker(
                             calldata: oe_calldata,
                         });
 
-                        // sweep call to predicted receiver — now sweeping real funds that actually arrived
+                        // sweep call to the receiver — now sweeping real funds that actually arrived
                         let sweep_selector = match get_selector_from_name("sweep") {
                             Ok(s) => s,
                             Err(e) => {
@@ -533,7 +475,7 @@ pub async fn run_payment_worker(
                         };
 
                         let sweep_call = Call {
-                            to: predicted_receiver,
+                            to: receiver_felt,
                             selector: sweep_selector,
                             calldata: vec![],
                         };
@@ -549,7 +491,7 @@ pub async fn run_payment_worker(
                                     let deposit = beanie_keeper::config::Deposit {
                                         tx_hash: tx_hash.clone(),
                                         from_address: task.from_address.clone(),
-                                        receiver: format!("{:#x}", predicted_receiver),
+                                        receiver: format!("{:#x}", receiver_felt),
                                         amount_raw: task.amount_raw.clone(),
                                         block_number: 0,
                                     };
@@ -590,13 +532,11 @@ pub async fn run_payment_worker(
                 // `solana_keeper::broadcast_pending_registration`'s doc
                 // comment) and can't be merged into the payer's message
                 // after the fact. So this arm submits the transfer first,
-                // then — same-chain destinations only — JIT-registers (if
-                // needed) and sweeps inline right after, via
-                // `sweep_after_solana_payment` below, instead of waiting
-                // for the next indexer/reconciliation pass. Cross-chain
-                // (CCTP) destinations still fall back to that existing
-                // poller path, since `multicall_sweep_same_chain` doesn't
-                // cover CCTP sweeps yet.
+                // then JIT-registers (if needed) and sweeps inline right
+                // after via `sweep_after_solana_payment`, driven by the
+                // announced record in `solana_registry` (not the payment
+                // request). Same-chain and cross-chain (CCTP) routes are
+                // both handled there by `solana_keeper::sweep_registered`.
                 let auth = match &task.solana_auth {
                     Some(a) => a,
                     None => {
@@ -684,32 +624,29 @@ pub async fn run_payment_worker(
                             task.receiver_address, tx_sig
                         );
 
-                        // Register (if not already) and sweep right away,
-                        // same-chain only — see the doc comment on this
-                        // match arm for why register can't be bundled into
-                        // the transfer tx itself, and why cross-chain
-                        // destinations skip this and fall back to the
-                        // poller.
-                        let sweep_tx = if task.destination_chain == task.source_chain {
-                            match sweep_after_solana_payment(
-                                &solana_rpc,
-                                &solana_keeper,
-                                &solana_cfg,
-                                &task,
-                            )
-                            .await
-                            {
-                                Ok(tx) => tx,
-                                Err(e) => {
-                                    eprintln!(
-                                        "solana register/sweep after payment failed for {}: {e:#}",
-                                        task.receiver_address
-                                    );
-                                    None
-                                }
+                        // Register (if not already) and sweep right away.
+                        // What to do — same-chain or CCTP sweep, or skip
+                        // because the announce isn't indexed yet — is
+                        // decided inside from the announced record in
+                        // `solana_registry`, never from the payment
+                        // request's own destination_chain.
+                        let sweep_tx = match sweep_after_solana_payment(
+                            &solana_rpc,
+                            &solana_keeper,
+                            &solana_cfg,
+                            &solana_registry,
+                            &task,
+                        )
+                        .await
+                        {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                eprintln!(
+                                    "solana register/sweep after payment failed for {}: {e:#}",
+                                    task.receiver_address
+                                );
+                                None
                             }
-                        } else {
-                            None
                         };
 
                         if let Some(url) = &task.webhook_url {
@@ -744,41 +681,42 @@ pub async fn run_payment_worker(
     }
 }
 
-/// Register-if-needed + same-chain sweep for a receiver that just landed a
+/// Register-if-needed + sweep for a receiver that just landed a
 /// gasless-transfer payment, run inline right after that transfer confirms
 /// instead of waiting for the next indexer/reconciliation pass.
 ///
-/// The receiver's owning pubkey — what `receiver_config` and
-/// `pending_registration` are actually keyed on, distinct from its token
-/// account — isn't present anywhere in the payment request. It's read
-/// straight off the receiver token account itself, which
-/// `solana_keeper::prepare_registration` guarantees already exists by the
-/// time any payment can reference it.
+/// Everything about the receiver (merchant, route, pending `reg_tx`) comes
+/// from `solana_registry` — the same map solana.rs's own worker builds from
+/// validated `MerchantAnnounced`/`MerchantRegistered` events. Nothing is
+/// derived from the payment request, and the pending `reg_tx` is only ever
+/// broadcast after `attach_reg_tx_and_merge`'s `validate_announce` has
+/// already accepted it (the old path re-fetched it from chain unchecked).
 ///
-/// Same-chain only (`chain`/`recipient` zeroed, same convention as the EVM
-/// arm's `task.destination_chain == task.source_chain` case) — mirrors
-/// `multicall_sweep_same_chain`'s restriction. Callers must skip this for
-/// cross-chain destinations and let the existing indexer/poller sweep
-/// handle those once CCTP sweep support lands.
+/// Outcomes:
+///   - not in registry yet          -> skip (Ok(None)), poller catches it
+///   - Announced                    -> broadcast validated reg_tx, then sweep
+///   - Registered                   -> sweep
+///
+/// The sweep itself is chosen per receiver inside
+/// `solana_keeper::sweep_registered`: zero route -> same-chain, non-zero ->
+/// CCTP, route unknown -> read from the on-chain `receiver_config`.
+///
+/// The receiver's owning pubkey (the registry key) isn't in the payment
+/// request; it's read off the receiver token account, which
+/// `solana_keeper::prepare_registration` guarantees already exists.
 async fn sweep_after_solana_payment(
     solana_rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
     solana_keeper: &Arc<SolanaKeypair>,
     solana_cfg: &Arc<beanie_keeper::config::SolanaConfig>,
+    solana_registry: &SharedSolanaRegistry,
     task: &crate::models::PaymentTask,
 ) -> anyhow::Result<Option<String>> {
-    use beanie_keeper::solana_keeper::{
-        broadcast_pending_registration, derive_pending_registration, derive_receiver_config,
-        multicall_sweep_same_chain,
-    };
+    use beanie_keeper::solana_keeper::{broadcast_pending_registration, sweep_registered};
 
     let receiver_token_account: SolanaPubkey = task
         .receiver_address
         .parse()
         .map_err(|e| anyhow::anyhow!("bad solana receiver_address: {e}"))?;
-    let merchant: SolanaPubkey = task
-        .merchant_address
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bad solana merchant_address: {e}"))?;
 
     let ta_account = solana_rpc
         .get_account(&receiver_token_account)
@@ -788,58 +726,38 @@ async fn sweep_after_solana_payment(
         .map_err(|e| anyhow::anyhow!("receiver token account failed to unpack: {e}"))?
         .owner;
 
-    // Same-chain: cctp_mint_chain/recipient are zeroed.
-    let chain = [0u8; 32];
-    let recipient = [0u8; 32];
-    let receiver_config = derive_receiver_config(
-        &solana_cfg.program_id,
-        &merchant,
-        &receiver_owner,
-        &chain,
-        &recipient,
-    );
-
-    if solana_rpc.get_account(&receiver_config).await.is_err() {
-        let pending_registration = derive_pending_registration(
-            &solana_cfg.program_id,
-            &merchant,
-            &receiver_owner,
-            &chain,
-            &recipient,
+    let rec: Option<SolanaReceiverRecord> =
+        solana_registry.read().await.get(&receiver_owner).cloned();
+    let Some(rec) = rec else {
+        println!(
+            "no announced record yet for solana receiver {receiver_owner} — skipping inline sweep"
         );
-        let pending_acct = solana_rpc
-            .get_account(&pending_registration)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("receiver not registered and no pending_registration on-chain: {e}")
-            })?;
-        // PendingRegistration layout: 8-byte Anchor discriminator + 1-byte
-        // bump + 4-byte Vec<u8> length prefix, then reg_tx (same layout
-        // solana.rs's box_fetch_reg_tx relies on).
-        anyhow::ensure!(
-            pending_acct.data.len() > 13,
-            "pending_registration account too short"
-        );
-        let reg_tx = &pending_acct.data[13..];
-        let sig = broadcast_pending_registration(solana_rpc, reg_tx).await?;
-        println!("Solana JIT register (payment path) {receiver_owner} -> {sig}");
-    }
-
-    let merchant_token_account = get_associated_token_address(&merchant, &solana_cfg.mint);
-    let rec = SolanaReceiverRecord {
-        merchant,
-        receiver: receiver_owner,
-        receiver_token_account,
-        receiver_config,
-        status: ReceiverStatus::Registered,
-        reg_tx: None,
+        return Ok(None);
     };
 
-    multicall_sweep_same_chain(
+    if rec.status == ReceiverStatus::Announced {
+        let reg_tx = rec
+            .reg_tx
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("receiver Announced but registry holds no reg_tx"))?;
+        match broadcast_pending_registration(solana_rpc, reg_tx).await {
+            Ok(sig) => println!("Solana JIT register (payment path) {receiver_owner} -> {sig}"),
+            Err(e) => {
+                // Registry snapshot may be stale (poller registered it
+                // moments ago). Fine if receiver_config now exists.
+                if solana_rpc.get_account(&rec.receiver_config).await.is_err() {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    let merchant_token_account = get_associated_token_address(&rec.merchant, &solana_cfg.mint);
+    Ok(sweep_registered(
         solana_rpc,
-        &solana_keeper.insecure_clone(),
+        solana_keeper,
         solana_cfg,
         &[(rec, merchant_token_account)],
     )
-    .await
+    .await)
 }

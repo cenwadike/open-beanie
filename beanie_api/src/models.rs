@@ -3,10 +3,10 @@ pub use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use ethers::utils::format_bytes32_string;
 use ethers::utils::keccak256;
 use ethers::{contract::abigen, types::H256};
 pub use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use starknet::core::types::Felt;
 pub use std::net::SocketAddr;
 pub use std::sync::Arc;
@@ -163,35 +163,18 @@ pub fn err(status: StatusCode, msg: &str) -> Response {
         .into_response()
 }
 
-pub(crate) fn chain_to_bytes32(chain: Chain) -> [u8; 32] {
-    let name = match chain {
-        Chain::Base => "BASE",
-        Chain::Ethereum => "ETHEREUM",
-        Chain::Arbitrum => "ARBITRUM",
-        Chain::Monad => "MONAD",
-        Chain::Starknet => "STARKNET",
-        Chain::Solana => "SOLANA",
-    };
-
-    format_bytes32_string(name).expect("Chain name fits in bytes32")
-}
-
-pub(crate) fn chain_to_felt(chain: Chain) -> Felt {
-    match chain {
-        Chain::Base => Felt::from_hex(&hex::encode("BASE")).unwrap(),
-        Chain::Ethereum => Felt::from_hex(&hex::encode("ETHEREUM")).unwrap(),
-        Chain::Arbitrum => Felt::from_hex(&hex::encode("ARBITRUM")).unwrap(),
-        Chain::Monad => Felt::from_hex(&hex::encode("MONAD")).unwrap(),
-        Chain::Solana => Felt::from_hex(&hex::encode("SOLANA")).unwrap(),
-        Chain::Starknet => Felt::from_hex(&hex::encode("STARKNET")).unwrap(),
-    }
-}
-
-pub(crate) fn derive_felt_from_foreign_address(addr: &str) -> Felt {
+pub fn derive_felt_from_foreign_address(addr: &str) -> Felt {
     let hash = keccak256(addr.as_bytes());
     let mut buf = [0u8; 32];
     buf[12..].copy_from_slice(&hash[12..32]);
     Felt::from_bytes_be(&buf)
+}
+
+pub fn derive_pubkey_from_foreign_address(address: &str) -> solana_sdk::pubkey::Pubkey {
+    let mut hasher = Sha256::new();
+    hasher.update(address.as_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    solana_sdk::pubkey::Pubkey::new_from_array(hash)
 }
 
 abigen!(

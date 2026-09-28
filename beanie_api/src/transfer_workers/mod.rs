@@ -36,6 +36,11 @@ use tokio::sync::mpsc;
 use beanie_keeper::log_cache::LogCache;
 use beanie_keeper::starknet_keeper::StarknetAccount;
 
+use crate::models::Chain;
+pub(crate) use evm::SharedEvmRegistry;
+pub(crate) use solana::SharedSolanaRegistry;
+pub(crate) use starknet::SharedStarknetRegistry;
+
 /// Starts every EVM chain's worker, plus Starknet's and Solana's,
 /// concurrently, and never returns. Each one runs its own catch-up retry
 /// loop, live-tip loop, and reconciliation ticker independently — a
@@ -44,10 +49,17 @@ use beanie_keeper::starknet_keeper::StarknetAccount;
 /// (Base only) or several (Base, Arbitrum, ...) and every entry runs
 /// concurrently with every other, same as the EVM/Starknet/Solana split
 /// already does.
-pub async fn run_native_transfer_poller(
+pub(crate) async fn run_native_transfer_poller(
+    // `Chain` tagged onto each entry (in addition to its config, which
+    // already carries `chain_name` as a display string) so this same list
+    // can also carry that chain's registry handle — `payment_workers.rs`
+    // needs to pick the right one by `Chain`, not by string, since that's
+    // what `PaymentTask::source_chain` already is.
     evm_chains: Vec<(
+        Chain,
         Arc<beanie_keeper::evm_keeper::SignerProvider>,
         Arc<beanie_keeper::config::EvmConfig>,
+        SharedEvmRegistry,
     )>,
     starknet_account: Arc<StarknetAccount>,
     solana_rpc: Arc<SolanaRpcClient>,
@@ -55,13 +67,15 @@ pub async fn run_native_transfer_poller(
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
     solana_cfg: Arc<beanie_keeper::config::SolanaConfig>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
+    starknet_registry: SharedStarknetRegistry,
+    solana_registry: SharedSolanaRegistry,
 ) {
     log::info!(
         "Transfer worker starting ({} EVM chain(s): {})",
         evm_chains.len(),
         evm_chains
             .iter()
-            .map(|(_, cfg)| cfg.chain_name.as_str())
+            .map(|(_, _, cfg, _)| cfg.chain_name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -75,19 +89,21 @@ pub async fn run_native_transfer_poller(
     // concurrently via `join_all` rather than `tokio::join!` since the
     // count isn't known until runtime (1 chain today, N once Ethereum,
     // etc. are added to `main.rs`'s `evm_chains` vec).
-    let evm_futures = evm_chains.into_iter().map(|(evm_client, evm_cfg)| {
-        let chain_name = evm_cfg.chain_name.clone();
-        let log_cache = log_cache.clone();
-        let webhook_tx = webhook_tx.clone();
-        async move {
-            evm::run_evm_worker(evm_client, evm_cfg, log_cache, webhook_tx).await;
-            // run_evm_worker runs an unconditional `loop {}` internally and
-            // is not expected to return under normal operation — this only
-            // fires if that ever changes (e.g. a future refactor adds an
-            // early-return error path) and is here so that case isn't silent.
-            log::error!("EVM worker for chain '{chain_name}' exited unexpectedly");
-        }
-    });
+    let evm_futures = evm_chains
+        .into_iter()
+        .map(|(chain, evm_client, evm_cfg, evm_registry)| {
+            let chain_name = evm_cfg.chain_name.clone();
+            let log_cache = log_cache.clone();
+            let webhook_tx = webhook_tx.clone();
+            async move {
+                evm::run_evm_worker(evm_client, evm_cfg, log_cache, webhook_tx, evm_registry).await;
+                // run_evm_worker runs an unconditional `loop {}` internally and
+                // is not expected to return under normal operation — this only
+                // fires if that ever changes (e.g. a future refactor adds an
+                // early-return error path) and is here so that case isn't silent.
+                log::error!("EVM worker for chain '{chain_name}' ({chain:?}) exited unexpectedly");
+            }
+        });
 
     tokio::join!(
         join_all(evm_futures),
@@ -95,14 +111,16 @@ pub async fn run_native_transfer_poller(
             starknet_account,
             starknet_cfg,
             log_cache.clone(),
-            webhook_tx.clone()
+            webhook_tx.clone(),
+            starknet_registry,
         ),
         solana::run_solana_worker(
             solana_rpc,
             solana_keeper_wallet,
             solana_cfg,
             log_cache,
-            webhook_tx
+            webhook_tx,
+            solana_registry,
         ),
     );
 }

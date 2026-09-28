@@ -1,7 +1,7 @@
 //! EVM native transfer worker — one instance per EVM-compatible chain
 //! (Base, Arbitrum, ...), each given its own `EvmConfig`/`SignerProvider`
 //! by `transfer_workers/mod.rs`'s `evm_chains` list. Nothing in this file
-//! is Base-specific; everything chain-identifying comes from the `cfg`
+//! is chain-specific; everything chain-identifying comes from the `cfg`
 //! passed in.
 //!
 //! Pipeline: historical catch-up -> live push-tip loop (registry/webhook
@@ -11,8 +11,7 @@
 //! `sweep_evm_receivers`'s doc comment for why that backstop exists).
 //!
 //! Register + sweep are sent as a single atomic Multicall3 `aggregate3`
-//! call per batch — unlike Solana, where registration is a separate,
-//! pre-signed, standalone broadcast (see `solana.rs`).
+//! call per batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,6 +29,7 @@ use crate::models::{ChainXReceiverLocal, ReceiverFactory};
 use beanie_keeper::evm_indexer::{EvmReceiverRecord, EvmRoute};
 use beanie_keeper::evm_ws::{self, EvmTip};
 use beanie_keeper::log_cache::LogCache;
+use tokio::sync::RwLock as AsyncRwLock;
 
 use super::common::RECONCILE_EVERY;
 
@@ -153,10 +153,26 @@ async fn batch_check_evm_nonzero_balance(
 /// What the registry told us about a receiver: who it belongs to and, for
 /// receivers learned from `ReceiverAnnounced`, the CCTP route that is part
 /// of its address. Registration replays that route verbatim.
+///
+/// `pub(crate)` — `payment_workers.rs` reads this same shape out of
+/// `SharedEvmRegistry` instead of re-deriving a route from the payment
+/// request, so it has to be visible outside this module.
 #[derive(Clone, Copy)]
-struct EvmReceiverInfo {
-    merchant: Address,
-    route: Option<EvmRoute>,
+pub(crate) struct EvmReceiverInfo {
+    pub(crate) merchant: Address,
+    pub(crate) route: Option<EvmRoute>,
+}
+
+/// What `payment_workers.rs` reads. Republished after every mutation to
+/// `EvmState.merchant_map` rather than making the live map itself
+/// lock-guarded — this worker's own hot path (every tip, every
+/// reconciliation tick) stays a plain, uncontended `HashMap` exactly as
+/// before; only the snapshot handed outward pays a lock+clone, and only
+/// when the map actually changed.
+pub(crate) type SharedEvmRegistry = Arc<AsyncRwLock<HashMap<Address, EvmReceiverInfo>>>;
+
+async fn publish_evm_registry(state: &EvmState, shared: &SharedEvmRegistry) {
+    *shared.write().await = state.merchant_map.clone();
 }
 
 /// Never let a route-less `MerchantRegistered` row erase a route we already
@@ -173,13 +189,13 @@ fn remember_evm_receiver(map: &mut HashMap<Address, EvmReceiverInfo>, rec: EvmRe
 }
 
 /// Shared, cross-tick state. Bundled into one struct so `process_evm_tip`
-/// and the reconciliation pass operate on identical state instead of two
+/// and the reconciliation pass operate on identical state instead of
 /// slightly-diverged copies.
 struct EvmState {
     merchant_map: HashMap<Address, EvmReceiverInfo>,
-    /// Fix #5: persistent across ticks, only ever added to.
+    /// persistent across ticks, only ever added to.
     webhook_map: HashMap<String, String>,
-    /// Fix #3: once true, never checked again. Only ever set once a
+    /// once true, never checked again. Only ever set once a
     /// deploy send is *confirmed* successful (or an existence check
     /// confirms it), never eagerly at call-construction time.
     deployed: HashSet<Address>,
@@ -190,6 +206,7 @@ pub(super) async fn run_evm_worker(
     evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     log_cache: Arc<LogCache>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
+    evm_registry: SharedEvmRegistry,
 ) {
     let mut state = EvmState {
         merchant_map: HashMap::new(),
@@ -226,6 +243,7 @@ pub(super) async fn run_evm_worker(
         state.merchant_map.len(),
         state.webhook_map.len()
     );
+    publish_evm_registry(&state, &evm_registry).await;
 
     // The live stream resumes right after whatever block catch-up covered.
     let ws_start_block = summary
@@ -278,6 +296,7 @@ pub(super) async fn run_evm_worker(
                     &webhook_tx,
                     &mut state,
                     tip,
+                    &evm_registry,
                 ).await;
             }
             _ = reconcile_ticker.tick() => {
@@ -297,6 +316,7 @@ pub(super) async fn run_evm_worker(
                         &webhook_tx,
                         &mut state,
                         synthetic_tip,
+                        &evm_registry,
                     ).await;
 
                     // Balance-driven sweep backstop. `process_evm_tip` above
@@ -346,6 +366,7 @@ async fn process_evm_tip(
     webhook_tx: &Arc<mpsc::Sender<crate::models::WebhookJob>>,
     state: &mut EvmState,
     tip: EvmTip,
+    evm_registry: &SharedEvmRegistry,
 ) {
     let tip_bn = tip.block_number;
 
@@ -391,7 +412,7 @@ async fn process_evm_tip(
                     remember_evm_receiver(&mut state.merchant_map, rec);
                 }
                 for (merchant, url) in found_webhooks {
-                    // Fix #5: insert into the persistent map, never reset it.
+                    // insert into the persistent map, never reset it.
                     state.webhook_map.insert(format!("{merchant:?}"), url);
                 }
                 // No local watermark to advance: discover_registry_activity
@@ -405,6 +426,7 @@ async fn process_evm_tip(
             }
             Err(e) => error!("discover_registry_activity failed: {e:#}"),
         }
+        publish_evm_registry(state, evm_registry).await;
     } else if registry_webhook_watermark == tip_bn {
         // The stream already reported no factory/webhook-registry logs in this
         // exact block and there's no gap behind it, so it's safe to mark scanned.
@@ -474,7 +496,7 @@ async fn process_evm_tip(
 /// identified — a fresh deposit scan (`act_on_evm_deposits`) or a
 /// reconciliation balance sweep (`run_evm_worker`'s reconcile tick) both
 /// call into this one function. That matters because `state.deployed` is a
-/// permanent, never-re-checked cache (fix #3): there must be exactly one
+/// permanent, never-re-checked cache: there must be exactly one
 /// place that builds register/sweep calls and folds a receiver into it, or
 /// the two callers would drift.
 ///
@@ -607,7 +629,7 @@ async fn sweep_evm_receivers(
                     // out — none of which are on-chain reverts, but all of
                     // which leave the receiver genuinely undeployed. Since
                     // state.deployed is a permanent cache that's never
-                    // re-checked (fix #3), marking it early on any of
+                    // re-checked, marking it early on any of
                     // those paths would permanently strand this receiver:
                     // every future pass would build sweep-only calls
                     // against a contract that doesn't exist, forever.
@@ -782,7 +804,7 @@ async fn compute_sweep_fees(
 }
 
 /// Sends the Multicall3 aggregate3 call, using the block-header base fee
-/// from the push tip when available (fixes item #4) and falling back to
+/// from the push tip when available and falling back to
 /// `estimate_eip1559_fees` for the priority fee in all cases (see
 /// `compute_sweep_fees`).
 async fn send_evm_multicall(

@@ -89,6 +89,19 @@ pub enum ReceiverStatus {
     Registered,
 }
 
+/// The CCTP destination this receiver was announced with — `chain`/
+/// `recipient` all-zero means same-chain (the receiver sweeps to itself),
+/// anything else is a genuine cross-chain route. Unlike EVM/Starknet's
+/// registry records, this used to be validated against `reg_tx` in
+/// `attach_reg_tx_and_merge` and then thrown away — nothing downstream
+/// could ever tell a same-chain receiver from a cross-chain one after the
+/// fact. Recording it here is what makes that distinction available again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolanaRoute {
+    pub chain: [u8; 32],
+    pub recipient: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 pub struct SolanaReceiverRecord {
     pub merchant: Pubkey,
@@ -98,6 +111,12 @@ pub struct SolanaReceiverRecord {
     pub status: ReceiverStatus,
     /// Present only while `Announced`. Cleared once `Registered` fires.
     pub reg_tx: Option<Vec<u8>>,
+    /// Set from the validated `MerchantAnnounced` event in
+    /// `attach_reg_tx_and_merge`. `None` means this record was only ever
+    /// seen via `MerchantRegistered` (the announce predates this field, or
+    /// was missed) — callers that need the route must treat `None` as
+    /// "unknown, do not guess," never as "same-chain."
+    pub route: Option<SolanaRoute>,
 }
 
 // ── Raw event bodies (fixed-size — plain byte-offset slicing) ───────────────
@@ -278,6 +297,11 @@ fn merge_events(map: &mut HashMap<Pubkey, SolanaReceiverRecord>, events: &[Ancho
             log::warn!("undecodable MerchantRegistered at slot {}", ev.slot);
             continue;
         };
+        // `route: None` here only, never touched below — if an entry
+        // already exists (the normal case: Announced always precedes
+        // Registered), its route from `attach_reg_tx_and_merge` is left
+        // exactly as-is. `MerchantRegistered` carries no route to
+        // overwrite it with, and must not erase one we already validated.
         let entry = map.entry(raw.receiver).or_insert(SolanaReceiverRecord {
             merchant: raw.merchant,
             receiver: raw.receiver,
@@ -285,6 +309,7 @@ fn merge_events(map: &mut HashMap<Pubkey, SolanaReceiverRecord>, events: &[Ancho
             receiver_config: raw.receiver_config,
             status: ReceiverStatus::Registered,
             reg_tx: None,
+            route: None,
         });
         entry.status = ReceiverStatus::Registered;
         entry.reg_tx = None;
@@ -339,6 +364,13 @@ pub async fn attach_reg_tx_and_merge(
                 receiver_config: raw.receiver_config,
                 status: ReceiverStatus::Announced,
                 reg_tx: Some(reg_tx),
+                // Already validated above (validate_announce confirms this
+                // exact chain/recipient pair is what reg_tx itself
+                // registers) — safe to record as the receiver's real route.
+                route: Some(SolanaRoute {
+                    chain: raw.cctp_mint_chain,
+                    recipient: raw.cctp_mint_recipient,
+                }),
             },
         );
     }
@@ -368,8 +400,17 @@ pub async fn run_solana_catchup(
     let (events, last_seen) = fetch_program_events(cfg, cache, from_slot, head).await?;
 
     let mut map: HashMap<Pubkey, SolanaReceiverRecord> = HashMap::new();
-    merge_events(&mut map, &events);
+    // Announced MUST be merged first: it's the only place `route` is ever
+    // captured (straight off the validated event, see
+    // `attach_reg_tx_and_merge`'s doc comment), and it only fires for
+    // entries that aren't already `Registered`. Running `merge_events`
+    // first would insert a route-less `Registered` row before the
+    // Announced event for the same receiver is ever looked at, so its
+    // route would never be attached — same receiver, same batch, silently
+    // lost. `merge_events` afterward only flips `status`/`reg_tx`, never
+    // touches `route`, so a route captured here survives it untouched.
     attach_reg_tx_and_merge(&mut map, &events, &cfg.program_id, &cfg.mint, fetch_reg_tx).await;
+    merge_events(&mut map, &events);
 
     if let Some(seen) = last_seen {
         cache.set_checkpoint(REGISTRY_SCAN_ID, seen)?;

@@ -35,9 +35,11 @@ use crate::models::{Chain, StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
 use crate::stealth_routes::execute_stealth_claim;
+use crate::transfer_workers::{SharedEvmRegistry, SharedSolanaRegistry, SharedStarknetRegistry};
 use crate::{config::Config, models::AppState};
 use crate::{create_routes::announce_receiver, create_workers::run_announce_worker};
 use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
+use tokio::sync::RwLock as AsyncRwLock;
 
 /// Fallback route handler for serving static frontend files and pretty HTML URLs.
 pub async fn serve_static(req: Request) -> Response {
@@ -117,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     let base_cfg = EvmConfig::from_env("BASE", "base")?;
     let arbitrum_cfg = EvmConfig::from_env("ARBITRUM", "arbitrum")?;
     let monad_cfg = EvmConfig::from_env("MONAD", "monad")?;
-    let solana_cfg = SolanaConfig::from_env()?;
+    let mut solana_cfg = SolanaConfig::from_env()?;
     debug!("[baeanie_api::main]: env loaded");
 
     // 1. Initialize EVM Provider & Signer Clients — one per EVM chain.
@@ -135,6 +137,17 @@ async fn main() -> anyhow::Result<()> {
     // client to build — solana_indexer.rs/solana_ws.rs talk to Subsquid
     // Portal directly using solana_cfg.
     let solana_rpc = beanie_keeper::solana_keeper::build_client(&solana_cfg);
+
+    // `treasury_token_account` lives in the on-chain FactoryConfig and can't
+    // come from env — SolanaConfig::from_env leaves a placeholder. Every
+    // sweep (same-chain and CCTP) passes it, so read it before the config
+    // is shared.
+    solana_cfg.treasury_token_account = beanie_keeper::solana_keeper::fetch_treasury_token_account(
+        &solana_rpc,
+        &solana_cfg.factory_config,
+    )
+    .await?;
+
     let solana_keeper_wallet = solana_cfg.keeper_wallet.clone();
     let solana_usdc_mint = solana_cfg.mint;
     let solana_program_id = solana_cfg.program_id;
@@ -224,10 +237,44 @@ async fn main() -> anyhow::Result<()> {
     let payment_solana_keeper_clone = solana_keeper_wallet.clone();
     let payment_solana_cfg_clone = solana_cfg.clone();
 
+    // One announce-log registry per EVM chain, plus one each for Starknet
+    // and Solana. Built here, before either worker spawns, and shared by
+    // clone: the transfer poller writes to each (populated from
+    // ReceiverAnnounced/MerchantRegistered via evm_indexer.rs /
+    // starknet_indexer.rs / solana_indexer.rs), the payment worker only
+    // ever reads. Single writer, so no risk of the two workers'
+    // registrations racing or drifting apart.
+    let base_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+    let arbitrum_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+    let monad_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+    let starknet_registry: SharedStarknetRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+    let solana_registry: SharedSolanaRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+
+    // Keyed by `Chain` so the payment worker can pick the right registry
+    // straight off `PaymentTask::source_chain` — same aliasing as
+    // `evm_targets` above: `Chain::Ethereum` has no client of its own yet,
+    // so it shares Base's registry too.
+    let evm_registries: HashMap<Chain, SharedEvmRegistry> = HashMap::from([
+        (Chain::Base, base_registry.clone()),
+        (Chain::Ethereum, base_registry.clone()),
+        (Chain::Arbitrum, arbitrum_registry.clone()),
+        (Chain::Monad, monad_registry.clone()),
+    ]);
+
     let evm_chains = vec![
-        (base_client, Arc::new(base_cfg)),
-        (arbitrum_client, Arc::new(arbitrum_cfg)),
-        (monad_client, Arc::new(monad_cfg)),
+        (Chain::Base, base_client, Arc::new(base_cfg), base_registry),
+        (
+            Chain::Arbitrum,
+            arbitrum_client,
+            Arc::new(arbitrum_cfg),
+            arbitrum_registry,
+        ),
+        (
+            Chain::Monad,
+            monad_client,
+            Arc::new(monad_cfg),
+            monad_registry,
+        ),
     ];
     let starknet_cfg_clone = state.starknet_config.clone();
     let webhook_tx_for_transfer = webhook_tx.clone();
@@ -249,14 +296,19 @@ async fn main() -> anyhow::Result<()> {
     // Spawn stealth workers
     tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
 
-    // Spawn payment worker
+    // Spawn payment worker — reads the same registries the transfer
+    // poller below writes to, instead of deriving JIT-register/sweep
+    // params from the payment request itself.
     tokio::spawn(run_payment_worker(
         evm_payments,
+        evm_registries,
         payment_starknet_account_clone,
         state.starknet_config.clone(),
+        starknet_registry.clone(),
         payment_solana_rpc_clone,
         payment_solana_keeper_clone,
         payment_solana_cfg_clone,
+        solana_registry.clone(),
         payment_rx,
         webhook_tx.clone(),
     ));
@@ -271,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
             starknet_cfg_clone,
             solana_cfg,
             webhook_tx_for_transfer,
+            starknet_registry,
+            solana_registry,
         )
         .await;
     });

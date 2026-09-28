@@ -19,11 +19,12 @@ use solana_sdk::transaction::Transaction as LegacyTransaction;
 use spl_associated_token_account::get_associated_token_address;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{SolanaConfig, now_formatted};
-use crate::solana_indexer::SolanaReceiverRecord;
+use crate::solana_indexer::{SolanaReceiverRecord, SolanaRoute};
 
 /// Conservative same-chain batch size. Each `sweep` (same-chain) touches 9
 /// accounts (caller, caller_ta, receiver_ta, factory_config, treasury_ta,
@@ -113,6 +114,170 @@ pub fn derive_pending_registration(
 
 fn derive_merchant_registry(program_id: &Pubkey, merchant: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[REGISTRY_SEED, merchant.as_ref()], program_id).0
+}
+
+// ── CCTP (Circle Cross-Chain Transfer Protocol) PDAs ────────────────────────
+// These belong to Circle's TokenMessengerMinterV2 / MessageTransmitterV2
+// programs, not ours. Verified against Circle's real, deployed V2 source
+// (circlefin/solana-cctp-contracts, programs/v2/token-messenger-minter-v2/
+// src/token_messenger_v2/instructions/deposit_for_burn.rs) — every account
+// this program's `sweep` cross-chain branch passes maps 1:1, in the same
+// order, to that instruction's `DepositForBurnContext`. The one seed not
+// independently verifiable that way is `remote_token_messenger` (Circle's
+// own struct has no `seeds =` constraint on it — the caller/SDK is trusted
+// to supply the right address); that one still rests on Circle's official
+// V2 quickstart sample rather than an on-chain-checkable constraint.
+const CCTP_SENDER_AUTHORITY_SEED: &[u8] = b"sender_authority";
+const CCTP_DENYLIST_SEED: &[u8] = b"denylist_account";
+const CCTP_MESSAGE_TRANSMITTER_SEED: &[u8] = b"message_transmitter";
+const CCTP_TOKEN_MESSENGER_SEED: &[u8] = b"token_messenger";
+const CCTP_REMOTE_TOKEN_MESSENGER_SEED: &[u8] = b"remote_token_messenger";
+const CCTP_TOKEN_MINTER_SEED: &[u8] = b"token_minter";
+const CCTP_LOCAL_TOKEN_SEED: &[u8] = b"local_token";
+const CCTP_EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+
+// Same constants as lib.rs's CCTP_TOKEN_MESSENGER_MINTER_V2 /
+// CCTP_MESSAGE_TRANSMITTER_V2 — duplicated here rather than imported since
+// this crate doesn't depend on the on-chain program crate.
+const CCTP_TOKEN_MESSENGER_MINTER_V2: &str = "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe";
+const CCTP_MESSAGE_TRANSMITTER_V2: &str = "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC";
+
+fn cctp_token_messenger_minter_id() -> Pubkey {
+    Pubkey::from_str(CCTP_TOKEN_MESSENGER_MINTER_V2).expect("valid pubkey literal")
+}
+fn cctp_message_transmitter_id() -> Pubkey {
+    Pubkey::from_str(CCTP_MESSAGE_TRANSMITTER_V2).expect("valid pubkey literal")
+}
+
+fn derive_cctp_sender_authority_pda() -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_SENDER_AUTHORITY_SEED],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+
+/// Seeded off whichever pubkey signs as CCTP's `owner` for the burn — in
+/// this program that's `receiver_config` (see lib.rs's `sweep`:
+/// `AccountMeta::new_readonly(receiver_config.key(), true)` is passed as
+/// `owner`), NOT the keeper wallet. Confirmed against Circle's real V2
+/// source: `seeds = [b"denylist_account", owner.key()]`.
+fn derive_cctp_denylist_account(owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_DENYLIST_SEED, owner.as_ref()],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+fn derive_cctp_message_transmitter() -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_MESSAGE_TRANSMITTER_SEED],
+        &cctp_message_transmitter_id(),
+    )
+    .0
+}
+fn derive_cctp_token_messenger() -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_TOKEN_MESSENGER_SEED],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+/// Domain is encoded as its base-10 STRING representation for this seed in
+/// CCTP V2 (V1 used raw domain bytes instead) — per Circle's V2 quickstart.
+/// Not independently checkable against an on-chain `seeds =` constraint,
+/// since Circle's own `remote_token_messenger` account has none; worth a
+/// devnet dry run before trusting on mainnet.
+fn derive_cctp_remote_token_messenger(domain: u32) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            CCTP_REMOTE_TOKEN_MESSENGER_SEED,
+            domain.to_string().as_bytes(),
+        ],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+fn derive_cctp_token_minter() -> Pubkey {
+    Pubkey::find_program_address(&[CCTP_TOKEN_MINTER_SEED], &cctp_token_messenger_minter_id()).0
+}
+fn derive_cctp_local_token(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_LOCAL_TOKEN_SEED, mint.as_ref()],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+fn derive_cctp_event_authority() -> Pubkey {
+    Pubkey::find_program_address(
+        &[CCTP_EVENT_AUTHORITY_SEED],
+        &cctp_token_messenger_minter_id(),
+    )
+    .0
+}
+
+/// `ReceiverConfig.cctp_domain_id` is written once, at `register_merchant`
+/// time, by the SAME `validate_route` the on-chain program itself uses (see
+/// lib.rs) — reading it back here avoids re-implementing that chain-name ->
+/// domain-id mapping (and factory_config's per-chain domain fields) a
+/// second time, off-chain, where it could drift from the on-chain version.
+/// Byte layout mirrors `ReceiverConfig` exactly: 8-byte Anchor
+/// discriminator, then receiver/merchant/mint/merchant_token_account/
+/// cctp_mint_chain/cctp_mint_recipient (32 bytes each, six fields), then
+/// cctp_domain_id as a little-endian u32.
+async fn fetch_cctp_domain_id(rpc: &RpcClient, receiver_config: &Pubkey) -> Result<u32> {
+    let account = rpc
+        .get_account(receiver_config)
+        .await
+        .context("receiver_config account not found on-chain")?;
+    const DOMAIN_OFFSET: usize = 8 + 32 * 6;
+    let bytes = account
+        .data
+        .get(DOMAIN_OFFSET..DOMAIN_OFFSET + 4)
+        .context("receiver_config account too short to contain cctp_domain_id")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Route straight from the on-chain `ReceiverConfig` — the same account the
+/// program's own `sweep` uses to decide same-chain vs cross-chain, so it can
+/// never disagree with it. Used only when the indexer has no route for a
+/// receiver (e.g. `Registered` with no announce seen).
+/// Layout: 8-byte discriminator, receiver/merchant/mint/merchant_token_account
+/// (32 bytes each), then cctp_mint_chain and cctp_mint_recipient.
+pub async fn fetch_receiver_route(
+    rpc: &RpcClient,
+    receiver_config: &Pubkey,
+) -> Result<SolanaRoute> {
+    let account = rpc
+        .get_account(receiver_config)
+        .await
+        .context("receiver_config account not found on-chain")?;
+    const ROUTE_OFFSET: usize = 8 + 32 * 4;
+    let b = account
+        .data
+        .get(ROUTE_OFFSET..ROUTE_OFFSET + 64)
+        .context("receiver_config account too short to contain route")?;
+    Ok(SolanaRoute {
+        chain: b[..32].try_into().unwrap(),
+        recipient: b[32..].try_into().unwrap(),
+    })
+}
+
+/// `treasury_token_account` from the on-chain `FactoryConfig`
+/// (8-byte discriminator, mint, then treasury_token_account).
+pub async fn fetch_treasury_token_account(
+    rpc: &RpcClient,
+    factory_config: &Pubkey,
+) -> Result<Pubkey> {
+    let account = rpc
+        .get_account(factory_config)
+        .await
+        .context("factory_config account not found on-chain")?;
+    let b = account
+        .data
+        .get(8 + 32..8 + 64)
+        .context("factory_config account too short to contain treasury_token_account")?;
+    Ok(Pubkey::new_from_array(b.try_into().unwrap()))
 }
 
 // ── Borsh-shaped instruction data (hand-encoded, no extra `borsh` dep) ──────
@@ -503,11 +668,9 @@ fn build_same_chain_sweep_ix(program_id: &Pubkey, a: &SameChainSweepAccounts) ->
 /// Same-chain sweeps only — `Registered` receivers whose `cctp_mint_chain`
 /// is zeroed. Cross-chain (CCTP) sweeps are NOT batched here: each one adds
 /// two ephemeral co-signers (`event_rent_payer`, `message_sent_event_data`)
-/// and ~11 extra accounts, which eats the per-tx budget fast enough that
+/// and ~14 extra accounts, which eats the per-tx budget fast enough that
 /// batching them together buys little. See `sweep_cross_chain_receiver` for
-/// the one-sweep-per-tx path — not implemented in this draft; wire up once
-/// real CCTP CPI accounts (sender authority PDA, message transmitter, etc.)
-/// are sourced, same TODO the Anchor test suite itself leaves `.skip`ped.
+/// the one-sweep-per-tx path.
 pub async fn multicall_sweep_same_chain(
     rpc: &RpcClient,
     keeper: &Keypair,
@@ -574,4 +737,188 @@ pub async fn multicall_sweep_same_chain(
     }
 
     Ok(sent.into_iter().last())
+}
+
+// ── Cross-chain sweep (CCTP) ─────────────────────────────────────────────────
+
+struct CrossChainSweepAccounts {
+    caller: Pubkey,
+    caller_token_account: Pubkey,
+    receiver_token_account: Pubkey,
+    factory_config: Pubkey,
+    treasury_token_account: Pubkey,
+    receiver_config: Pubkey,
+    cctp_burn_staging_account: Pubkey,
+    event_rent_payer: Pubkey,
+    message_sent_event_data: Pubkey,
+    burn_token_mint: Pubkey,
+    cctp_sender_authority_pda: Pubkey,
+    cctp_denylist_account: Pubkey,
+    cctp_message_transmitter: Pubkey,
+    cctp_token_messenger: Pubkey,
+    cctp_remote_token_messenger: Pubkey,
+    cctp_token_minter: Pubkey,
+    cctp_local_token: Pubkey,
+    cctp_event_authority: Pubkey,
+}
+
+/// Account order MUST exactly match `Sweep<'info>` in lib.rs — Anchor
+/// deserializes accounts positionally, not by name. `merchant_token_account`
+/// is left at the "None" sentinel (`program_id`), same convention
+/// `build_same_chain_sweep_ix` uses for ITS unused (CCTP) slots — a
+/// cross-chain sweep never reads `merchant_token_account` on-chain (lib.rs's
+/// `sweep` only touches it inside the `!cross_chain` branch). This account
+/// list, and the mut/signer flags on each entry, were verified directly
+/// against Circle's real, deployed V2 `deposit_for_burn` instruction
+/// (circlefin/solana-cctp-contracts) — see the doc comment on the CCTP PDA
+/// derivation functions above.
+fn build_cross_chain_sweep_ix(program_id: &Pubkey, a: &CrossChainSweepAccounts) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(a.caller, true),
+            AccountMeta::new(a.caller_token_account, false),
+            AccountMeta::new(a.receiver_token_account, false),
+            AccountMeta::new_readonly(a.factory_config, false),
+            AccountMeta::new(a.treasury_token_account, false),
+            AccountMeta::new_readonly(a.receiver_config, false),
+            AccountMeta::new_readonly(*program_id, false), // merchant_token_account: None
+            AccountMeta::new(a.cctp_burn_staging_account, false),
+            AccountMeta::new(a.event_rent_payer, true),
+            AccountMeta::new(a.message_sent_event_data, true),
+            AccountMeta::new(a.burn_token_mint, false),
+            AccountMeta::new_readonly(a.cctp_sender_authority_pda, false),
+            AccountMeta::new_readonly(a.cctp_denylist_account, false),
+            AccountMeta::new(a.cctp_message_transmitter, false),
+            AccountMeta::new_readonly(a.cctp_token_messenger, false),
+            AccountMeta::new_readonly(a.cctp_remote_token_messenger, false),
+            AccountMeta::new_readonly(a.cctp_token_minter, false),
+            AccountMeta::new(a.cctp_local_token, false),
+            AccountMeta::new_readonly(a.cctp_event_authority, false),
+            AccountMeta::new_readonly(cctp_message_transmitter_id(), false),
+            AccountMeta::new_readonly(cctp_token_messenger_minter_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: anchor_discriminator("sweep").to_vec(), // same no-arg data as same-chain
+    }
+}
+
+/// One sweep per transaction, deliberately not batched — a cross-chain
+/// sweep adds two ephemeral co-signers (`event_rent_payer`,
+/// `message_sent_event_data`) plus ~14 extra accounts on top of what a
+/// same-chain sweep needs, so several together would blow the 1232-byte
+/// packet / account-count ceiling `multicall_sweep_same_chain` is already
+/// sized against.
+///
+/// `message_sent_event_data` is a fresh, single-use keypair generated here
+/// and used only to co-sign this one transaction — Circle's
+/// MessageTransmitterV2 program initializes it via CPI inside
+/// `deposit_for_burn`, the same "ephemeral account, signs once, never
+/// touched again" shape `prepare_registration`'s nonce keypair already
+/// uses elsewhere in this file. `event_rent_payer` is the keeper itself,
+/// since the keeper already pays for and signs the whole transaction.
+pub async fn sweep_cross_chain_receiver(
+    rpc: &RpcClient,
+    keeper: &Keypair,
+    cfg: &SolanaConfig,
+    rec: &SolanaReceiverRecord,
+) -> Result<String> {
+    let domain = fetch_cctp_domain_id(rpc, &rec.receiver_config).await?;
+    let event_data_kp = Keypair::new();
+
+    let accounts = CrossChainSweepAccounts {
+        caller: keeper.pubkey(),
+        caller_token_account: cfg.caller_token_account,
+        receiver_token_account: rec.receiver_token_account,
+        factory_config: cfg.factory_config,
+        treasury_token_account: cfg.treasury_token_account,
+        receiver_config: rec.receiver_config,
+        cctp_burn_staging_account: get_associated_token_address(&rec.receiver_config, &cfg.mint),
+        event_rent_payer: keeper.pubkey(),
+        message_sent_event_data: event_data_kp.pubkey(),
+        burn_token_mint: cfg.mint,
+        cctp_sender_authority_pda: derive_cctp_sender_authority_pda(),
+        cctp_denylist_account: derive_cctp_denylist_account(&rec.receiver_config),
+        cctp_message_transmitter: derive_cctp_message_transmitter(),
+        cctp_token_messenger: derive_cctp_token_messenger(),
+        cctp_remote_token_messenger: derive_cctp_remote_token_messenger(domain),
+        cctp_token_minter: derive_cctp_token_minter(),
+        cctp_local_token: derive_cctp_local_token(&cfg.mint),
+        cctp_event_authority: derive_cctp_event_authority(),
+    };
+
+    let ix = build_cross_chain_sweep_ix(&cfg.program_id, &accounts);
+
+    let blockhash = rpc
+        .get_latest_blockhash()
+        .await
+        .context("failed fetching blockhash for cross-chain sweep tx")?;
+    let tx = LegacyTransaction::new_signed_with_payer(
+        &[ix],
+        Some(&keeper.pubkey()),
+        &[keeper, &event_data_kp],
+        blockhash,
+    );
+
+    let sig = rpc
+        .send_and_confirm_transaction(&tx)
+        .await
+        .context("cross-chain sweep failed")?;
+    log::info!(
+        "[{}] solana cross-chain sweep for {} -> tx {} (domain {domain})",
+        now_formatted(),
+        rec.receiver,
+        sig
+    );
+    Ok(sig.to_string())
+}
+
+/// Sweeps `Registered` receivers, picking the instruction per receiver:
+/// zero route -> batched same-chain sweep, non-zero route -> one CCTP sweep
+/// per tx. A route missing from the indexer is read from chain; if that
+/// fails the receiver is skipped, never guessed (a wrong guess reverts, and
+/// would take a whole same-chain batch down with it).
+/// Returns the last tx signature that landed.
+pub async fn sweep_registered(
+    rpc: &RpcClient,
+    keeper: &Keypair,
+    cfg: &SolanaConfig,
+    registered: &[(
+        SolanaReceiverRecord,
+        Pubkey, /* merchant_token_account */
+    )],
+) -> Option<String> {
+    let mut same_chain = Vec::new();
+    let mut last = None;
+
+    for (rec, merchant_ta) in registered {
+        let route = match rec.route {
+            Some(r) => r,
+            None => match fetch_receiver_route(rpc, &rec.receiver_config).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("skipping sweep for {}: route unknown: {e:#}", rec.receiver);
+                    continue;
+                }
+            },
+        };
+
+        if route.chain == [0u8; 32] {
+            same_chain.push((rec.clone(), *merchant_ta));
+        } else {
+            match sweep_cross_chain_receiver(rpc, keeper, cfg, rec).await {
+                Ok(sig) => last = Some(sig),
+                Err(e) => log::error!("cross-chain sweep failed for {}: {e:#}", rec.receiver),
+            }
+        }
+    }
+
+    let same = multicall_sweep_same_chain(rpc, keeper, cfg, &same_chain)
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("same-chain sweep failed: {e:#}");
+            None
+        });
+    same.or(last)
 }

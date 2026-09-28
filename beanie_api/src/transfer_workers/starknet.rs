@@ -24,6 +24,7 @@ use starknet::accounts::{Account, ConnectedAccount};
 use starknet::core::types::{BlockId, BlockTag, Call, Felt};
 use starknet::core::utils::get_selector_from_name;
 use starknet::providers::Provider;
+use tokio::sync::RwLock as AsyncRwLock;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
 
@@ -54,10 +55,22 @@ const STARKNET_MIN_LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 /// What the registry told us about a receiver: who it belongs to and, for
 /// receivers learned from `ReceiverAnnounced`, the CCTP route that is part
 /// of its address. Registration replays that route verbatim.
+///
+/// `pub(crate)` — `payment_workers.rs` reads this same shape out of
+/// `SharedStarknetRegistry` instead of re-deriving a route from the
+/// payment request.
 #[derive(Clone, Copy)]
-struct StarknetReceiverInfo {
-    merchant: Felt,
-    route: Option<StarknetRoute>,
+pub(crate) struct StarknetReceiverInfo {
+    pub(crate) merchant: Felt,
+    pub(crate) route: Option<StarknetRoute>,
+}
+
+/// What `payment_workers.rs` reads — same republish-after-mutation shape
+/// as `evm.rs`'s `SharedEvmRegistry`.
+pub(crate) type SharedStarknetRegistry = Arc<AsyncRwLock<HashMap<Felt, StarknetReceiverInfo>>>;
+
+async fn publish_starknet_registry(state: &StarknetState, shared: &SharedStarknetRegistry) {
+    *shared.write().await = state.merchant_map.clone();
 }
 
 /// Never let a route-less `MerchantRegistered` row erase a route we already
@@ -91,6 +104,7 @@ pub(super) async fn run_starknet_worker(
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
     log_cache: Arc<LogCache>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
+    starknet_registry: SharedStarknetRegistry,
 ) {
     let mut sn_state = StarknetState {
         merchant_map: HashMap::new(),
@@ -109,6 +123,7 @@ pub(super) async fn run_starknet_worker(
         for rec in &summary.merchants {
             remember_starknet_receiver(&mut sn_state.merchant_map, *rec);
         }
+        publish_starknet_registry(&sn_state, &starknet_registry).await;
 
         act_on_starknet_deposits(
             &starknet_account,
@@ -144,6 +159,7 @@ pub(super) async fn run_starknet_worker(
                     &mut sn_state,
                     tip,
                     false, // live tip: respect STARKNET_MIN_LIVE_SCAN_INTERVAL
+                    &starknet_registry,
                 ).await;
             }
             _ = reconcile_ticker.tick() => {
@@ -157,6 +173,7 @@ pub(super) async fn run_starknet_worker(
                         &mut sn_state,
                         StarknetTip { block_number: bn },
                         true, // reconciliation backstop: always scan
+                        &starknet_registry,
                     ).await;
                 }
             }
@@ -173,6 +190,7 @@ async fn process_starknet_tip(
     state: &mut StarknetState,
     tip: StarknetTip,
     force_scan: bool,
+    starknet_registry: &SharedStarknetRegistry,
 ) {
     let sn_tip = tip.block_number;
 
@@ -204,6 +222,7 @@ async fn process_starknet_tip(
         }
         Err(e) => error!("starknet discover_merchants failed: {e:#}"),
     }
+    publish_starknet_registry(state, starknet_registry).await;
 
     if state.merchant_map.is_empty() {
         return;
@@ -319,7 +338,7 @@ async fn act_on_starknet_deposits(
             continue;
         }
 
-        // Fix #3, Starknet side: only ask the chain once per receiver, ever.
+        // Starknet side: only ask the chain once per receiver, ever.
         let needs_deploy = if state.deployed.contains(&receiver) {
             false
         } else {
@@ -357,7 +376,7 @@ async fn act_on_starknet_deposits(
             // Do NOT mark state.deployed here — same reasoning as the EVM
             // side. execute_v3(...).send() can fail without the receiver
             // ever having been deployed, and state.deployed is a
-            // permanent, never-re-checked cache (fix #3). Marking it
+            // permanent, never-re-checked cache. Marking it
             // early would permanently strand the receiver on failure.
             pending_deploys.push(receiver);
         }
