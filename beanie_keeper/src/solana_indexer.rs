@@ -7,7 +7,7 @@
 //!
 //! WHY ANNOUNCED IS A TRACKED STATE, NOT JUST REGISTERED
 //! -------------------------------------------------------
-//! `MerchantAnnounced` discloses `receiver`/`receiver_token_account` to
+//! `ReceiverAnnounced` discloses `receiver`/`receiver_token_account` to
 //! depositors before `receiver_config` exists on-chain. `register_merchant`
 //! is a separate, permissionless broadcast of a pre-signed tx that can
 //! happen long after the first deposit lands (JIT registration). If
@@ -65,7 +65,7 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 /// matched. Slot is carried through for checkpointing.
 #[derive(Clone, Debug)]
 pub struct AnchorEvent {
-    pub name: String,  // "MerchantAnnounced" | "MerchantRegistered"
+    pub name: String,  // "ReceiverAnnounced" | "ReceiverRegistered"
     pub data: Vec<u8>, // borsh body, discriminator already stripped
     pub slot: u64,
 }
@@ -111,9 +111,9 @@ pub struct SolanaReceiverRecord {
     pub status: ReceiverStatus,
     /// Present only while `Announced`. Cleared once `Registered` fires.
     pub reg_tx: Option<Vec<u8>>,
-    /// Set from the validated `MerchantAnnounced` event in
+    /// Set from the validated `ReceiverAnnounced` event in
     /// `attach_reg_tx_and_merge`. `None` means this record was only ever
-    /// seen via `MerchantRegistered` (the announce predates this field, or
+    /// seen via `ReceiverRegistered` (the announce predates this field, or
     /// was missed) — callers that need the route must treat `None` as
     /// "unknown, do not guess," never as "same-chain."
     pub route: Option<SolanaRoute>,
@@ -121,7 +121,7 @@ pub struct SolanaReceiverRecord {
 
 // ── Raw event bodies (fixed-size — plain byte-offset slicing) ───────────────
 
-struct RawMerchantAnnounced {
+struct RawReceiverAnnounced {
     merchant: Pubkey,
     receiver: Pubkey,
     receiver_token_account: Pubkey,
@@ -138,14 +138,14 @@ fn read_pubkey(buf: &[u8], off: usize) -> Result<Pubkey> {
         .context("event body too short")
 }
 
-fn decode_merchant_announced(data: &[u8]) -> Result<RawMerchantAnnounced> {
+fn decode_merchant_announced(data: &[u8]) -> Result<RawReceiverAnnounced> {
     if data.len() != 256 {
         bail!(
-            "MerchantAnnounced body is {} bytes, expected 256",
+            "ReceiverAnnounced body is {} bytes, expected 256",
             data.len()
         );
     }
-    Ok(RawMerchantAnnounced {
+    Ok(RawReceiverAnnounced {
         merchant: read_pubkey(data, 0)?,
         receiver: read_pubkey(data, 32)?,
         receiver_token_account: read_pubkey(data, 64)?,
@@ -157,21 +157,21 @@ fn decode_merchant_announced(data: &[u8]) -> Result<RawMerchantAnnounced> {
     })
 }
 
-pub struct RawMerchantRegistered {
+pub struct RawReceiverRegistered {
     pub merchant: Pubkey,
     pub receiver: Pubkey,
     pub receiver_config: Pubkey,
     pub receiver_token_account: Pubkey,
 }
 
-pub fn decode_merchant_registered(data: &[u8]) -> Result<RawMerchantRegistered> {
+pub fn decode_merchant_registered(data: &[u8]) -> Result<RawReceiverRegistered> {
     if data.len() < 128 {
         bail!(
-            "MerchantRegistered body is {} bytes, expected >=128",
+            "ReceiverRegistered body is {} bytes, expected >=128",
             data.len()
         );
     }
-    Ok(RawMerchantRegistered {
+    Ok(RawReceiverRegistered {
         merchant: read_pubkey(data, 0)?,
         receiver: read_pubkey(data, 32)?,
         receiver_config: read_pubkey(data, 64)?,
@@ -204,7 +204,7 @@ mod register_merchant_accounts {
 }
 
 fn validate_announce(
-    ev: &RawMerchantAnnounced,
+    ev: &RawReceiverAnnounced,
     reg_tx: &[u8],
     program_id: &Pubkey,
     mint: &Pubkey,
@@ -290,17 +290,17 @@ fn validate_announce(
 
 fn merge_events(map: &mut HashMap<Pubkey, SolanaReceiverRecord>, events: &[AnchorEvent]) {
     for ev in events {
-        if ev.name != "MerchantRegistered" {
-            continue; // MerchantAnnounced handled in attach_reg_tx_and_merge
+        if ev.name != "ReceiverRegistered" {
+            continue; // ReceiverAnnounced handled in attach_reg_tx_and_merge
         }
         let Ok(raw) = decode_merchant_registered(&ev.data) else {
-            log::warn!("undecodable MerchantRegistered at slot {}", ev.slot);
+            log::warn!("undecodable ReceiverRegistered at slot {}", ev.slot);
             continue;
         };
         // `route: None` here only, never touched below — if an entry
         // already exists (the normal case: Announced always precedes
         // Registered), its route from `attach_reg_tx_and_merge` is left
-        // exactly as-is. `MerchantRegistered` carries no route to
+        // exactly as-is. `ReceiverRegistered` carries no route to
         // overwrite it with, and must not erase one we already validated.
         let entry = map.entry(raw.receiver).or_insert(SolanaReceiverRecord {
             merchant: raw.merchant,
@@ -316,7 +316,7 @@ fn merge_events(map: &mut HashMap<Pubkey, SolanaReceiverRecord>, events: &[Ancho
     }
 }
 
-/// `MerchantAnnounced` needs the pinned `PendingRegistration.reg_tx` blob to
+/// `ReceiverAnnounced` needs the pinned `PendingRegistration.reg_tx` blob to
 /// validate against — the event itself doesn't carry it. `fetch_reg_tx` is
 /// an ordinary on-chain account read (via solana_keeper's RPC client, not
 /// Portal — Portal doesn't serve current account state).
@@ -328,11 +328,11 @@ pub async fn attach_reg_tx_and_merge(
     mut fetch_reg_tx: impl FnMut(Pubkey) -> BoxFuture<Result<Vec<u8>>>,
 ) {
     for ev in events {
-        if ev.name != "MerchantAnnounced" {
+        if ev.name != "ReceiverAnnounced" {
             continue;
         }
         let Ok(raw) = decode_merchant_announced(&ev.data) else {
-            log::warn!("undecodable MerchantAnnounced at slot {}", ev.slot);
+            log::warn!("undecodable ReceiverAnnounced at slot {}", ev.slot);
             continue;
         };
         if matches!(map.get(&raw.receiver), Some(r) if r.status == ReceiverStatus::Registered) {
@@ -693,7 +693,7 @@ async fn stream_solana(
     Ok(last_seen)
 }
 
-/// MerchantAnnounced/MerchantRegistered are Anchor `emit!` lines — `kind:
+/// ReceiverAnnounced/ReceiverRegistered are Anchor `emit!` lines — `kind:
 /// "data"` log rows ("Program data: <base64>"). Filtered by emitting
 /// program_id; discriminator match happens client-side.
 pub async fn fetch_program_events(
@@ -702,8 +702,8 @@ pub async fn fetch_program_events(
     from_slot: u64,
     to_slot: u64,
 ) -> Result<(Vec<AnchorEvent>, Option<u64>)> {
-    let announced_disc = anchor_discriminator("event", "MerchantAnnounced");
-    let registered_disc = anchor_discriminator("event", "MerchantRegistered");
+    let announced_disc = anchor_discriminator("event", "ReceiverAnnounced");
+    let registered_disc = anchor_discriminator("event", "ReceiverRegistered");
     let program_str = cfg.program_id.to_string();
 
     let extra = serde_json::json!({
@@ -730,9 +730,9 @@ pub async fn fetch_program_events(
             }
             let (disc, data) = raw.split_at(8);
             let name = if disc == announced_disc {
-                "MerchantAnnounced"
+                "ReceiverAnnounced"
             } else if disc == registered_disc {
-                "MerchantRegistered"
+                "ReceiverRegistered"
             } else {
                 continue;
             };

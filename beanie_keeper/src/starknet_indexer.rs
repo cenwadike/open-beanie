@@ -38,7 +38,7 @@ pub struct StarknetRoute {
 pub struct StarknetReceiverRecord {
     pub merchant: Felt,
     pub receiver: Felt,
-    /// `Some` for receivers learned from `ReceiverAnnounced`. `MerchantRegistered`
+    /// `Some` for receivers learned from `ReceiverAnnounced`. `ReceiverRegistered`
     /// doesn't carry a route, but a registered receiver is already deployed.
     pub route: Option<StarknetRoute>,
 }
@@ -136,8 +136,8 @@ fn transfer_selector() -> Result<Felt> {
 }
 
 fn merchant_registered_selector() -> Result<Felt> {
-    get_selector_from_name("MerchantRegistered")
-        .context("failed computing MerchantRegistered event selector")
+    get_selector_from_name("ReceiverRegistered")
+        .context("failed computing ReceiverRegistered event selector")
 }
 
 fn receiver_announced_selector() -> Result<Felt> {
@@ -501,7 +501,7 @@ pub async fn discover_merchants(
         .context("failed fetching Starknet registry events")?;
 
         // Neither `ReceiverAnnounced { merchant, receiver, cctp_mint_chain,
-        // cctp_mint_recipient }` nor `MerchantRegistered { merchant, receiver }`
+        // cctp_mint_recipient }` nor `ReceiverRegistered { merchant, receiver }`
         // in merchant_factory.cairo annotates any field `#[key]`, so every field
         // lands in the event's `data` array — `keys` is always just `[selector]`.
         // Read `data`, not `keys`. The two variants have different arities (5
@@ -521,7 +521,7 @@ pub async fn discover_merchants(
                         route: None,
                     }),
                     _ => warn!(
-                        "MerchantRegistered event at block {} (tx {}) had unexpected data shape (len={}), skipping",
+                        "ReceiverRegistered event at block {} (tx {}) had unexpected data shape (len={}), skipping",
                         evt.block_number,
                         evt.transaction_hash,
                         evt.data.len()
@@ -723,15 +723,6 @@ fn u256_to_string(low: Felt, high: Felt) -> String {
     let low_u128: u128 = low.try_into().unwrap_or(0);
     let high_u128: u128 = high.try_into().unwrap_or(0);
 
-    // Bug fix: this was `low_u128.to_string();` — a statement, not a
-    // `return` — so this branch never actually returned and every amount
-    // fell through to the hex-concatenation path below regardless of
-    // `high_u128`. For a genuine zero-amount transfer (low = high = 0),
-    // that fallthrough formatted 64 hex zero characters and then
-    // `trim_start_matches('0')` stripped all of them, producing an EMPTY
-    // STRING for `amount_raw` instead of "0" — a real landmine for
-    // whatever consumes `Deposit.amount_raw` downstream (webhook payloads,
-    // DB inserts, etc).
     if high_u128 == 0 {
         return low_u128.to_string();
     }

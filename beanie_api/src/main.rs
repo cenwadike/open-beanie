@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
     // One announce-log registry per EVM chain, plus one each for Starknet
     // and Solana. Built here, before either worker spawns, and shared by
     // clone: the transfer poller writes to each (populated from
-    // ReceiverAnnounced/MerchantRegistered via evm_indexer.rs /
+    // ReceiverAnnounced/ReceiverRegistered via evm_indexer.rs /
     // starknet_indexer.rs / solana_indexer.rs), the payment worker only
     // ever reads. Single writer, so no risk of the two workers'
     // registrations racing or drifting apart.

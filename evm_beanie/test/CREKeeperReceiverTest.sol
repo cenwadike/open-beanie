@@ -72,7 +72,9 @@ contract CREKeeperReceiverTest is Test {
             1, // Starknet Domain
             2, // Base Domain
             3, // Solana Domain
-            4 // Eth Domain
+            4, // Eth Domain
+            5, // Arbitrum Domain
+            6 // Monad Domain
         );
 
         // 2. Deploy CRE Keeper Receiver entrypoint

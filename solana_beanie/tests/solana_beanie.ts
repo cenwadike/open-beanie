@@ -120,7 +120,7 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
   const treasuryOwnerKp = Keypair.generate();
   const badActorKp = Keypair.generate();
 
-  const STARKNET_DOMAIN = 21;
+  const STARKNET_DOMAIN = 25;
   const BASE_DOMAIN = 6;
   const ETHEREUM_DOMAIN = 0;
   const MONAD_DOMAIN = 15;
@@ -477,7 +477,7 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
 
       const sig = await sendRaw(raw);
 
-      const ev = findEvent(await eventsOf(sig), "MerchantAnnounced")!.data;
+      const ev = findEvent(await eventsOf(sig), "ReceiverAnnounced")!.data;
       assert.equal(ev.merchant.toBase58(), merchant.toBase58());
       assert.equal(ev.receiver.toBase58(), r.receiver.toBase58());
       assert.equal(ev.receiverTokenAccount.toBase58(), r.receiverTA.toBase58());
@@ -570,7 +570,7 @@ describe("Solana Beanie (receiver-keyed factory, pinned pre-signed registration)
 
       const sig = await broadcastStored(r.pendingPda);
 
-      const ev = findEvent(await eventsOf(sig), "MerchantRegistered")!.data;
+      const ev = findEvent(await eventsOf(sig), "ReceiverRegistered")!.data;
       assert.equal(ev.receiver.toBase58(), r.receiver.toBase58());
       assert.equal(ev.receiverConfig.toBase58(), r.configPda.toBase58());
 

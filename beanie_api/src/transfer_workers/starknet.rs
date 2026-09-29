@@ -73,7 +73,7 @@ async fn publish_starknet_registry(state: &StarknetState, shared: &SharedStarkne
     *shared.write().await = state.merchant_map.clone();
 }
 
-/// Never let a route-less `MerchantRegistered` row erase a route we already
+/// Never let a route-less `ReceiverRegistered` row erase a route we already
 /// learned from `ReceiverAnnounced`.
 fn remember_starknet_receiver(
     map: &mut HashMap<Felt, StarknetReceiverInfo>,

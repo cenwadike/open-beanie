@@ -92,7 +92,7 @@ pub(crate) async fn run_payment_worker(
     evm_targets: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)>,
     // One shared, read-only registry per chain — populated by
     // transfer_workers' own worker for that chain from
-    // ReceiverAnnounced/MerchantRegistered, never by this worker. JIT
+    // ReceiverAnnounced/ReceiverRegistered, never by this worker. JIT
     // register/sweep params below are looked up here, never derived from
     // the payment request itself.
     evm_registries: HashMap<Chain, SharedEvmRegistry>,
@@ -687,7 +687,7 @@ pub(crate) async fn run_payment_worker(
 ///
 /// Everything about the receiver (merchant, route, pending `reg_tx`) comes
 /// from `solana_registry` — the same map solana.rs's own worker builds from
-/// validated `MerchantAnnounced`/`MerchantRegistered` events. Nothing is
+/// validated `ReceiverAnnounced`/`ReceiverRegistered` events. Nothing is
 /// derived from the payment request, and the pending `reg_tx` is only ever
 /// broadcast after `attach_reg_tx_and_merge`'s `validate_announce` has
 /// already accepted it (the old path re-fetched it from chain unchecked).

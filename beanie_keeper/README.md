@@ -356,6 +356,6 @@ EVM worker state ready: N receiver(s), M webhook(s)
 | `unreadable cached registry chunk ... refetching` | Cached chunk didn't deserialize (format change); it's refetched and rewritten |
 | No EVM lines at all after startup | Live tips are flowing but nothing is due. Set `RUST_LOG=debug` to see per-tip `no receivers in merchant_map` messages |
 
-If `N` is `0` even though merchants exist, check that `MerchantRegistered`
+If `N` is `0` even though merchants exist, check that `ReceiverRegistered`
 carries the receiver in `data`: the decoder expects that layout and
 silently skips the log if the receiver is an indexed topic instead.

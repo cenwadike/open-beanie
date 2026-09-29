@@ -63,7 +63,7 @@ pub mod ReceiverFactory {
     #[event]
     #[derive(Drop, starknet::Event)]
     pub enum Event {
-        MerchantRegistered: MerchantRegistered,
+        ReceiverRegistered: ReceiverRegistered,
         ReceiverAnnounced: ReceiverAnnounced,
     }
 
@@ -76,7 +76,7 @@ pub mod ReceiverFactory {
     }
 
     #[derive(Drop, starknet::Event)]
-    pub struct MerchantRegistered {
+    pub struct ReceiverRegistered {
         pub merchant: ContractAddress,
         pub receiver: ContractAddress,
     }
@@ -133,6 +133,8 @@ pub mod ReceiverFactory {
         base_destination_domain: u32,
         solana_destination_domain: u32,
         eth_destination_domain: u32,
+        arb_destination_domain: u32,
+        monad_destination_domain: u32,
     ) {
         assert(
             token.is_non_zero() && treasury.is_non_zero() && token_messenger.is_non_zero(),
@@ -147,10 +149,14 @@ pub mod ReceiverFactory {
         self.valid_domains.write('BASE', true);
         self.valid_domains.write('SOLANA', true);
         self.valid_domains.write('ETHEREUM', true);
+        self.valid_domains.write('MONAD', true);
+        self.valid_domains.write('ARBITRUM', true);
 
         self.destination_domains.write('BASE', base_destination_domain);
         self.destination_domains.write('SOLANA', solana_destination_domain);
         self.destination_domains.write('ETHEREUM', eth_destination_domain);
+        self.destination_domains.write('ARBITRUM', arb_destination_domain);
+        self.destination_domains.write('MONAD', monad_destination_domain);
     }
 
     #[abi(embed_v0)]
@@ -192,8 +198,8 @@ pub mod ReceiverFactory {
 
             self
                 .emit(
-                    Event::MerchantRegistered(
-                        MerchantRegistered { merchant, receiver: receiver_address },
+                    Event::ReceiverRegistered(
+                        ReceiverRegistered { merchant, receiver: receiver_address },
                     ),
                 );
             receiver_address

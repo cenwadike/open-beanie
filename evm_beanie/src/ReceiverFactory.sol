@@ -28,7 +28,7 @@ contract ReceiverFactory {
     mapping(bytes32 => bool) public validDomains;
     mapping(bytes32 => uint32) public destinationDomain; // keyed by chain name
 
-    event MerchantRegistered(address indexed merchant, address receiver);
+    event ReceiverRegistered(address indexed merchant, address receiver);
     event ReceiverAnnounced(
         address indexed merchant,
         address indexed receiver,
@@ -48,18 +48,32 @@ contract ReceiverFactory {
         uint32 _starknetDestinationDomain,
         uint32 _baseDestinationDomain,
         uint32 _solanaDestinationDomain,
-        uint32 _ethDestinationDomain
+        uint32 _ethDestinationDomain,
+        uint32 _arbDestinationDomain,
+        uint32 _monadDestinationDomain
     ) {
         require(_receiverImplementation != address(0), "zero impl");
+
+        // Ensure all provided CCTP domains are unique
         require(
             _baseDestinationDomain != _solanaDestinationDomain &&
                 _baseDestinationDomain != _starknetDestinationDomain &&
                 _baseDestinationDomain != _ethDestinationDomain &&
+                _baseDestinationDomain != _arbDestinationDomain &&
+                _baseDestinationDomain != _monadDestinationDomain &&
                 _solanaDestinationDomain != _starknetDestinationDomain &&
                 _solanaDestinationDomain != _ethDestinationDomain &&
-                _starknetDestinationDomain != _ethDestinationDomain,
+                _solanaDestinationDomain != _arbDestinationDomain &&
+                _solanaDestinationDomain != _monadDestinationDomain &&
+                _starknetDestinationDomain != _ethDestinationDomain &&
+                _starknetDestinationDomain != _arbDestinationDomain &&
+                _starknetDestinationDomain != _monadDestinationDomain &&
+                _ethDestinationDomain != _arbDestinationDomain &&
+                _ethDestinationDomain != _monadDestinationDomain &&
+                _arbDestinationDomain != _monadDestinationDomain,
             "provide unique cctp domains"
         );
+
         receiverImplementation = _receiverImplementation;
         token = _token;
         treasury = _treasury;
@@ -69,20 +83,25 @@ contract ReceiverFactory {
         validDomains["BASE"] = true;
         validDomains["SOLANA"] = true;
         validDomains["ETHEREUM"] = true;
+        validDomains["ARBITRUM"] = true;
+        validDomains["MONAD"] = true;
 
         destinationDomain["STARKNET"] = _starknetDestinationDomain;
         destinationDomain["BASE"] = _baseDestinationDomain;
         destinationDomain["SOLANA"] = _solanaDestinationDomain;
         destinationDomain["ETHEREUM"] = _ethDestinationDomain;
+        destinationDomain["ARBITRUM"] = _arbDestinationDomain;
+        destinationDomain["MONAD"] = _monadDestinationDomain;
     }
 
     /// The receiver's address is a pure function of (merchant, cctpMintChain,
     /// cctpMintRecipient)
+    /// "same-chain" if ALL CCTP params is 0.
     /// Registering the same route twice reverts (CREATE2 onto a live address).
     /// MAX_RECEIVERS_PER_MERCHANT therefore caps distinct routes per merchant.
     function registerMerchant(
         address merchant,
-        bytes32 cctpMintChain, // 0 (same-chain) || "STARKNET" || "BASE" || "SOLANA" || "ETHEREUM"
+        bytes32 cctpMintChain, // 0 (same-chain) || "STARKNET" || "BASE" || "SOLANA" || "ETHEREUM" || "ARBITRUM" || "MONAD"
         bytes32 cctpMintRecipient // 0 (same-chain) || recipient on the destination chain
     ) external returns (address) {
         if (
@@ -110,7 +129,7 @@ contract ReceiverFactory {
 
         merchantReceiversMap[merchant].push(clone);
 
-        emit MerchantRegistered(merchant, clone);
+        emit ReceiverRegistered(merchant, clone);
         return clone;
     }
 

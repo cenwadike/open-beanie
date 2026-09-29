@@ -181,13 +181,16 @@ fn deploy_factory(
     base_destination_domain: u32,
     solana_destination_domain: u32,
     eth_destination_domain: u32,
+    arb_destination_domain: u32,
+    monad_destination_domain: u32,
     receiver_class: ContractClass,
 ) -> ContractAddress {
     let factory_class = declare("ReceiverFactory").unwrap_syscall().contract_class();
     let calldata = array![
         receiver_class.class_hash.into(), token.into(), treasury.into(), token_messenger.into(),
         base_destination_domain.into(), solana_destination_domain.into(),
-        eth_destination_domain.into(),
+        eth_destination_domain.into(), arb_destination_domain.into(),
+        monad_destination_domain.into(),
     ];
     let (factory_addr, _) = factory_class.deploy(@calldata).unwrap_syscall();
     factory_addr
@@ -302,7 +305,15 @@ fn merchant_factory_registers_and_predicts_receiver() {
     let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
 
     let factory_addr = deploy_factory(
-        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
+        token,
+        treasury,
+        messenger,
+        6_u32, // Base
+        5_u32, // Solana
+        0_u32, // Ethereum
+        3_u32, // Arbitrum
+        15_u32, // Monad
+        receiver_class.clone(),
     );
 
     let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };
@@ -327,7 +338,15 @@ fn merchant_factory_rejects_exceeding_max_receivers() {
     let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
 
     let factory_addr = deploy_factory(
-        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
+        token,
+        treasury,
+        messenger,
+        6_u32, // Base
+        5_u32, // Solana
+        0_u32, // Ethereum
+        3_u32, // Arbitrum
+        15_u32, // Monad
+        receiver_class.clone(),
     );
 
     let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };
@@ -356,7 +375,15 @@ fn merchant_factory_announces_receiver() {
     let receiver_class = declare("StarknetReceiver").unwrap_syscall().contract_class();
 
     let factory_addr = deploy_factory(
-        token, treasury, messenger, 6_u32, 5_u32, 0_u32, receiver_class.clone(),
+        token,
+        treasury,
+        messenger,
+        6_u32, // Base
+        5_u32, // Solana
+        0_u32, // Ethereum
+        3_u32, // Arbitrum
+        15_u32, // Monad
+        receiver_class.clone(),
     );
 
     let factory = IReceiverFactoryDispatcher { contract_address: factory_addr };

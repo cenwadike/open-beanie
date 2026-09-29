@@ -83,7 +83,7 @@ const REGISTRY_CHUNK_BLOCKS: u64 = 200_000;
 /// so a shallow reorg near the tip can't leave stale logs in the cache.
 const REORG_SAFETY_BLOCKS: u64 = 128;
 
-const MERCHANT_REGISTERED_SIG: &str = "MerchantRegistered(address,address)";
+const MERCHANT_REGISTERED_SIG: &str = "ReceiverRegistered(address,address)";
 const RECEIVER_ANNOUNCED_SIG: &str = "ReceiverAnnounced(address,address,bytes32,bytes32)";
 const WEBHOOK_URL_SET_SIG: &str = "WebhookUrlSet(address,string)";
 const TRANSFER_SIG: &str = "Transfer(address,address,uint256)";
@@ -102,7 +102,7 @@ pub struct EvmRoute {
 pub struct EvmReceiverRecord {
     pub merchant: Address,
     pub receiver: Address,
-    /// `Some` for receivers learned from `ReceiverAnnounced`. `MerchantRegistered`
+    /// `Some` for receivers learned from `ReceiverAnnounced`. `ReceiverRegistered`
     /// doesn't carry a route, but a registered receiver is already deployed, so
     /// nothing downstream needs one for it.
     pub route: Option<EvmRoute>,

@@ -20,7 +20,7 @@ use crate::solana_indexer::{SQD_SOLANA_RATE_LIMITER, portal_http_client};
 #[derive(Debug, Clone, Copy)]
 pub struct SolanaTip {
     pub slot: u64,
-    pub registry_activity: bool, // program logged a MerchantAnnounced/Registered this slot
+    pub registry_activity: bool, // program logged a ReceiverAnnounced/Registered this slot
     pub deposit_activity: bool,  // a tracked receiver ATA saw a transfer this slot
 }
 

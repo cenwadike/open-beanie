@@ -117,10 +117,12 @@ contract ReceiverFactoryTest is Test {
     ReceiverFactory factory;
 
     address treasury = address(0x100);
-    uint32 _starknetDestinationDomain = 21;
+    uint32 _starknetDestinationDomain = 25;
     uint32 _solanaDestinationDomain = 5;
-    uint32 _baseDestinationDomain = 3;
+    uint32 _baseDestinationDomain = 6; // Updated to 6 to accurately reflect CCTP Base domain and leave 3 for Arbitrum
     uint32 _ethDestinationDomain = 0;
+    uint32 _arbDestinationDomain = 3;
+    uint32 _monadDestinationDomain = 15;
 
     // Helper function to dynamically generate a valid CCTP recipient
     function getMintRecipient(
@@ -142,7 +144,9 @@ contract ReceiverFactoryTest is Test {
             _starknetDestinationDomain,
             _baseDestinationDomain,
             _solanaDestinationDomain,
-            _ethDestinationDomain
+            _ethDestinationDomain,
+            _arbDestinationDomain,
+            _monadDestinationDomain
         );
     }
 
@@ -169,7 +173,9 @@ contract ReceiverFactoryTest is Test {
             _starknetDestinationDomain,
             _baseDestinationDomain,
             _solanaDestinationDomain,
-            _ethDestinationDomain
+            _ethDestinationDomain,
+            _arbDestinationDomain,
+            _monadDestinationDomain
         );
 
         address clone2 = f2.registerMerchant(
@@ -232,7 +238,9 @@ contract ReceiverFactoryTest is Test {
             _starknetDestinationDomain,
             _baseDestinationDomain,
             _solanaDestinationDomain,
-            _ethDestinationDomain
+            _ethDestinationDomain,
+            _arbDestinationDomain,
+            _monadDestinationDomain
         );
 
         // zero chain and zero recipient => same-chain settlement path
@@ -276,16 +284,28 @@ contract ReceiverFactoryTest is Test {
             "SOLANA",
             validRecipient
         );
+        address clone3 = factory.registerMerchant(
+            merchant,
+            "ARBITRUM",
+            validRecipient
+        );
+        address clone4 = factory.registerMerchant(
+            merchant,
+            "MONAD",
+            validRecipient
+        );
 
-        assertEq(factory.getReceiverCount(merchant), 2);
+        assertEq(factory.getReceiverCount(merchant), 4);
 
         address[] memory receivers = factory.getMerchantReceivers(merchant);
-        assertEq(receivers.length, 2);
+        assertEq(receivers.length, 4);
         assertEq(receivers[0], clone1);
         assertEq(receivers[1], clone2);
+        assertEq(receivers[2], clone3);
+        assertEq(receivers[3], clone4);
 
         assertEq(factory.getMerchantReceiverAt(merchant, 0), clone1);
-        assertEq(factory.getMerchantReceiverAt(merchant, 1), clone2);
+        assertEq(factory.getMerchantReceiverAt(merchant, 2), clone3);
     }
 
     function test_revert_exceed_max_receivers() public {

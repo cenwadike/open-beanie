@@ -61,7 +61,7 @@ struct SolanaState {
     merchant_ta_cache: HashMap<SolanaPubkey, SolanaPubkey>,
 }
 
-/// Never let a `MerchantAnnounced` merge downgrade an already-`Registered`
+/// Never let a `ReceiverAnnounced` merge downgrade an already-`Registered`
 /// receiver, and never drop the pinned `reg_tx` until it's actually been
 /// consumed — see `solana_indexer.rs`'s module doc for why Announced is
 /// tracked at all (JIT registration).
@@ -75,8 +75,8 @@ fn remember_solana_receiver(
             // by the reconciliation backstop) must not undo that.
         }
         Some(existing) => {
-            // Never let a route-less row (e.g. a `MerchantRegistered` seen
-            // before its own `MerchantAnnounced` was processed this same
+            // Never let a route-less row (e.g. a `ReceiverRegistered` seen
+            // before its own `ReceiverAnnounced` was processed this same
             // batch) erase a route already captured. Same "never downgrade
             // what we already validated" rule as the status check above.
             if rec.route.is_none() {
@@ -287,9 +287,9 @@ async fn process_solana_tip(
             Ok((events, last_seen)) => {
                 // Announced MUST be merged first — it's the only place
                 // `route` is ever captured, and it skips receivers already
-                // `Registered`. Doing the `MerchantRegistered` loop first
+                // `Registered`. Doing the `ReceiverRegistered` loop first
                 // would insert a route-less `Registered` row before this
-                // same batch's `MerchantAnnounced` for that receiver is
+                // same batch's `ReceiverAnnounced` for that receiver is
                 // ever looked at, permanently losing its route. See the
                 // identical ordering note in solana_indexer.rs's
                 // `run_solana_catchup`.
@@ -304,7 +304,7 @@ async fn process_solana_tip(
                 .await;
 
                 for ev in &events {
-                    if ev.name == "MerchantRegistered" {
+                    if ev.name == "ReceiverRegistered" {
                         if let Ok(raw) = solana_indexer::decode_merchant_registered(&ev.data) {
                             remember_solana_receiver(
                                 &mut state.merchant_map,

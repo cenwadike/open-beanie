@@ -175,7 +175,7 @@ async fn publish_evm_registry(state: &EvmState, shared: &SharedEvmRegistry) {
     *shared.write().await = state.merchant_map.clone();
 }
 
-/// Never let a route-less `MerchantRegistered` row erase a route we already
+/// Never let a route-less `ReceiverRegistered` row erase a route we already
 /// learned from `ReceiverAnnounced`.
 fn remember_evm_receiver(map: &mut HashMap<Address, EvmReceiverInfo>, rec: EvmReceiverRecord) {
     let entry = map.entry(rec.receiver).or_insert(EvmReceiverInfo {

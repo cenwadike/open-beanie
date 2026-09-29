@@ -192,7 +192,7 @@ pub mod sol {
         pending.bump = ctx.bumps.pending_registration;
         pending.reg_tx = reg_tx;
 
-        emit!(MerchantAnnounced {
+        emit!(ReceiverAnnounced {
             merchant,
             receiver,
             receiver_token_account,
@@ -276,7 +276,7 @@ pub mod sol {
         registry.receivers[idx] = receiver_config_key;
         registry.receiver_count += 1;
 
-        emit!(MerchantRegistered {
+        emit!(ReceiverRegistered {
             merchant,
             receiver,
             receiver_config: receiver_config_key,
@@ -876,7 +876,7 @@ pub struct FactoryInitialized {
 }
 
 #[event]
-pub struct MerchantAnnounced {
+pub struct ReceiverAnnounced {
     pub merchant: Pubkey,
     pub receiver: Pubkey,
     pub receiver_token_account: Pubkey,
@@ -888,7 +888,7 @@ pub struct MerchantAnnounced {
 }
 
 #[event]
-pub struct MerchantRegistered {
+pub struct ReceiverRegistered {
     pub merchant: Pubkey,
     pub receiver: Pubkey,
     pub receiver_config: Pubkey,

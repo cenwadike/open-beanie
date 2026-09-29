@@ -73,7 +73,6 @@ pub mod StarknetReceiver {
         IMessageTransmitterV2Dispatcher, IMessageTransmitterV2DispatcherTrait, IStarknetReceiver,
     };
 
-
     const FEE_BPS: u256 = 50; // 0.50% of gross — matches ChainXReceiver.sol
     const BPS_DENOM: u256 = 10_000;
     const CALLER_SHARE_BPS: u256 = 1_000; // 10% of the fee, not of gross

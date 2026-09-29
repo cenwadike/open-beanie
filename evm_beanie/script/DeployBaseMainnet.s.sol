@@ -16,8 +16,10 @@ contract DeployBaseMainnet is Script {
 
     // CCTP Destination Domains
     uint32 constant ETH_DOMAIN = 0;
-    uint32 constant BASE_DOMAIN = 6;
+    uint32 constant ARBITRUM_DOMAIN = 3;
     uint32 constant SOLANA_DOMAIN = 5;
+    uint32 constant BASE_DOMAIN = 6;
+    uint32 constant MONAD_DOMAIN = 15;
     uint32 constant STARKNET_DOMAIN = 25;
 
     function run() external {
@@ -61,7 +63,9 @@ contract DeployBaseMainnet is Script {
             STARKNET_DOMAIN,
             BASE_DOMAIN,
             SOLANA_DOMAIN,
-            ETH_DOMAIN
+            ETH_DOMAIN,
+            ARBITRUM_DOMAIN,
+            MONAD_DOMAIN
         );
         console.log("ReceiverFactory deployed to:", address(factory));
 

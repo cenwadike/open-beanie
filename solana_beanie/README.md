@@ -29,7 +29,7 @@ Exchanges derive the ATA from the owner, so the receiver stays `AccountOwner` fo
 2. **tx1, payer signs only** (plus a throwaway nonce keypair): create a durable nonce account with `authority = payer`, create `ATA(receiver)`, create the staging ATA.
 3. Read the nonce value. Sign **one** tx with `receiver` + payer: `[AdvanceNonce(payer), register_merchant(...)]`, fee payer = payer. Discard the key. Its lifetime is grind → tx1 confirmed → one signature; it signs `register_merchant` only.
 4. Send the payer-only `announce_merchant` tx carrying those signed bytes. Keep an offline copy of the bytes too.
-5. Read back before disclosing: the stored blob equals your bytes, and the derived addresses in `MerchantAnnounced` match yours. Simulate the blob (`sigVerify: false`) against live state.
+5. Read back before disclosing: the stored blob equals your bytes, and the derived addresses in `ReceiverAnnounced` match yours. Simulate the blob (`sigVerify: false`) against live state.
 6. Any keeper reads the blob from `[pending, receiver]` and broadcasts it unchanged.
 7. Disclose the address only after a finalized read-back: `[config, receiver]` exists, `delegate == config`, `closeAuthority == config`, `owner == receiver`.
 8. **Close the nonce.** In a later tx the payer (the nonce authority) sends `WithdrawNonce(all lamports) → payer`. Many nonces can be batched into one tx. Nothing on-chain is involved.
