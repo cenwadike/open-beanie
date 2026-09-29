@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let starknet_cfg = StarknetConfig::from_env()?;
     let base_cfg = EvmConfig::from_env("BASE", "base")?;
+    let ethereum_cfg = EvmConfig::from_env("ETHEREUM", "ethereum")?;
     let arbitrum_cfg = EvmConfig::from_env("ARBITRUM", "arbitrum")?;
     let monad_cfg = EvmConfig::from_env("MONAD", "monad")?;
     let mut solana_cfg = SolanaConfig::from_env()?;
@@ -127,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // Arbitrum's is used by both the announce worker (new) and the native
     // transfer poller further down.
     let evm_client = beanie_keeper::evm_keeper::build_client(&base_cfg).await?;
+    let ethereum_client = beanie_keeper::evm_keeper::build_client(&ethereum_cfg).await?;
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
     let monad_client = beanie_keeper::evm_keeper::build_client(&monad_cfg).await?;
 
@@ -156,9 +158,7 @@ async fn main() -> anyhow::Result<()> {
     debug!("[baeanie_api::main]: clients loaded");
 
     // Every EVM-family chain the announce worker can target, each with its
-    // own signer client. `Chain::Ethereum` has no separate client built
-    // anywhere in this file yet, so it's pointed at Base's for now — same
-    // behavior the pre-Solana code had by lumping Base|Ethereum together.
+    // own signer client and its own factory address.
     let evm_targets: HashMap<
         Chain,
         (
@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
         (Chain::Base, (evm_client.clone(), base_cfg.factory_address)),
         (
             Chain::Ethereum,
-            (evm_client.clone(), base_cfg.factory_address),
+            (ethereum_client.clone(), ethereum_cfg.factory_address),
         ),
         (
             Chain::Arbitrum,
@@ -184,6 +184,10 @@ async fn main() -> anyhow::Result<()> {
     let evm_payments: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)> =
         HashMap::from([
             (Chain::Base, (evm_client.clone(), base_cfg.clone())),
+            (
+                Chain::Ethereum,
+                (ethereum_client.clone(), ethereum_cfg.clone()),
+            ),
             (
                 Chain::Arbitrum,
                 (arbitrum_client.clone(), arbitrum_cfg.clone()),
@@ -245,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
     // ever reads. Single writer, so no risk of the two workers'
     // registrations racing or drifting apart.
     let base_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
+    let ethereum_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
     let arbitrum_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
     let monad_registry: SharedEvmRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
     let starknet_registry: SharedStarknetRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
@@ -256,13 +261,19 @@ async fn main() -> anyhow::Result<()> {
     // so it shares Base's registry too.
     let evm_registries: HashMap<Chain, SharedEvmRegistry> = HashMap::from([
         (Chain::Base, base_registry.clone()),
-        (Chain::Ethereum, base_registry.clone()),
+        (Chain::Ethereum, ethereum_registry.clone()),
         (Chain::Arbitrum, arbitrum_registry.clone()),
         (Chain::Monad, monad_registry.clone()),
     ]);
 
     let evm_chains = vec![
         (Chain::Base, base_client, Arc::new(base_cfg), base_registry),
+        (
+            Chain::Ethereum,
+            ethereum_client,
+            Arc::new(ethereum_cfg),
+            ethereum_registry,
+        ),
         (
             Chain::Arbitrum,
             arbitrum_client,

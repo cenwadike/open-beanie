@@ -6,7 +6,7 @@
 // recovery, compared against a stored Ethereum address — the exact
 // pattern used in Starknet's own docs (docs.starknet.io, Starknet by
 // Example, "ECDSA Verification"). This avoids constructing/storing a
-// raw curve point, which was the source of the last two compile errors.
+// raw curve point.
 
 use starknet::ContractAddress;
 
