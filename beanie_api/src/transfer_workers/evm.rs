@@ -25,7 +25,7 @@ use log::{debug, error, info};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
 
-use crate::models::{ChainXReceiverLocal, ReceiverFactory};
+use crate::models::{ChainXReceiverLocal, ReceiverFactory, WebhookRegistry};
 use beanie_keeper::evm_indexer::{EvmReceiverRecord, EvmRoute};
 use beanie_keeper::evm_ws::{self, EvmTip};
 use beanie_keeper::log_cache::LogCache;
@@ -558,6 +558,13 @@ async fn sweep_evm_receivers(
         .filter(|a| !state.deployed.contains(a))
         .collect();
 
+    // Receivers whose deployment status could not be determined this pass.
+    // Treating these as "undeployed" would add a registerMerchant call that
+    // reverts (allow_failure: false) if the receiver actually exists, taking
+    // the whole atomic batch down. Skip them; the balance stays nonzero and
+    // the reconciliation backstop retries.
+    let mut indeterminate: HashSet<Address> = HashSet::new();
+
     if !unknown.is_empty() {
         match evm_ws::batch_check_deployed(evm_http_rpc_url, &unknown).await {
             Ok(results) => {
@@ -568,10 +575,6 @@ async fn sweep_evm_receivers(
                 }
             }
             Err(e) => {
-                // Batched check failed outright (e.g. provider doesn't
-                // support batching over this transport) — fall back to the
-                // original one-by-one check for just this pass rather than
-                // silently treating every receiver as undeployed.
                 error!("batched existence check failed, falling back to per-call: {e}");
                 for &addr in &unknown {
                     match evm_client.provider().get_code(addr, None).await {
@@ -579,69 +582,90 @@ async fn sweep_evm_receivers(
                             state.deployed.insert(addr);
                         }
                         Ok(_) => {}
-                        Err(e) => error!("get_code failed for {addr:?}: {e}"),
+                        Err(e) => {
+                            error!(
+                                "get_code failed for {addr:?}: {e} — deployment unknown, skipping this pass"
+                            );
+                            indeterminate.insert(addr);
+                        }
                     }
                 }
             }
         }
     }
 
-    // --- Build the atomic register(if needed) + sweep multicall -----------
+    // --- Build the atomic register(if needed) + setWebhookUrl(if unregistered) + sweep multicall ---
     let mut calls: Vec<Call3> = Vec::new();
-    // Receivers we're attempting to register in THIS batch. Only folded
-    // into state.deployed once send_evm_multicall confirms success — see
-    // note below on why marking it eagerly was unsafe.
     let mut pending_deploys: Vec<Address> = Vec::new();
 
+    // Keep track of webhooks added in this batch to prevent duplicate calls for the same merchant
+    let mut updated_webhooks: HashSet<Address> = HashSet::new();
+
     for &receiver_addr in &unique {
+        if indeterminate.contains(&receiver_addr) {
+            continue;
+        }
+
+        let (merchant, route) = match state.merchant_map.get(&receiver_addr) {
+            Some(info) => (info.merchant, info.route),
+            None => {
+                error!("no merchant mapping for receiver {receiver_addr:?}");
+                continue;
+            }
+        };
+
         let exists = state.deployed.contains(&receiver_addr);
 
+        // Register merchant/receiver and set webhook on Base contract if and only if receiver is not yet registered
         if !exists {
-            let (merchant, route) = match state.merchant_map.get(&receiver_addr) {
-                Some(info) => (info.merchant, info.route),
-                None => {
-                    error!("no merchant mapping for undeployed receiver {receiver_addr:?}");
-                    continue;
-                }
-            };
-            // The route is part of the receiver's address, so it must be the
-            // one from its ReceiverAnnounced event, never a default.
+            // 0. Route check FIRST: nothing is queued for a receiver we
+            //    can't register.
             let Some(route) = route else {
                 error!("no announced route for undeployed receiver {receiver_addr:?}");
                 continue;
             };
-            let cctp_chain_bytes = route.chain;
-            let recipient_bytes = route.recipient;
 
+            // Encode registerMerchant up front too, so an encoding failure
+            // can't leave a stray setWebhookUrl behind in the batch.
             let reg_call = ReceiverFactory::new(evm_cfg.factory_address, evm_client.clone())
-                .register_merchant(merchant, cctp_chain_bytes, recipient_bytes);
+                .register_merchant(merchant, route.chain, route.recipient);
+            let Some(reg_bytes) = reg_call.calldata() else {
+                error!("failed encoding registerMerchant for {receiver_addr:?}");
+                continue;
+            };
 
-            match reg_call.calldata() {
-                Some(bytes) => {
-                    calls.push(Call3 {
-                        target: evm_cfg.factory_address,
-                        allow_failure: false,
-                        call_data: bytes,
-                    });
-                    // Do NOT mark state.deployed here. send_evm_multicall
-                    // can fail before ever broadcasting (agg.send() err),
-                    // return Ok(None) (tx dropped from mempool), or time
-                    // out — none of which are on-chain reverts, but all of
-                    // which leave the receiver genuinely undeployed. Since
-                    // state.deployed is a permanent cache that's never
-                    // re-checked, marking it early on any of
-                    // those paths would permanently strand this receiver:
-                    // every future pass would build sweep-only calls
-                    // against a contract that doesn't exist, forever.
-                    pending_deploys.push(receiver_addr);
-                }
-                None => {
-                    error!("failed encoding registerMerchant for {receiver_addr:?}");
-                    continue;
+            // 1. Include setWebhookUrl for this merchant if not registered yet
+            let webhook_key = format!("{merchant:?}");
+            if let Some(url) = state.webhook_map.get(&webhook_key) {
+                if !updated_webhooks.contains(&merchant) {
+                    let webhook_contract =
+                        WebhookRegistry::new(evm_cfg.webhook_registry_address, evm_client.clone());
+                    let webhook_call = webhook_contract.set_webhook_url(merchant, url.clone());
+
+                    match webhook_call.calldata() {
+                        Some(bytes) => {
+                            calls.push(Call3 {
+                                target: evm_cfg.webhook_registry_address,
+                                allow_failure: true,
+                                call_data: bytes,
+                            });
+                            updated_webhooks.insert(merchant);
+                        }
+                        None => error!("failed encoding setWebhookUrl for merchant {merchant:?}"),
+                    }
                 }
             }
+
+            // 2. Register receiver contract
+            calls.push(Call3 {
+                target: evm_cfg.factory_address,
+                allow_failure: false,
+                call_data: reg_bytes,
+            });
+            pending_deploys.push(receiver_addr);
         }
 
+        // 3. Sweep receiver contract
         let receiver_contract = ChainXReceiverLocal::new(receiver_addr, evm_client.clone());
         match receiver_contract.sweep().calldata() {
             Some(bytes) => {
@@ -661,15 +685,12 @@ async fn sweep_evm_receivers(
         send_evm_multicall(evm_client, tip, calls).await
     };
 
-    // Only now — once we know the multicall actually landed — is it safe
-    // to treat these receivers as deployed.
     if sweep_tx.is_some() {
         state.deployed.extend(pending_deploys);
     }
 
     sweep_tx
 }
-
 /// JIT-deploy/sweep/webhook pipeline for a batch of already-discovered EVM
 /// deposits.
 async fn act_on_evm_deposits(

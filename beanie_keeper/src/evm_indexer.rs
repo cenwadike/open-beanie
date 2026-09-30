@@ -50,7 +50,7 @@ pub fn deposits_scan_id(cfg: &EvmConfig) -> String {
 /// which is exactly the failure mode a high-log-volume contract like
 /// Base's native USDC hits: the registry scan's two low-traffic addresses
 /// never need to shrink, but a Transfer-event scan over USDC can.
-const MAX_BLOCKS_PER_REQUEST: u64 = 1_000;
+const MAX_BLOCKS_PER_REQUEST: u64 = 2_000;
 
 /// Window for the deposit scan. The filter (USDC address + Transfer topic +
 /// `topic2` in our receivers) matches very few logs, so tiny windows only
@@ -1126,6 +1126,7 @@ pub async fn fetch_deposits_since_block(
                     "0".to_string()
                 };
                 deposits.push(Deposit {
+                    chain: cfg.chain_name.to_string(),
                     tx_hash: log.transaction_hash.clone(),
                     from_address: format!("{from:?}"),
                     receiver: format!("{to:?}"),

@@ -23,8 +23,6 @@ use crate::models::{
     AppState, Chain, EvmAuth, PaymentTask, SocketAddr, SolanaAuth, StarknetAuth, err,
 };
 
-const BASE_CHAIN_ID: u64 = 8453;
-const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const STARKNET_USDC: &str = "0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb";
 
 #[derive(Debug, Deserialize)]
@@ -78,20 +76,6 @@ struct PaymentResponse {
     message: String,
 }
 
-fn domain_separator_base_usdc() -> H256 {
-    let typehash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let encoded = encode(&[
-        Token::FixedBytes(typehash.to_vec()),
-        Token::FixedBytes(keccak256(b"USD Coin").to_vec()),
-        Token::FixedBytes(keccak256(b"2").to_vec()),
-        Token::Uint(U256::from(BASE_CHAIN_ID)),
-        Token::Address(Address::from_str(BASE_USDC).expect("valid USDC address")),
-    ]);
-    H256::from(keccak256(encoded))
-}
-
 fn transfer_auth_digest(
     from: Address,
     to: Address,
@@ -99,6 +83,7 @@ fn transfer_auth_digest(
     valid_after: u64,
     valid_before: u64,
     nonce: H256,
+    domain_separator: H256,
 ) -> H256 {
     let typehash = keccak256(
         b"TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)",
@@ -113,7 +98,7 @@ fn transfer_auth_digest(
         Token::FixedBytes(nonce.as_bytes().to_vec()),
     ]));
     let mut buf = vec![0x19u8, 0x01u8];
-    buf.extend_from_slice(domain_separator_base_usdc().as_bytes());
+    buf.extend_from_slice(domain_separator.as_bytes());
     buf.extend_from_slice(&struct_hash);
     H256::from(keccak256(buf))
 }
@@ -129,6 +114,7 @@ fn verify_evm_authorization(
     valid_before: u64,
     nonce_hex: &str,
     sig_hex: &str,
+    domain_separator: H256,
 ) -> Result<EvmAuth, &'static str> {
     let from_addr = Address::from_str(from).map_err(|_| "bad from address")?;
     let to_addr = Address::from_str(to).map_err(|_| "bad to address")?;
@@ -169,6 +155,7 @@ fn verify_evm_authorization(
         valid_after,
         valid_before,
         nonce,
+        domain_separator,
     );
     let signature = Signature::from_str(sig_hex.trim_start_matches("0x"))
         .map_err(|_| "bad signature encoding")?;
@@ -406,7 +393,7 @@ pub async fn receive_payment(
 
     let (evm_auth, starknet_auth, solana_auth) = match (payload.chain, &parsed) {
         (
-            Chain::Base | Chain::Ethereum,
+            Chain::Base | Chain::Ethereum | Chain::Arbitrum | Chain::Monad,
             SignaturePayload::Evm {
                 from,
                 to,
@@ -417,6 +404,16 @@ pub async fn receive_payment(
                 signature,
             },
         ) => {
+            let domain_separator = match state.evm_domain_separators.get(&payload.chain) {
+                Some(ds) => *ds,
+                None => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported chain: missing domain separator configuration",
+                    );
+                }
+            };
+
             match verify_evm_authorization(
                 &payload,
                 from,
@@ -426,6 +423,7 @@ pub async fn receive_payment(
                 *valid_before,
                 nonce,
                 signature,
+                domain_separator,
             ) {
                 Ok(auth) => (Some(auth), None, None),
                 Err(msg) => return err(StatusCode::BAD_REQUEST, msg),

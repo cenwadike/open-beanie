@@ -683,6 +683,7 @@ pub async fn fetch_deposits_since_block(
                 "0".to_string()
             };
             all_deposits.push(Deposit {
+                chain: cfg.chain_name.to_string(),
                 tx_hash: evt.transaction_hash.clone(),
                 from_address: format!("{from:#x}"),
                 receiver: format!("{to:#x}"),

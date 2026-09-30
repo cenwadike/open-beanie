@@ -6,11 +6,11 @@ use ethers::{
     middleware::{NonceManagerMiddleware, SignerMiddleware},
     providers::{Http, Middleware, Provider, RetryClient},
     signers::{LocalWallet, Signer},
-    types::{Address, Eip1559TransactionRequest, transaction::eip2718::TypedTransaction},
+    types::{Address, H256},
 };
 use std::sync::Arc;
 
-use crate::config::{EvmConfig, now_formatted};
+use crate::config::EvmConfig;
 
 abigen!(
     ChainXReceiver,
@@ -26,6 +26,11 @@ abigen!(
         function balanceOf(address) external view returns (uint256)
         event Transfer(address indexed from, address indexed to, uint256 value)
     ]"#
+);
+
+abigen!(
+    Erc20Domain,
+    r#"[function DOMAIN_SEPARATOR() external view returns (bytes32)]"#
 );
 
 pub const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
@@ -84,95 +89,12 @@ pub async fn build_client(cfg: &EvmConfig) -> AnyhowResult<Arc<SignerProvider>> 
     Ok(Arc::new(SignerMiddleware::new(nonce_managed, wallet)))
 }
 
-pub async fn multicall_sweep(
+pub async fn fetch_domain_separator(
     client: Arc<SignerProvider>,
-    receivers: &[Address],
-) -> AnyhowResult<Option<String>> {
-    if receivers.is_empty() {
-        return Ok(None);
-    }
+    token_address: Address,
+) -> AnyhowResult<H256> {
+    let contract = Erc20Domain::new(token_address, client);
+    let domain_separator_bytes = contract.domain_separator().call().await?;
 
-    let multicall_addr: Address = MULTICALL3_ADDRESS
-        .parse()
-        .expect("MULTICALL3_ADDRESS is a hardcoded valid address");
-    let multicall = Multicall3::new(multicall_addr, client.clone());
-
-    let mut calls = Vec::with_capacity(receivers.len());
-    for &receiver in receivers {
-        let receiver_contract = ChainXReceiver::new(receiver, client.clone());
-        let call_data = receiver_contract
-            .sweep()
-            .calldata()
-            .context("failed encoding sweep() calldata")?;
-        calls.push(Call3 {
-            target: receiver,
-            allow_failure: true,
-            call_data,
-        });
-    }
-
-    let (suggested_max_fee, suggested_priority_fee) = client
-        .estimate_eip1559_fees(None)
-        .await
-        .context("failed to estimate EIP-1559 fees for multicall sweep")?;
-
-    let max_allowed_priority = ethers::utils::parse_units("0.05", "gwei")
-        .context("failed parsing priority fee ceiling")?;
-    let priority_fee = std::cmp::min(suggested_priority_fee, max_allowed_priority.into());
-
-    let max_fee_cap =
-        ethers::utils::parse_units("0.1", "gwei").context("failed parsing max fee cap")?;
-    let max_fee = std::cmp::min(suggested_max_fee, max_fee_cap.into());
-
-    let mut multicall_caller = multicall.aggregate_3(calls);
-
-    let estimated_gas = multicall_caller
-        .estimate_gas()
-        .await
-        .context("failed to estimate gas for multicall aggregate3")?;
-    let buffered_gas = estimated_gas * 130 / 100;
-
-    multicall_caller.tx.set_gas(buffered_gas);
-
-    if let Some(eip1559_req) = multicall_caller.tx.as_eip1559_mut() {
-        eip1559_req.max_priority_fee_per_gas = Some(priority_fee);
-        eip1559_req.max_fee_per_gas = Some(max_fee);
-    } else {
-        let legacy = multicall_caller.tx.clone();
-        multicall_caller.tx = TypedTransaction::Eip1559(Eip1559TransactionRequest {
-            from: legacy.from().copied(),
-            to: legacy.to().cloned(),
-            gas: Some(buffered_gas),
-            value: legacy.value().copied(),
-            data: legacy.data().cloned(),
-            nonce: legacy.nonce().copied(),
-            access_list: Default::default(),
-            max_priority_fee_per_gas: Some(priority_fee),
-            max_fee_per_gas: Some(max_fee),
-            chain_id: legacy.chain_id(),
-        });
-    }
-
-    let pending = multicall_caller
-        .send()
-        .await
-        .context("aggregate3 send failed")?;
-
-    let receipt = pending
-        .await
-        .context("aggregate3 tx dropped before confirmation")?;
-
-    match receipt {
-        Some(r) => {
-            let tx_hash = format!("{:?}", r.transaction_hash);
-            println!(
-                "[{}] multicall swept {} receiver(s) — tx {}",
-                now_formatted(),
-                receivers.len(),
-                tx_hash
-            );
-            Ok(Some(tx_hash))
-        }
-        None => Ok(None),
-    }
+    Ok(H256::from(domain_separator_bytes))
 }

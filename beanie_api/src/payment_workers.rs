@@ -3,7 +3,7 @@ use beanie_keeper::{
     config::EvmConfig,
     solana_indexer::{ReceiverStatus, SolanaReceiverRecord},
 };
-use log::info;
+use log::{info, warn};
 use solana_sdk::{
     message::Message as SolanaMessage,
     program_pack::Pack as SolanaPack,
@@ -36,7 +36,7 @@ use spl_associated_token_account::get_associated_token_address;
 
 pub type StarknetAccount = SingleOwnerAccount<JsonRpcClient<HttpTransport>, StarknetWallet>;
 
-use crate::models::{Chain, ChainXReceiverLocal, ReceiverFactory};
+use crate::models::{Chain, ChainXReceiverLocal, ReceiverFactory, WebhookRegistry};
 use crate::transfer_workers::evm::EvmReceiverInfo;
 use crate::transfer_workers::starknet::StarknetReceiverInfo;
 use crate::transfer_workers::{SharedEvmRegistry, SharedSolanaRegistry, SharedStarknetRegistry};
@@ -88,6 +88,8 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 /// Payment worker: processes incoming payment notifications, performs JIT
 /// receiver creation if missing, and triggers `sweep()` on the receiver.
+/// Payment worker: processes incoming payment notifications, performs JIT
+/// receiver creation if missing, and triggers `sweep()` on the receiver.
 pub(crate) async fn run_payment_worker(
     evm_targets: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)>,
     // One shared, read-only registry per chain — populated by
@@ -110,8 +112,6 @@ pub(crate) async fn run_payment_worker(
 
     let starknet_factory_addr = starknet_cfg.factory_address;
 
-    // Local abigen is declared at top-level
-
     while let Some(mut task) = rx.recv().await {
         task.attempts += 1;
 
@@ -123,7 +123,7 @@ pub(crate) async fn run_payment_worker(
                         let Some((chain_client, evm_cfg)) =
                             evm_targets.get(&task.source_chain).cloned()
                         else {
-                            eprintln!(
+                            warn!(
                                 "announce worker: no client/factory configured for {:?}",
                                 task.source_chain
                             );
@@ -140,39 +140,29 @@ pub(crate) async fn run_payment_worker(
                             Err(_) => false,
                         };
 
-                        // If receiver missing, we'll include `registerMerchant` in the atomic multicall
-                        // instead of doing a separate synchronous deploy.
-                        let _ = (&exists, &task.create_if_missing);
-
-                        // Build an atomic multicall: optional registerMerchant (if missing)
-                        // then sweep() on the receiver. All sent as one tx.
+                        // Build an atomic multicall: optional registerMerchant (if missing),
+                        // optional setWebhookUrl (if receiver was not previously created), transferWithAuthorization, and sweep().
                         let mut calls = Vec::new();
 
-                        // If receiver doesn't exist, add factory.registerMerchant calldata
+                        // Look up merchant/route info once from the source chain's registry snapshot
+                        let info: Option<EvmReceiverInfo> = match evm_registries
+                            .get(&task.source_chain)
+                        {
+                            Some(registry) => registry.read().await.get(&receiver_addr).copied(),
+                            None => None,
+                        };
+
+                        // 1. If receiver doesn't exist, add factory.registerMerchant calldata
                         if !exists && task.create_if_missing {
-                            // (merchant, route) come straight from what was
-                            // actually announced for THIS receiver address —
-                            // never derived from task.destination_chain /
-                            // task.merchant_address. If the announce hasn't
-                            // been indexed yet, don't guess: drop this
-                            // payment for now and let it retry once it has
-                            // (task.attempts already tracks retries).
-                            let info: Option<EvmReceiverInfo> =
-                                match evm_registries.get(&task.source_chain) {
-                                    Some(registry) => {
-                                        registry.read().await.get(&receiver_addr).copied()
-                                    }
-                                    None => None,
-                                };
                             let Some(info) = info else {
-                                eprintln!(
+                                warn!(
                                     "no announced route yet for evm receiver {receiver_addr:?} on {:?} — skipping this pass",
                                     task.source_chain
                                 );
                                 continue;
                             };
                             let Some(route) = info.route else {
-                                eprintln!(
+                                warn!(
                                     "evm receiver {receiver_addr:?} known but has no announced route — skipping this pass"
                                 );
                                 continue;
@@ -197,18 +187,56 @@ pub(crate) async fn run_payment_worker(
                                     call_data: bytes,
                                 }),
                                 None => {
-                                    eprintln!("Failed encoding register_merchant calldata");
+                                    warn!("Failed encoding register_merchant calldata");
                                     continue;
                                 }
                             }
                         }
 
+                        // 2. Add setWebhookUrl targeting Base's WebhookRegistry ONLY IF receiver did NOT exist beforehand
+                        if !exists && task.create_if_missing {
+                            if let Some(url) = &task.webhook_url {
+                                let base_target = evm_targets.get(&Chain::Base).cloned();
+
+                                if let Some((base_client, base_cfg)) = base_target {
+                                    let merchant_addr = if let Some(info) = info {
+                                        info.merchant
+                                    } else {
+                                        task.merchant_address.parse().unwrap_or_default()
+                                    };
+
+                                    let webhook_contract = WebhookRegistry::new(
+                                        base_cfg.webhook_registry_address,
+                                        base_client.clone(),
+                                    );
+
+                                    let webhook_call = webhook_contract
+                                        .set_webhook_url(merchant_addr, url.clone());
+
+                                    match webhook_call.calldata() {
+                                        Some(bytes) => calls.push(Call3 {
+                                            target: base_cfg.webhook_registry_address,
+                                            allow_failure: true, // Failed webhook update won't revert the payment batch
+                                            call_data: bytes,
+                                        }),
+                                        None => warn!(
+                                            "failed encoding setWebhookUrl for merchant {:?}",
+                                            merchant_addr
+                                        ),
+                                    }
+                                } else {
+                                    warn!(
+                                        "Base chain configuration unavailable for setWebhookUrl routing"
+                                    );
+                                }
+                            }
+                        }
+
+                        // 3. transferWithAuthorization calldata
                         let auth = match &task.evm_auth {
                             Some(a) => a,
                             None => {
-                                eprintln!(
-                                    "EVM payment task missing verified authorization, dropping"
-                                );
+                                warn!("EVM payment task missing verified authorization, dropping");
                                 continue;
                             }
                         };
@@ -217,21 +245,21 @@ pub(crate) async fn run_payment_worker(
                         ) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("bad signature stored on task: {e}");
+                                warn!("bad signature stored on task: {e}");
                                 continue;
                             }
                         };
                         let value = match U256::from_dec_str(&task.amount_raw) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("bad amount on task: {e}");
+                                warn!("bad amount on task: {e}");
                                 continue;
                             }
                         };
                         let from_addr: Address = match task.from_address.parse() {
                             Ok(a) => a,
                             Err(e) => {
-                                eprintln!("bad from_address on task: {e}");
+                                warn!("bad from_address on task: {e}");
                                 continue;
                             }
                         };
@@ -252,7 +280,7 @@ pub(crate) async fn run_payment_worker(
                         let transfer_calldata = match transfer_call.calldata() {
                             Some(c) => c,
                             None => {
-                                eprintln!("failed to encode transferWithAuthorization");
+                                warn!("failed to encode transferWithAuthorization");
                                 continue;
                             }
                         };
@@ -262,13 +290,13 @@ pub(crate) async fn run_payment_worker(
                             call_data: transfer_calldata,
                         });
 
-                        // sweep calldata
+                        // 4. sweep calldata
                         let receiver_contract =
                             ChainXReceiverLocal::new(receiver_addr, chain_client.clone());
                         let sweep_calldata = match receiver_contract.sweep().calldata() {
                             Some(b) => b,
                             None => {
-                                eprintln!("failed to encode sweep calldata");
+                                warn!("failed to encode sweep calldata");
                                 continue;
                             }
                         };
@@ -314,6 +342,7 @@ pub(crate) async fn run_payment_worker(
                                     // Build deposit payload and deliver webhook if configured
                                     if let Some(url) = &task.webhook_url {
                                         let deposit = beanie_keeper::config::Deposit {
+                                            chain: evm_cfg.chain_name.to_string(),
                                             tx_hash: tx_hash.clone(),
                                             from_address: task.from_address.clone(),
                                             receiver: format!("{:?}", receiver_addr),
@@ -336,34 +365,24 @@ pub(crate) async fn run_payment_worker(
                                         };
 
                                         if let Err(e) = webhook_tx.send(job).await {
-                                            eprintln!("failed enqueuing webhook job: {e}");
+                                            warn!("failed enqueuing webhook job: {e}");
                                         }
                                     }
                                 }
                                 Ok(None) => {
-                                    eprintln!("Atomic multicall dropped for {}", receiver_addr)
+                                    warn!("Atomic multicall dropped for {}", receiver_addr)
                                 }
-                                Err(e) => eprintln!("Atomic multicall failed: {}", e),
+                                Err(e) => warn!("Atomic multicall failed: {}", e),
                             },
-                            Err(e) => eprintln!("Failed sending atomic multicall: {}", e),
+                            Err(e) => warn!("Failed sending atomic multicall: {}", e),
                         }
                     }
-                    Err(e) => eprintln!("Invalid EVM receiver address in payment task: {}", e),
+                    Err(e) => warn!("Invalid EVM receiver address in payment task: {}", e),
                 }
             }
             crate::models::Chain::Starknet => {
                 match Felt::from_hex(&task.receiver_address) {
                     Ok(receiver_felt) => {
-                        // (merchant, route) come straight from the
-                        // announced record for THIS receiver — same
-                        // registry starknet.rs's own transfer worker
-                        // maintains, never re-derived from
-                        // task.destination_chain / task.merchant_address.
-                        // Also replaces the old on-chain
-                        // predict_receiver_address call: a registry hit
-                        // for receiver_felt already IS a real, previously
-                        // announced receiver, a stronger guarantee than a
-                        // same-tx prediction would give.
                         let info: Option<StarknetReceiverInfo> =
                             starknet_registry.read().await.get(&receiver_felt).copied();
 
@@ -371,13 +390,13 @@ pub(crate) async fn run_payment_worker(
 
                         if task.create_if_missing {
                             let Some(info) = info else {
-                                eprintln!(
+                                warn!(
                                     "no announced route yet for starknet receiver {receiver_felt:#x} — skipping this pass"
                                 );
                                 continue;
                             };
                             let Some(route) = info.route else {
-                                eprintln!(
+                                warn!(
                                     "starknet receiver {receiver_felt:#x} known but has no announced route — skipping this pass"
                                 );
                                 continue;
@@ -388,7 +407,7 @@ pub(crate) async fn run_payment_worker(
                                 match get_selector_from_name("register_merchant") {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        eprintln!(
+                                        warn!(
                                             "Failed to get selector for register_merchant: {}",
                                             e
                                         );
@@ -408,12 +427,39 @@ pub(crate) async fn run_payment_worker(
                             };
 
                             calls.push(register_call);
+
+                            // Send setWebhookUrl on Base if receiver was NOT registered beforehand
+                            if let Some(url) = &task.webhook_url {
+                                if let Some((base_client, base_cfg)) =
+                                    evm_targets.get(&Chain::Base).cloned()
+                                {
+                                    let merchant_addr: Option<Address> =
+                                        format!("{:#x}", merchant_felt).parse().ok();
+
+                                    if let Some(merchant_addr) = merchant_addr {
+                                        let webhook_contract = WebhookRegistry::new(
+                                            base_cfg.webhook_registry_address,
+                                            base_client,
+                                        );
+
+                                        if let Err(e) = webhook_contract
+                                            .set_webhook_url(merchant_addr, url.clone())
+                                            .send()
+                                            .await
+                                        {
+                                            warn!(
+                                                "failed sending setWebhookUrl on Base for Starknet merchant: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         let auth = match &task.starknet_auth {
                             Some(a) => a,
                             None => {
-                                eprintln!(
+                                warn!(
                                     "Starknet payment task missing verified authorization, dropping"
                                 );
                                 continue;
@@ -423,7 +469,7 @@ pub(crate) async fn run_payment_worker(
                         let user_account_felt = match Felt::from_hex(&auth.user_address) {
                             Ok(f) => f,
                             Err(e) => {
-                                eprintln!("bad user address on task: {e}");
+                                warn!("bad user address on task: {e}");
                                 continue;
                             }
                         };
@@ -432,13 +478,12 @@ pub(crate) async fn run_payment_worker(
                             match get_selector_from_name("execute_from_outside_v2") {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    eprintln!("selector lookup failed: {e}");
+                                    warn!("selector lookup failed: {e}");
                                     continue;
                                 }
                             };
 
-                        // Serialize OutsideExecution + signature per Cairo Serde: struct fields flattened,
-                        // Span<Call>/Array<felt252> length-prefixed.
+                        // Serialize OutsideExecution + signature per Cairo Serde
                         let mut oe_calldata = vec![
                             Felt::from_hex(&auth.outside_execution.caller).unwrap(),
                             Felt::from_hex(&auth.outside_execution.nonce).unwrap(),
@@ -465,11 +510,11 @@ pub(crate) async fn run_payment_worker(
                             calldata: oe_calldata,
                         });
 
-                        // sweep call to the receiver — now sweeping real funds that actually arrived
+                        // sweep call to the receiver
                         let sweep_selector = match get_selector_from_name("sweep") {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("Failed to get selector for sweep: {}", e);
+                                warn!("Failed to get selector for sweep: {}", e);
                                 continue;
                             }
                         };
@@ -489,6 +534,7 @@ pub(crate) async fn run_payment_worker(
 
                                 if let Some(url) = &task.webhook_url {
                                     let deposit = beanie_keeper::config::Deposit {
+                                        chain: starknet_cfg.chain_name.to_string(),
                                         tx_hash: tx_hash.clone(),
                                         from_address: task.from_address.clone(),
                                         receiver: format!("{:#x}", receiver_felt),
@@ -509,38 +555,21 @@ pub(crate) async fn run_payment_worker(
                                     };
 
                                     if let Err(e) = webhook_tx.send(job).await {
-                                        eprintln!("failed enqueuing webhook job: {e}");
+                                        warn!("failed enqueuing webhook job: {e}");
                                     }
                                 }
                             }
-                            Err(e) => eprintln!("Starknet sweep failed: {}", e),
+                            Err(e) => warn!("Starknet sweep failed: {}", e),
                         }
                     }
-                    Err(e) => eprintln!("Invalid Starknet receiver felt: {}", e),
+                    Err(e) => warn!("Invalid Starknet receiver felt: {}", e),
                 }
             }
             crate::models::Chain::Solana => {
-                // `receiver_address` is always an already-live USDC ATA by
-                // the time a payment can reference it (created up front in
-                // `prepare_registration`, see create_workers.rs's Solana
-                // arm) — but the receiver's on-chain *registration*
-                // (`receiver_config`) may still be pending. Unlike
-                // EVM/Starknet, that register step can't be bundled into
-                // the same transaction as the gasless transfer: `reg_tx` is
-                // a separate, already-fully-signed `Transaction` pinned at
-                // announce time (see
-                // `solana_keeper::broadcast_pending_registration`'s doc
-                // comment) and can't be merged into the payer's message
-                // after the fact. So this arm submits the transfer first,
-                // then JIT-registers (if needed) and sweeps inline right
-                // after via `sweep_after_solana_payment`, driven by the
-                // announced record in `solana_registry` (not the payment
-                // request). Same-chain and cross-chain (CCTP) routes are
-                // both handled there by `solana_keeper::sweep_registered`.
                 let auth = match &task.solana_auth {
                     Some(a) => a,
                     None => {
-                        eprintln!("Solana payment task missing verified authorization, dropping");
+                        warn!("Solana payment task missing verified authorization, dropping");
                         continue;
                     }
                 };
@@ -548,50 +577,48 @@ pub(crate) async fn run_payment_worker(
                 let message_bytes = match BASE64.decode(&auth.message) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("bad solana message encoding on task: {e}");
+                        warn!("bad solana message encoding on task: {e}");
                         continue;
                     }
                 };
                 let message: SolanaMessage = match bincode::deserialize(&message_bytes) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("bad solana message on task: {e}");
+                        warn!("bad solana message on task: {e}");
                         continue;
                     }
                 };
                 let owner_pk: SolanaPubkey = match auth.owner.parse() {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("bad solana owner pubkey on task: {e}");
+                        warn!("bad solana owner pubkey on task: {e}");
                         continue;
                     }
                 };
                 let owner_sig_bytes = match BASE64.decode(&auth.signature) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("bad solana signature encoding on task: {e}");
+                        warn!("bad solana signature encoding on task: {e}");
                         continue;
                     }
                 };
                 let owner_sig = match SolanaSignature::try_from(owner_sig_bytes.as_slice()) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("bad solana signature bytes on task: {e}");
+                        warn!("bad solana signature bytes on task: {e}");
                         continue;
                     }
                 };
 
-                // Fee payer (Beanie's keeper) is always account index 0;
-                // the payer's own signature slot is wherever their pubkey
-                // landed among the required signers.
+                // Fee payer (Beanie's keeper) is always account index 0
                 let num_sigs = message.header.num_required_signatures as usize;
                 let Some(owner_idx) = message.account_keys.iter().position(|k| *k == owner_pk)
                 else {
-                    eprintln!("solana payment task: owner not present in message account keys");
+                    warn!("solana payment task: owner not present in message account keys");
                     continue;
                 };
                 if owner_idx >= num_sigs {
-                    eprintln!("solana payment task: owner is not a required signer");
+                    warn!("solana payment task: owner is not a required signer");
                     continue;
                 }
 
@@ -602,17 +629,14 @@ pub(crate) async fn run_payment_worker(
                     message,
                 };
 
-                // Same blockhash the payer already signed over, so this
-                // only fills the keeper's own signer slot(s) rather than
-                // wiping and re-signing everything.
                 let recent_blockhash = tx.message.recent_blockhash;
                 if let Err(e) = tx.try_partial_sign(&[solana_keeper.as_ref()], recent_blockhash) {
-                    eprintln!("failed keeper co-sign for solana payment: {e}");
+                    warn!("failed keeper co-sign for solana payment: {e}");
                     continue;
                 }
 
                 if let Err(e) = tx.verify() {
-                    eprintln!("solana payment tx failed signature verification: {e}");
+                    warn!("solana payment tx failed signature verification: {e}");
                     continue;
                 }
 
@@ -625,11 +649,6 @@ pub(crate) async fn run_payment_worker(
                         );
 
                         // Register (if not already) and sweep right away.
-                        // What to do — same-chain or CCTP sweep, or skip
-                        // because the announce isn't indexed yet — is
-                        // decided inside from the announced record in
-                        // `solana_registry`, never from the payment
-                        // request's own destination_chain.
                         let sweep_tx = match sweep_after_solana_payment(
                             &solana_rpc,
                             &solana_keeper,
@@ -641,7 +660,7 @@ pub(crate) async fn run_payment_worker(
                         {
                             Ok(tx) => tx,
                             Err(e) => {
-                                eprintln!(
+                                warn!(
                                     "solana register/sweep after payment failed for {}: {e:#}",
                                     task.receiver_address
                                 );
@@ -649,8 +668,38 @@ pub(crate) async fn run_payment_worker(
                             }
                         };
 
+                        // Send setWebhookUrl on Base if receiver required creation and sweep executed
+                        if task.create_if_missing {
+                            if let Some(url) = &task.webhook_url {
+                                if let Some((base_client, base_cfg)) =
+                                    evm_targets.get(&Chain::Base).cloned()
+                                {
+                                    let merchant_addr: Option<Address> =
+                                        task.merchant_address.parse().ok();
+
+                                    if let Some(merchant_addr) = merchant_addr {
+                                        let webhook_contract = WebhookRegistry::new(
+                                            base_cfg.webhook_registry_address,
+                                            base_client,
+                                        );
+
+                                        if let Err(e) = webhook_contract
+                                            .set_webhook_url(merchant_addr, url.clone())
+                                            .send()
+                                            .await
+                                        {
+                                            warn!(
+                                                "failed sending setWebhookUrl on Base for Solana merchant: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let Some(url) = &task.webhook_url {
                             let deposit = beanie_keeper::config::Deposit {
+                                chain: solana_cfg.chain_name.to_string(),
                                 tx_hash: tx_sig.clone(),
                                 from_address: task.from_address.clone(),
                                 receiver: task.receiver_address.clone(),
@@ -670,11 +719,11 @@ pub(crate) async fn run_payment_worker(
                             };
 
                             if let Err(e) = webhook_tx.send(job).await {
-                                eprintln!("failed enqueuing webhook job: {e}");
+                                warn!("failed enqueuing webhook job: {e}");
                             }
                         }
                     }
-                    Err(e) => eprintln!("Solana gasless transfer failed: {}", e),
+                    Err(e) => warn!("Solana gasless transfer failed: {}", e),
                 }
             }
         }

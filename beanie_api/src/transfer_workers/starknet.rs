@@ -3,27 +3,15 @@
 //! Pipeline: historical catch-up -> live tip loop, debounced (see
 //! `STARKNET_MIN_LIVE_SCAN_INTERVAL`) -> periodic reconciliation backstop
 //! that always scans regardless of the debounce.
-//!
-//! Unlike EVM's push subscription (real per-block activity flags) or
-//! Solana's gRPC push (same), Starknet's tip source is a plain
-//! `block_number` poll with no activity signal at all — so live-tip
-//! scanning here is gated purely on a minimum-interval debounce, not an
-//! activity flag or backlog check. `RECONCILE_EVERY` still guarantees a
-//! scan on its own cadence independent of that debounce, so a missed
-//! window is bounded the same way it is on the other two chains.
-//!
-//! Register + sweep are sent as a single atomic multicall per batch, same
-//! as EVM — unlike Solana, where registration is a separate, pre-signed,
-//! standalone broadcast (see `solana.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use log::{debug, error, info};
 use starknet::accounts::{Account, ConnectedAccount};
-use starknet::core::types::{BlockId, BlockTag, Call, Felt};
+use starknet::core::types::{BlockId, BlockTag, Call, Felt, StarknetError};
 use starknet::core::utils::get_selector_from_name;
-use starknet::providers::Provider;
+use starknet::providers::{Provider, ProviderError};
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
@@ -34,47 +22,20 @@ use beanie_keeper::starknet_keeper::StarknetAccount;
 
 use super::common::RECONCILE_EVERY;
 
-/// Minimum time between *live-tip-triggered* Starknet registry/deposit
-/// scans (`discover_merchants` / `fetch_deposits_since_block`), independent
-/// of how often new tips arrive.
-///
-/// `run_starknet_tip_source` polls `block_number` every 4s and emits a tip
-/// on every new block. Unlike the EVM path — which only actually scans when
-/// `process_evm_tip` sees real backlog or an activity flag — nothing here
-/// tells us whether a given Starknet block is worth scanning, so without a
-/// floor on frequency, every new block was firing its own
-/// `starknet_getEvents` call straight at Starkscan's rate-limited
-/// `rpc-beta` proxy. That's what was producing the "gateway locally
-/// saturated" (-32005) and dropped-connection errors in production: a live
-/// scan every few seconds, indefinitely. This debounce caps that to once
-/// per interval; `RECONCILE_EVERY` still guarantees a scan on its own
-/// cadence regardless of this floor, so a missed window is bounded the
-/// same way it always was.
 const STARKNET_MIN_LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// What the registry told us about a receiver: who it belongs to and, for
-/// receivers learned from `ReceiverAnnounced`, the CCTP route that is part
-/// of its address. Registration replays that route verbatim.
-///
-/// `pub(crate)` — `payment_workers.rs` reads this same shape out of
-/// `SharedStarknetRegistry` instead of re-deriving a route from the
-/// payment request.
 #[derive(Clone, Copy)]
 pub(crate) struct StarknetReceiverInfo {
     pub(crate) merchant: Felt,
     pub(crate) route: Option<StarknetRoute>,
 }
 
-/// What `payment_workers.rs` reads — same republish-after-mutation shape
-/// as `evm.rs`'s `SharedEvmRegistry`.
 pub(crate) type SharedStarknetRegistry = Arc<AsyncRwLock<HashMap<Felt, StarknetReceiverInfo>>>;
 
 async fn publish_starknet_registry(state: &StarknetState, shared: &SharedStarknetRegistry) {
     *shared.write().await = state.merchant_map.clone();
 }
 
-/// Never let a route-less `ReceiverRegistered` row erase a route we already
-/// learned from `ReceiverAnnounced`.
 fn remember_starknet_receiver(
     map: &mut HashMap<Felt, StarknetReceiverInfo>,
     rec: StarknetReceiverRecord,
@@ -93,15 +54,14 @@ struct StarknetState {
     merchant_map: HashMap<Felt, StarknetReceiverInfo>,
     deployed: HashSet<Felt>,
     next_nonce: Option<Felt>,
-    /// Wall-clock time of the last live-tip-triggered registry/deposit
-    /// scan. `None` means none has happened yet this process — the first
-    /// tip always scans. See `STARKNET_MIN_LIVE_SCAN_INTERVAL`.
     last_live_scan: Option<Instant>,
 }
 
 pub(super) async fn run_starknet_worker(
     starknet_account: Arc<StarknetAccount>,
     starknet_cfg: Arc<beanie_keeper::config::StarknetConfig>,
+    base_evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     log_cache: Arc<LogCache>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
     starknet_registry: SharedStarknetRegistry,
@@ -113,7 +73,6 @@ pub(super) async fn run_starknet_worker(
         last_live_scan: None,
     };
 
-    // Placeholder map or shared cross-chain lookup if needed
     let empty_webhook_map = HashMap::new();
 
     // 1. Run Starknet historical backfill
@@ -128,6 +87,8 @@ pub(super) async fn run_starknet_worker(
         act_on_starknet_deposits(
             &starknet_account,
             &starknet_cfg,
+            &base_evm_client,
+            &base_evm_cfg,
             &webhook_tx,
             &empty_webhook_map,
             &mut sn_state,
@@ -153,12 +114,14 @@ pub(super) async fn run_starknet_worker(
                 process_starknet_tip(
                     &starknet_account,
                     &starknet_cfg,
+                    &base_evm_client,
+                    &base_evm_cfg,
                     &log_cache,
                     &webhook_tx,
                     &empty_webhook_map,
                     &mut sn_state,
                     tip,
-                    false, // live tip: respect STARKNET_MIN_LIVE_SCAN_INTERVAL
+                    false,
                     &starknet_registry,
                 ).await;
             }
@@ -167,12 +130,14 @@ pub(super) async fn run_starknet_worker(
                     process_starknet_tip(
                         &starknet_account,
                         &starknet_cfg,
+                        &base_evm_client,
+                        &base_evm_cfg,
                         &log_cache,
                         &webhook_tx,
                         &empty_webhook_map,
                         &mut sn_state,
                         StarknetTip { block_number: bn },
-                        true, // reconciliation backstop: always scan
+                        true,
                         &starknet_registry,
                     ).await;
                 }
@@ -184,6 +149,8 @@ pub(super) async fn run_starknet_worker(
 async fn process_starknet_tip(
     starknet_account: &Arc<StarknetAccount>,
     starknet_cfg: &Arc<beanie_keeper::config::StarknetConfig>,
+    base_evm_client: &Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: &Arc<beanie_keeper::config::EvmConfig>,
     log_cache: &LogCache,
     webhook_tx: &Arc<mpsc::Sender<crate::models::WebhookJob>>,
     webhook_map: &HashMap<String, String>,
@@ -194,13 +161,6 @@ async fn process_starknet_tip(
 ) {
     let sn_tip = tip.block_number;
 
-    // `discover_merchants`'s checkpoint always advances to exactly the
-    // block it was last called with, so on a live push of one new block
-    // per tip, `current_from` lands right back at `to_block` on every
-    // call — its own early-exit never fires in steady state. Without this
-    // floor, every new Starknet block (as often as every few seconds) was
-    // firing its own `starknet_getEvents` call. `force_scan` lets the
-    // reconciliation backstop bypass this and always scan.
     let due = force_scan
         || state
             .last_live_scan
@@ -247,6 +207,8 @@ async fn process_starknet_tip(
     act_on_starknet_deposits(
         starknet_account,
         starknet_cfg,
+        base_evm_client,
+        base_evm_cfg,
         webhook_tx,
         webhook_map,
         state,
@@ -255,11 +217,11 @@ async fn process_starknet_tip(
     .await;
 }
 
-/// JIT-deploy/sweep/webhook pipeline for a batch of already-discovered
-/// Starknet deposits.
 async fn act_on_starknet_deposits(
     starknet_account: &Arc<StarknetAccount>,
     starknet_cfg: &Arc<beanie_keeper::config::StarknetConfig>,
+    base_evm_client: &Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: &Arc<beanie_keeper::config::EvmConfig>,
     webhook_tx: &Arc<mpsc::Sender<crate::models::WebhookJob>>,
     webhook_map: &HashMap<String, String>,
     state: &mut StarknetState,
@@ -291,7 +253,6 @@ async fn act_on_starknet_deposits(
         }
     };
 
-    // --- Skip receivers with nothing left to sweep -------------------------
     let nonzero_balances = match beanie_keeper::starknet_keeper::batch_check_nonzero_balance(
         starknet_account.provider(),
         starknet_cfg.token_address,
@@ -310,9 +271,8 @@ async fn act_on_starknet_deposits(
     };
 
     let mut calls: Vec<Call> = Vec::new();
-    // Same pattern as the EVM side: only folded into state.deployed once
-    // execute_v3(...).send() confirms success below.
     let mut pending_deploys: Vec<Felt> = Vec::new();
+    let mut updated_webhooks: std::collections::HashSet<Felt> = std::collections::HashSet::new();
 
     for &receiver in &unique {
         let (merchant, route) = match state.merchant_map.get(&receiver) {
@@ -320,49 +280,81 @@ async fn act_on_starknet_deposits(
             None => continue,
         };
 
-        // `None` means the batch check itself failed (see above) — don't
-        // let a check we couldn't run block a real sweep.
         let has_balance = nonzero_balances
             .as_ref()
             .map(|set| set.contains(&receiver))
             .unwrap_or(true);
         if !has_balance {
-            // Nothing to collect right now — skip BOTH the register and
-            // sweep calls for this receiver. Deploying a receiver purely
-            // to sweep a zero balance would waste exactly the gas this
-            // check exists to save; it'll be picked up again if a future
-            // tip finds a new Transfer event for it.
             info!(
                 "skipping starknet sweep for {receiver:#x} — balanceOf reports zero (already swept, or nothing to collect yet)"
             );
             continue;
         }
 
-        // Starknet side: only ask the chain once per receiver, ever.
         let needs_deploy = if state.deployed.contains(&receiver) {
             false
         } else {
-            let deployed = match starknet_account
+            match starknet_account
                 .provider()
                 .get_class_hash_at(BlockId::Tag(BlockTag::L1Accepted), receiver)
                 .await
             {
-                Ok(ch) => ch != Felt::ZERO,
-                Err(_) => false,
-            };
-            if deployed {
-                state.deployed.insert(receiver);
+                Ok(ch) if ch != Felt::ZERO => {
+                    state.deployed.insert(receiver);
+                    false
+                }
+                Ok(_) => true,
+                Err(ProviderError::StarknetError(StarknetError::ContractNotFound)) => true,
+                Err(e) => {
+                    error!(
+                        "get_class_hash_at failed for {receiver:#x}: {e} — deployment unknown, skipping this pass (balance stays nonzero, reconciliation retries)"
+                    );
+                    continue;
+                }
             }
-            !deployed
         };
 
         if needs_deploy {
-            // The route is part of the receiver's address, so it must be the
-            // one from its ReceiverAnnounced event, never a default.
             let Some(route) = route else {
                 error!("no announced route for undeployed receiver {receiver:#x}");
                 continue;
             };
+
+            // 1. Update webhook URL on Base contract if receiver is not yet registered/deployed
+            if !updated_webhooks.contains(&merchant) {
+                let merchant_key = format!("{:#x}", merchant);
+                if let Some(url) = webhook_map.get(&merchant_key) {
+                    let merchant_eth_addr: ethers::types::Address = merchant_key
+                        .parse()
+                        .unwrap_or_else(|_| ethers::types::Address::zero());
+
+                    if merchant_eth_addr != ethers::types::Address::zero() {
+                        let webhook_contract = crate::models::WebhookRegistry::new(
+                            base_evm_cfg.webhook_registry_address,
+                            base_evm_client.clone(),
+                        );
+                        match webhook_contract
+                            .set_webhook_url(merchant_eth_addr, url.clone())
+                            .send()
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    "Updated webhook URL on Base for Starknet merchant {merchant_key}"
+                                );
+                                updated_webhooks.insert(merchant);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to set webhook URL on Base for Starknet merchant {merchant_key}: {e:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Queue Starknet registration call
             calls.push(Call {
                 to: starknet_cfg.factory_address,
                 selector: register_selector,
@@ -373,11 +365,6 @@ async fn act_on_starknet_deposits(
                     route.recipient_high,
                 ],
             });
-            // Do NOT mark state.deployed here — same reasoning as the EVM
-            // side. execute_v3(...).send() can fail without the receiver
-            // ever having been deployed, and state.deployed is a
-            // permanent, never-re-checked cache. Marking it
-            // early would permanently strand the receiver on failure.
             pending_deploys.push(receiver);
         }
 
@@ -393,7 +380,7 @@ async fn act_on_starknet_deposits(
             starknet_account
                 .provider()
                 .get_nonce(
-                    BlockId::Tag(BlockTag::L1Accepted),
+                    BlockId::Tag(BlockTag::PreConfirmed),
                     starknet_account.address(),
                 )
                 .await
@@ -410,14 +397,12 @@ async fn act_on_starknet_deposits(
                 let tx_hash = format!("{:#x}", pending.transaction_hash);
                 info!("starknet native atomic register+sweep -> {tx_hash}");
                 state.next_nonce = Some(nonce + Felt::ONE);
-                // Send succeeded — safe to treat these receivers as
-                // deployed now.
                 state.deployed.extend(pending_deploys.iter().copied());
                 Some(tx_hash)
             }
             Err(e) => {
                 error!("starknet native atomic invoke failed: {e}");
-                state.next_nonce = None; // force a fresh get_nonce() next time
+                state.next_nonce = None;
                 None
             }
         }

@@ -152,8 +152,8 @@ pub struct EvmConfig {
     pub factory_address: Address, // Beanie's EVM ReceiverFactory
     pub registry_start_block: u64, // block ReceiverFactory was deployed at
     pub deposit_start_block: u64, // deposit-scan watermark
-    pub webhook_registry_address: Address, // MerchantWebhookRegistry
-    pub webhook_registry_start_block: u64, // block MerchantWebhookRegistry was deployed at
+    pub webhook_registry_address: Address, // WebhookRegistry
+    pub webhook_registry_start_block: u64, // block WebhookRegistry was deployed at
     // Same keypair as sweep_private_key, parsed once here without a chain ID (message
     // signing via EIP-191 personal_sign doesn't need one — only tx signing does).
     // Merchants verify webhooks by recovering the signer address from the signature and
@@ -310,6 +310,7 @@ impl SolanaConfig {
 
 #[derive(Debug, Clone)]
 pub struct Deposit {
+    pub chain: String,
     pub tx_hash: String,
     pub from_address: String,
     pub receiver: String, // which merchant's ChainXReceiver clone this landed in

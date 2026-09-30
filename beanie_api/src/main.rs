@@ -139,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
     let monad_client = beanie_keeper::evm_keeper::build_client(&monad_cfg).await?;
 
+    let base_evm_client_for_webhook = base_client.clone();
+    let base_evm_cfg_for_webhook = Arc::new(base_cfg.clone());
+
     let base_domain_seperator =
         fetch_domain_separator(base_client.clone(), base_cfg.token_address).await?;
     let ethereum_domain_seperator =
@@ -377,6 +380,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::transfer_workers::run_native_transfer_poller(
             evm_chains,
+            base_evm_client_for_webhook,
+            base_evm_cfg_for_webhook,
             transfer_starknet_account_clone,
             solana_rpc,
             solana_keeper_wallet,

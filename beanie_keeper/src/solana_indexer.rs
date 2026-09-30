@@ -469,6 +469,7 @@ pub async fn fetch_deposits_since_slot(
     let deposits: Vec<Deposit> = transfers
         .into_iter()
         .map(|t| Deposit {
+            chain: cfg.chain_name.to_string(),
             tx_hash: String::new(), // add "transaction": {"signatures": true} to fields if needed
             from_address: t.authority.to_string(),
             receiver: t.destination.to_string(),

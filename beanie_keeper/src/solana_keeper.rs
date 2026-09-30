@@ -14,7 +14,6 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
-// use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction as LegacyTransaction;
 use spl_associated_token_account::get_associated_token_address;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;

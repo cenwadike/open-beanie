@@ -67,7 +67,7 @@ pub async fn batch_check_nonzero_balance(
                     entry_point_selector: balance_of_selector,
                     calldata: vec![receiver],
                 },
-                block_id: BlockId::Tag(BlockTag::L1Accepted),
+                block_id: BlockId::Tag(BlockTag::PreConfirmed),
             })
         })
         .collect();
@@ -86,9 +86,10 @@ pub async fn batch_check_nonzero_balance(
                 }
             }
             other => {
-                eprintln!(
-                    "balanceOf batch: unexpected response variant for receiver {receiver:#x}: {other:?} — treating as zero balance"
+                log::error!(
+                    "balanceOf batch: unexpected response variant for receiver {receiver:#x}: {other:?} — treating as unknown, not zero"
                 );
+                nonzero.insert(receiver);
             }
         }
     }

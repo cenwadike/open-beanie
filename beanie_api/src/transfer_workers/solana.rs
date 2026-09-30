@@ -3,7 +3,7 @@
 //! NOTE — half-integrated: this worker's cross-chain webhook lookup is a
 //! hardcoded empty map (`empty_webhook_map` below), the same gap that
 //! exists on the Starknet side. Solana webhooks will not fire until that's
-//! wired up to the real `MerchantWebhookRegistry` state that currently
+//! wired up to the real `WebhookRegistry` state that currently
 //! only lives inside the EVM worker's own `EvmState`. That's not new here
 //! — it's the pre-existing gap, just made explicit per-chain instead of
 //! silently inherited.
@@ -117,6 +117,8 @@ pub(super) async fn run_solana_worker(
     solana_rpc: Arc<SolanaRpcClient>,
     solana_keeper_wallet: Arc<SolanaKeypair>,
     solana_cfg: Arc<beanie_keeper::config::SolanaConfig>,
+    base_evm_client: Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: Arc<beanie_keeper::config::EvmConfig>,
     log_cache: Arc<LogCache>,
     webhook_tx: Arc<mpsc::Sender<crate::models::WebhookJob>>,
     solana_registry: SharedSolanaRegistry,
@@ -127,7 +129,7 @@ pub(super) async fn run_solana_worker(
     };
 
     // Same gap as Starknet's `empty_webhook_map`: cross-chain webhook
-    // lookup against Base's real `MerchantWebhookRegistry` isn't wired
+    // lookup against Base's real `WebhookRegistry` isn't wired
     // between workers yet (EVM's is only populated inside its own
     // `EvmState`). Until that's shared across tasks, Solana webhooks
     // won't fire either — not a new gap introduced here, the existing one
@@ -164,6 +166,8 @@ pub(super) async fn run_solana_worker(
         &solana_rpc,
         &solana_keeper_wallet,
         &solana_cfg,
+        &base_evm_client,
+        &base_evm_cfg,
         &webhook_tx,
         &empty_webhook_map,
         &mut state,
@@ -199,6 +203,8 @@ pub(super) async fn run_solana_worker(
                     &solana_rpc,
                     &solana_keeper_wallet,
                     &solana_cfg,
+                    &base_evm_client,
+                    &base_evm_cfg,
                     &log_cache,
                     &webhook_tx,
                     &empty_webhook_map,
@@ -213,12 +219,14 @@ pub(super) async fn run_solana_worker(
                 let mut watched = tracked_receiver_tas.write().await;
                 *watched = state.merchant_map.values().map(|r| r.receiver_token_account).collect();
             }
-                _ = reconcile_ticker.tick() => {
+            _ = reconcile_ticker.tick() => {
                 if let Ok(head) = solana_rpc.get_slot().await {
                     process_solana_tip(
                         &solana_rpc,
                         &solana_keeper_wallet,
                         &solana_cfg,
+                        &base_evm_client,
+                        &base_evm_cfg,
                         &log_cache,
                         &webhook_tx,
                         &empty_webhook_map,
@@ -234,6 +242,9 @@ pub(super) async fn run_solana_worker(
                             &solana_rpc,
                             &solana_keeper_wallet,
                             &solana_cfg,
+                            &base_evm_client,
+                            &base_evm_cfg,
+                            &empty_webhook_map,
                             &mut state,
                             all_receivers,
                         ).await;
@@ -249,6 +260,8 @@ async fn process_solana_tip(
     solana_rpc: &Arc<SolanaRpcClient>,
     solana_keeper_wallet: &Arc<SolanaKeypair>,
     solana_cfg: &Arc<beanie_keeper::config::SolanaConfig>,
+    base_evm_client: &Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: &Arc<beanie_keeper::config::EvmConfig>,
     log_cache: &LogCache,
     webhook_tx: &Arc<mpsc::Sender<crate::models::WebhookJob>>,
     webhook_map: &HashMap<String, String>,
@@ -376,6 +389,8 @@ async fn process_solana_tip(
         solana_rpc,
         solana_keeper_wallet,
         solana_cfg,
+        base_evm_client,
+        base_evm_cfg,
         webhook_tx,
         webhook_map,
         state,
@@ -400,18 +415,16 @@ fn merchant_token_account(
 /// same "one function, called from both the deposit path and the
 /// reconciliation backstop" shape as EVM's `sweep_evm_receivers`.
 ///
-/// Unlike EVM/Starknet, registration here is NOT part of this function's
-/// atomic send — `reg_tx` is pre-signed and broadcasts standalone (see
-/// `solana_keeper::broadcast_pending_registration`'s doc comment). A
-/// receiver promoted from Announced to Registered in this pass is only
-/// swept on the *next* call.
-///
-/// The sweep itself (same-chain vs CCTP, per receiver) is picked inside
-/// `solana_keeper::sweep_registered`.
+/// If a receiver is NOT yet registered (`ReceiverStatus::Announced`), it updates
+/// the merchant's webhook URL on the Base webhook registry contract before
+/// broadcasting the Solana registration transaction.
 async fn sweep_solana_receivers(
     solana_rpc: &Arc<SolanaRpcClient>,
     solana_keeper_wallet: &Arc<SolanaKeypair>,
     solana_cfg: &Arc<beanie_keeper::config::SolanaConfig>,
+    base_evm_client: &Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: &Arc<beanie_keeper::config::EvmConfig>,
+    webhook_map: &HashMap<String, String>,
     state: &mut SolanaState,
     candidates: Vec<SolanaReceiverRecord>,
 ) -> Option<String> {
@@ -436,16 +449,55 @@ async fn sweep_solana_receivers(
     };
 
     // --- JIT-register: Announced + nonzero balance --------------------------
-    let to_register: Vec<(SolanaPubkey, Vec<u8>)> = candidates
+    let to_register: Vec<(SolanaPubkey, SolanaPubkey, Vec<u8>)> = candidates
         .iter()
         .filter(|r| nonzero.contains(&r.receiver_token_account))
         .filter_map(|r| match (r.status, &r.reg_tx) {
-            (ReceiverStatus::Announced, Some(reg_tx)) => Some((r.receiver, reg_tx.clone())),
+            (ReceiverStatus::Announced, Some(reg_tx)) => {
+                Some((r.receiver, r.merchant, reg_tx.clone()))
+            }
             _ => None,
         })
         .collect();
 
-    for (receiver, reg_tx) in to_register {
+    let mut updated_webhooks: std::collections::HashSet<SolanaPubkey> =
+        std::collections::HashSet::new();
+
+    for (receiver, merchant, reg_tx) in to_register {
+        // 1. Update webhook URL on Base contract if receiver is not yet registered
+        if !updated_webhooks.contains(&merchant) {
+            let merchant_key = merchant.to_string();
+            if let Some(url) = webhook_map.get(&merchant_key) {
+                let merchant_eth_addr: ethers::types::Address = merchant
+                    .to_string()
+                    .parse()
+                    .unwrap_or_else(|_| ethers::types::Address::zero());
+
+                if merchant_eth_addr != ethers::types::Address::zero() {
+                    let webhook_contract = crate::models::WebhookRegistry::new(
+                        base_evm_cfg.webhook_registry_address,
+                        base_evm_client.clone(),
+                    );
+                    match webhook_contract
+                        .set_webhook_url(merchant_eth_addr, url.clone())
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {
+                            info!("Updated webhook URL on Base for merchant {merchant}");
+                            updated_webhooks.insert(merchant);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to set webhook URL on Base for merchant {merchant}: {e:#}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Broadcast pending registration on Solana
         match solana_keeper::broadcast_pending_registration(solana_rpc, &reg_tx).await {
             Ok(sig) => {
                 info!("solana JIT register {receiver} -> {sig}");
@@ -490,6 +542,8 @@ async fn act_on_solana_deposits(
     solana_rpc: &Arc<SolanaRpcClient>,
     solana_keeper_wallet: &Arc<SolanaKeypair>,
     solana_cfg: &Arc<beanie_keeper::config::SolanaConfig>,
+    base_evm_client: &Arc<beanie_keeper::evm_keeper::SignerProvider>,
+    base_evm_cfg: &Arc<beanie_keeper::config::EvmConfig>,
     webhook_tx: &Arc<mpsc::Sender<crate::models::WebhookJob>>,
     webhook_map: &HashMap<String, String>,
     state: &mut SolanaState,
@@ -516,6 +570,9 @@ async fn act_on_solana_deposits(
         solana_rpc,
         solana_keeper_wallet,
         solana_cfg,
+        base_evm_client,
+        base_evm_cfg,
+        webhook_map,
         state,
         candidates,
     )

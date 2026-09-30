@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ethers::types::Address;
 use ethers::utils::keccak256;
-use log::info;
+use log::{info, warn};
 use solana_sdk::signature::Signer;
 use starknet::accounts::Account;
 use starknet::core::types::{Call, Felt};
@@ -170,7 +170,7 @@ pub async fn run_announce_worker(
 
                 let Some((chain_client, factory_addr)) = evm_targets.get(&task.chain).cloned()
                 else {
-                    eprintln!(
+                    warn!(
                         "announce worker: no client/factory configured for {:?}",
                         task.chain
                     );
@@ -180,7 +180,7 @@ pub async fn run_announce_worker(
                 let Some((cctp_chain, cctp_recipient)) =
                     evm_route(&task.chain, &task.target_chain, &task.target_recipient)
                 else {
-                    eprintln!(
+                    warn!(
                         "announce worker: unusable settlement route {:?} -> {:?} ({})",
                         task.chain, task.target_chain, task.target_recipient
                     );
@@ -196,16 +196,16 @@ pub async fn run_announce_worker(
                             "announceReceiver ok chain={:?} merchant={:?} tx={:#x}",
                             task.chain, merchant, receipt.transaction_hash
                         ),
-                        Ok(None) => eprintln!(
+                        Ok(None) => warn!(
                             "announceReceiver dropped chain={:?} merchant={:?}",
                             task.chain, merchant
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => warn!(
                             "announceReceiver confirmation failed chain={:?} merchant={:?}: {e}",
                             task.chain, merchant
                         ),
                     },
-                    Err(e) => eprintln!(
+                    Err(e) => warn!(
                         "announceReceiver send failed chain={:?} merchant={:?}: {e}",
                         task.chain, merchant
                     ),
@@ -219,7 +219,7 @@ pub async fn run_announce_worker(
                 let selector = match get_selector_from_name("announce_receiver") {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("announce worker: selector announce_receiver: {e}");
+                        warn!("announce worker: selector announce_receiver: {e}");
                         continue;
                     }
                 };
@@ -227,7 +227,7 @@ pub async fn run_announce_worker(
                 let Some([cctp_chain, recipient_low, recipient_high]) =
                     starknet_route(&task.chain, &task.target_chain, &task.target_recipient)
                 else {
-                    eprintln!(
+                    warn!(
                         "announce worker: unusable settlement route {:?} -> {:?} ({})",
                         task.chain, task.target_chain, task.target_recipient
                     );
@@ -245,7 +245,7 @@ pub async fn run_announce_worker(
                         "announce_receiver ok merchant={:#x} tx={:#x}",
                         merchant, pending.transaction_hash
                     ),
-                    Err(e) => eprintln!("announce_receiver failed for {:#x}: {e}", merchant),
+                    Err(e) => warn!("announce_receiver failed for {:#x}: {e}", merchant),
                 }
             }
 
@@ -265,7 +265,7 @@ pub async fn run_announce_worker(
                 let Some((chain_buf, recipient_buf)) =
                     solana_route(&task.chain, &task.target_chain, &task.target_recipient)
                 else {
-                    eprintln!(
+                    warn!(
                         "announce worker: unusable settlement route {:?} -> {:?} ({})",
                         task.chain, task.target_chain, task.target_recipient
                     );
@@ -311,7 +311,7 @@ pub async fn run_announce_worker(
                     {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            eprintln!(
+                            warn!(
                                 "announce worker: solana prepare_registration failed for merchant {}: {e}",
                                 merchant
                             );
@@ -337,7 +337,7 @@ pub async fn run_announce_worker(
                 {
                     Ok(sig) => sig,
                     Err(e) => {
-                        eprintln!(
+                        warn!(
                             "announce worker: solana announce_merchant failed for merchant {}: {e}",
                             merchant
                         );
@@ -360,7 +360,7 @@ pub async fn run_announce_worker(
                 .await
                 {
                     Ok(sig) => println!("register_merchant broadcast ok tx={}", sig),
-                    Err(e) => eprintln!(
+                    Err(e) => warn!(
                         "announce worker: solana broadcast_pending_registration failed for merchant {}: {e}",
                         merchant
                     ),

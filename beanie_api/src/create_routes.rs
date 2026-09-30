@@ -56,6 +56,7 @@ pub struct AnnounceRequest {
     /// The merchant's address on `target_chain` (the wallet in standard mode,
     /// the target-chain stealth address in privacy mode).
     pub target_recipient: String,
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +95,26 @@ fn parse_and_sanitize_solana_addr(input: &str) -> Result<String, &'static str> {
         .parse::<solana_sdk::pubkey::Pubkey>()
         .map_err(|_| "Invalid Solana base58 address")?;
     Ok(pubkey.to_string())
+}
+
+fn parse_and_sanitize_webhook_url(input: &str) -> Result<Option<String>, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = url::Url::parse(trimmed).map_err(|_| "Invalid URL format")?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("Webhook URL scheme must be http or https"),
+    }
+
+    if !parsed.has_host() {
+        return Err("Webhook URL must contain a valid host");
+    }
+
+    Ok(Some(parsed.to_string()))
 }
 
 /// Per-chain address canonicalization. Arbitrum and Monad share Base/
@@ -167,6 +188,20 @@ pub async fn announce_receiver(
             }
         };
 
+    // 2c. Webhook URL must be valid url
+    let webhook_url = match payload.webhook_url.as_deref() {
+        Some(raw_url) => match parse_and_sanitize_webhook_url(raw_url) {
+            Ok(url) => url,
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid webhook_url: {e}"),
+                );
+            }
+        },
+        None => None,
+    };
+
     // 3. Single rate-limit call site, against the one proven credential_id.
     //    Not looped per fan-out leg — it's still one proven identity plus
     //    one settlement target, same as before the fan-out existed.
@@ -203,6 +238,7 @@ pub async fn announce_receiver(
             credential_id: credential_id.clone(),
             target_chain: payload.target_chain,
             target_recipient: target_recipient.clone(),
+            webhook_url: webhook_url.clone(),
         };
 
         if let Err(e) = state.announce_tx.send(task).await {
