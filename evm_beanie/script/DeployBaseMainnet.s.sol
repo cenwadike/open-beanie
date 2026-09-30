@@ -5,8 +5,7 @@ import "forge-std/Script.sol";
 import "../src/ChainXReceiver.sol";
 import "../src/StealthAccount.sol";
 import "../src/ReceiverFactory.sol";
-import "../src/MerchantWebhookRegistry.sol";
-import "../src/CREKeeperReceiver.sol";
+import "../src/WebhookRegistry.sol";
 
 contract DeployBaseMainnet is Script {
     // Base Mainnet Constants
@@ -70,26 +69,8 @@ contract DeployBaseMainnet is Script {
         console.log("ReceiverFactory deployed to:", address(factory));
 
         // 3. Deploy Webhook Registry
-        MerchantWebhookRegistry webhookRegistry = new MerchantWebhookRegistry(
-            address(factory)
-        );
-        console.log(
-            "MerchantWebhookRegistry deployed to:",
-            address(webhookRegistry)
-        );
-
-        // 4. Deploy CREKeeperReceiver
-        CREKeeperReceiver creKeeperReceiver = new CREKeeperReceiver(
-            keeper,
-            multicall3,
-            expectedWorkflowId,
-            expectedWorkflowOwner
-        );
-
-        console.log(
-            "CREKeeperReceiver deployed to:",
-            address(creKeeperReceiver)
-        );
+        WebhookRegistry webhookRegistry = new WebhookRegistry(address(factory));
+        console.log("WebhookRegistry deployed to:", address(webhookRegistry));
 
         vm.stopBroadcast();
     }

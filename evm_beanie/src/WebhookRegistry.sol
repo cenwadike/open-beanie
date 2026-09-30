@@ -7,7 +7,7 @@ interface IReceiverFactoryView {
 
 /// The single webhook URL registry for all of Beanie — not per-chain. A merchant might
 /// register a receiver on Base, Starknet, both, or (once Solana lands) all three.
-contract MerchantWebhookRegistry {
+contract WebhookRegistry {
     IReceiverFactoryView factory;
     mapping(address => string) public webhookUrl;
     error EmptyUrl();

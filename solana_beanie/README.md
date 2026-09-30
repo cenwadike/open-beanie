@@ -57,7 +57,7 @@ If step 4 or 5 fails, discard the address: nobody has seen it. The payer can sti
 | Program upgraded while blobs are pending | can invalidate them: freeze the upgrade authority or don't change `register_merchant` |
 | Mint freezes the receiver ATA before registration | `approve` fails and the nonce is burned: issuer-level edge |
 
-## Known residuals
+## Known tradeoffs
 
 - **Registry cap is enforced at registration.** If a merchant's registry fills between your simulation and the broadcast, the tx fails and burns its nonce while the key is gone. The address was never disclosed, so nothing is stranded, but the address is lost (`RM-SAD-8`). Keep the cap high enough, or shard by merchant.
 - **The payer key is the nonce authority.** A compromised payer key can advance or close nonces and kill pending blobs (grief, not theft; the address is undisclosed until `Active`). Use a payer key you already protect as the operator key.
@@ -80,12 +80,3 @@ anchor test          # Anchor.toml: mocha timeout -t 1000000
 ```
 
 `NC-*` cover the nonce close. `SW-CC-HAPPY-1` (real CCTP CPI) is `it.skip`; the validator flags are in the test file.
-
-## Status
-
-Written but **not compiled or run** here (no Rust/Anchor toolchain; the test file only passed a TypeScript syntax check). Verify first:
-
-- `RM-HAPPY-1` / `RM-SAD-2`: `init` of config plus `close = payer` on the pinned account in one instruction.
-- `AN-HAPPY-1`: measured announce tx size ≤ 1232.
-- `SW-SAD-6`: Anchor surfaces `AccountNotInitialized` for a config that doesn't exist.
-- IDL camelCase account names match the ones used in the tests.
