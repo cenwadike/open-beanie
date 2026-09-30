@@ -284,7 +284,7 @@ flowchart TB
 
 | Component | Role |
 |---|---|
-| **EVM contracts** (`ChainXReceiver`, `ReceiverFactory`, `MerchantWebhookRegistry`) | Deterministic per-merchant clones. `sweep()` takes the fee and then burns via CCTP or forwards to the merchant. The factory resolves the CCTP domain from a chain name. |
+| **EVM contracts** (`ChainXReceiver`, `ReceiverFactory`, `WebhookRegistry`) | Deterministic per-merchant clones. `sweep()` takes the fee and then burns via CCTP or forwards to the merchant. The factory resolves the CCTP domain from a chain name. |
 | **Starknet contracts** (`StarknetReceiver`, `ReceiverFactory`, `StealthAccount`) | The same receiver logic in Cairo, plus the 2-of-2 stealth account. |
 | **Solana program** (Anchor) | Receiver PDAs bound to the full route, a pinned pre-signed registration transaction, and a permissionless `sweep` (same-chain transfer or CCTP `deposit_for_burn`). |
 | **`beanie_api`** | HTTP layer. It validates requests, verifies payment authorizations, queues work, and serves the frontend. |

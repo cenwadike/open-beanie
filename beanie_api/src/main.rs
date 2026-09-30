@@ -19,7 +19,11 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
-use beanie_keeper::config::{EvmConfig, SolanaConfig, StarknetConfig};
+use beanie_keeper::{
+    config::{EvmConfig, SolanaConfig, StarknetConfig},
+    evm_keeper::{SignerProvider, fetch_domain_separator},
+};
+use ethers::types::H256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tower::ServiceExt;
@@ -30,15 +34,18 @@ use log::{debug, info};
 use crate::auth::{
     AuthState, RateLimiter, auth_finish, auth_start, register_finish, register_start,
 };
+use crate::models::AnnounceTask;
 use crate::models::PaymentTask;
 use crate::models::{Chain, StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
 use crate::stealth_routes::execute_stealth_claim;
+use crate::stealth_workers::{
+    ChainRegistry, FireblocksRest, WorkerCtx, chain_cfgs_from_env, start_stealth_workers,
+};
 use crate::transfer_workers::{SharedEvmRegistry, SharedSolanaRegistry, SharedStarknetRegistry};
 use crate::{config::Config, models::AppState};
 use crate::{create_routes::announce_receiver, create_workers::run_announce_worker};
-use crate::{models::AnnounceTask, stealth_workers::start_stealth_workers};
 use tokio::sync::RwLock as AsyncRwLock;
 
 /// Fallback route handler for serving static frontend files and pretty HTML URLs.
@@ -127,10 +134,26 @@ async fn main() -> anyhow::Result<()> {
     // Base's client also backs the announce/payment/stealth flows below;
     // Arbitrum's is used by both the announce worker (new) and the native
     // transfer poller further down.
-    let evm_client = beanie_keeper::evm_keeper::build_client(&base_cfg).await?;
+    let base_client = beanie_keeper::evm_keeper::build_client(&base_cfg).await?;
     let ethereum_client = beanie_keeper::evm_keeper::build_client(&ethereum_cfg).await?;
     let arbitrum_client = beanie_keeper::evm_keeper::build_client(&arbitrum_cfg).await?;
     let monad_client = beanie_keeper::evm_keeper::build_client(&monad_cfg).await?;
+
+    let base_domain_seperator =
+        fetch_domain_separator(base_client.clone(), base_cfg.token_address).await?;
+    let ethereum_domain_seperator =
+        fetch_domain_separator(ethereum_client.clone(), ethereum_cfg.token_address).await?;
+    let arbitrum_domain_separator =
+        fetch_domain_separator(arbitrum_client.clone(), arbitrum_cfg.token_address).await?;
+    let monad_domain_seperator =
+        fetch_domain_separator(monad_client.clone(), base_cfg.token_address).await?;
+
+    let evm_domain_separators: HashMap<Chain, H256> = HashMap::from([
+        (Chain::Base, base_domain_seperator),
+        (Chain::Ethereum, ethereum_domain_seperator),
+        (Chain::Arbitrum, arbitrum_domain_separator),
+        (Chain::Monad, monad_domain_seperator),
+    ]);
 
     // 2. Initialize Starknet Account Client
     let starknet_account = beanie_keeper::starknet_keeper::build_starknet_account(&starknet_cfg)?;
@@ -157,6 +180,14 @@ async fn main() -> anyhow::Result<()> {
 
     debug!("[baeanie_api::main]: clients loaded");
 
+    // 3b. Stealth cosigner backend + chain registry. Built BEFORE AppState
+    // because the claim route reads the registry (allowlists, chain family,
+    // enabled_for_claims). Refuses to start if STEALTH_CHAINS_JSON or the
+    // Fireblocks env vars are missing/invalid, if two chains share a vault or
+    // cosigner address, or if an EVM RPC reports the wrong chain id.
+    let fireblocks = Arc::new(FireblocksRest::from_env(reqwest::Client::new())?);
+    let stealth_chains = Arc::new(ChainRegistry::build(chain_cfgs_from_env()?, &fireblocks).await?);
+
     // Every EVM-family chain the announce worker can target, each with its
     // own signer client and its own factory address.
     let evm_targets: HashMap<
@@ -166,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
             ethers::types::Address,
         ),
     > = HashMap::from([
-        (Chain::Base, (evm_client.clone(), base_cfg.factory_address)),
+        (Chain::Base, (base_client.clone(), base_cfg.factory_address)),
         (
             Chain::Ethereum,
             (ethereum_client.clone(), ethereum_cfg.factory_address),
@@ -183,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
 
     let evm_payments: HashMap<Chain, (Arc<beanie_keeper::evm_keeper::SignerProvider>, EvmConfig)> =
         HashMap::from([
-            (Chain::Base, (evm_client.clone(), base_cfg.clone())),
+            (Chain::Base, (base_client.clone(), base_cfg.clone())),
             (
                 Chain::Ethereum,
                 (ethereum_client.clone(), ethereum_cfg.clone()),
@@ -221,25 +252,28 @@ async fn main() -> anyhow::Result<()> {
         announce_tx: announce_tx.clone(),
         stealth_tx: stealth_tx.clone(),
         payment_tx: payment_tx.clone(),
-        app_config: Arc::new(cfg.clone()),
         starknet_config: Arc::new(StarknetConfig::from_env()?),
-        evm_config: Arc::new(beanie_keeper::config::EvmConfig::from_env("BASE", "base")?),
         solana_config: solana_cfg.clone(),
         reqwest_client: Arc::new(reqwest::Client::builder().build()?),
+        evm_domain_separators: Arc::new(evm_domain_separators),
+        stealth_chains: stealth_chains.clone(),
     };
     let worker_state = Arc::new(state.clone());
-    let base_client = evm_client.clone();
+    let base_client = base_client.clone();
     let announce_starknet_account_clone = starknet_account.clone();
     let payment_starknet_account_clone = starknet_account.clone();
     let transfer_starknet_account_clone = starknet_account.clone();
     // solana_rpc/solana_keeper_wallet are moved into the transfer poller
-    // below, so the announce worker needs its own clone of each (both are
-    // Arc, so this is just a refcount bump).
+    // below, so every other consumer (announce worker, payment worker,
+    // stealth worker) needs its own clone of each (both are Arc, so this is
+    // just a refcount bump).
     let announce_solana_rpc_clone = solana_rpc.clone();
     let announce_solana_keeper_clone = solana_keeper_wallet.clone();
     let payment_solana_rpc_clone = solana_rpc.clone();
     let payment_solana_keeper_clone = solana_keeper_wallet.clone();
     let payment_solana_cfg_clone = solana_cfg.clone();
+    let stealth_solana_rpc_clone = solana_rpc.clone();
+    let stealth_solana_keeper_clone = solana_keeper_wallet.clone();
 
     // One announce-log registry per EVM chain, plus one each for Starknet
     // and Solana. Built here, before either worker spawns, and shared by
@@ -256,14 +290,19 @@ async fn main() -> anyhow::Result<()> {
     let solana_registry: SharedSolanaRegistry = Arc::new(AsyncRwLock::new(HashMap::new()));
 
     // Keyed by `Chain` so the payment worker can pick the right registry
-    // straight off `PaymentTask::source_chain` — same aliasing as
-    // `evm_targets` above: `Chain::Ethereum` has no client of its own yet,
-    // so it shares Base's registry too.
+    // straight off `PaymentTask::source_chain`.
     let evm_registries: HashMap<Chain, SharedEvmRegistry> = HashMap::from([
         (Chain::Base, base_registry.clone()),
         (Chain::Ethereum, ethereum_registry.clone()),
         (Chain::Arbitrum, arbitrum_registry.clone()),
         (Chain::Monad, monad_registry.clone()),
+    ]);
+
+    let evm_clients: HashMap<Chain, Arc<SignerProvider>> = HashMap::from([
+        (Chain::Base, ethereum_client.clone()),
+        (Chain::Ethereum, base_client.clone()),
+        (Chain::Arbitrum, arbitrum_client.clone()),
+        (Chain::Monad, monad_client.clone()),
     ]);
 
     let evm_chains = vec![
@@ -290,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
     let starknet_cfg_clone = state.starknet_config.clone();
     let webhook_tx_for_transfer = webhook_tx.clone();
 
-    debug!("[baeanie_api::main]: app state loaded");
+    debug!("app state loaded");
 
     // Spawn announce workers
     tokio::spawn(run_announce_worker(
@@ -304,8 +343,18 @@ async fn main() -> anyhow::Result<()> {
         announce_rx,
     ));
 
-    // Spawn stealth workers
-    tokio::spawn(start_stealth_workers(worker_state, stealth_rx));
+    // Spawn stealth workers (Fireblocks co-sign + gasless relay). The context
+    // carries the chain registry, the cosigner backend, the per-chain EVM
+    // keeper wallets and the Solana RPC/relayer.
+    let stealth_ctx = Arc::new(WorkerCtx {
+        state: worker_state,
+        chains: stealth_chains,
+        cosigner: fireblocks,
+        evm_clients,
+        solana_rpc: stealth_solana_rpc_clone,
+        solana_keeper: stealth_solana_keeper_clone,
+    });
+    tokio::spawn(start_stealth_workers(stealth_ctx, stealth_rx));
 
     // Spawn payment worker — reads the same registries the transfer
     // poller below writes to, instead of deriving JIT-register/sweep
@@ -346,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
         crate::webhook_workers::run_webhook_worker(http_for_webhooks, webhook_rx).await;
     });
 
-    debug!("[baeanie_api::main]: workers loaded");
+    debug!("workers loaded");
 
     let app = Router::new()
         .route("/api/v1/webauthn/register/start", post(register_start))
@@ -362,16 +411,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
 
+    info!("Beanie Lanes API running on {}", cfg.listen_addr);
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<crate::models::SocketAddr>(),
     )
     .await?;
-
-    info!(
-        "[baeanie_api::main]: Beanie Lanes API running on {}",
-        cfg.listen_addr
-    );
 
     Ok(())
 }

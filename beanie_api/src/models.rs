@@ -8,28 +8,28 @@ use ethers::{contract::abigen, types::H256};
 pub use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starknet::core::types::Felt;
+use std::collections::HashMap;
 pub use std::net::SocketAddr;
 pub use std::sync::Arc;
 pub use tokio::sync::mpsc;
 
 use crate::{
-    Config,
     auth::{AuthState, RateLimiter},
-    stealth_routes::{CallDataPayload, ClientSignature},
+    stealth_routes::{Auth3009Params, CallDataPayload, ClientSignature, StarknetTxParams},
 };
 
 /// Global application state shared across Axum route handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<AuthState>,
-    pub app_config: Arc<Config>,
+    pub stealth_chains: Arc<crate::stealth_workers::ChainRegistry>,
     pub starknet_config: Arc<beanie_keeper::config::StarknetConfig>,
-    pub evm_config: Arc<beanie_keeper::config::EvmConfig>,
     pub solana_config: Arc<beanie_keeper::config::SolanaConfig>,
     pub limiter: Arc<RateLimiter>,
     pub announce_tx: Arc<mpsc::Sender<AnnounceTask>>,
     pub stealth_tx: Arc<mpsc::Sender<StealthTask>>,
     pub payment_tx: Arc<mpsc::Sender<PaymentTask>>,
+    pub evm_domain_separators: Arc<HashMap<Chain, H256>>,
     pub reqwest_client: Arc<reqwest::Client>,
 }
 
@@ -110,6 +110,7 @@ pub struct AnnounceTask {
     pub credential_id: String,
     pub target_chain: Chain,
     pub target_recipient: String,
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +138,9 @@ pub struct StealthTask {
     pub client_sig: ClientSignature,
     pub credential_id: String,
     pub calls: Vec<CallDataPayload>,
+    pub auth3009: Option<Auth3009Params>,
+    pub starknet: Option<StarknetTxParams>,
+    pub message_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +188,7 @@ abigen!(
         function getReceiverCount(address merchant) external view returns (uint256)
         function announceReceiver(address merchant, bytes32 cctpMintChain, bytes32 cctpMintRecipient) external
     ]"#;
-    MerchantWebhookRegistry,
+    WebhookRegistry,
     r#"[
         function setWebhookUrl(address merchant, string calldata url) external
     ]"#;

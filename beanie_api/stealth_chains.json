@@ -1,0 +1,108 @@
+[
+    {
+        "chain": "BASE",
+        "family": {
+            "evm": {
+                "chain_id": 8453,
+                "rpc_url": "https://mainnet.base.org",
+                "entry_point": "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+            }
+        },
+        "vault_id": "11",
+        "asset_id": "BASECHAIN_ETH",
+        "algo": "ecdsa_secp256k1",
+        "allowed_targets": [
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        ],
+        "allowed_factories": [
+            "0xYourStealthAccountFactory"
+        ],
+        "allowed_paymasters": [
+            "0xYourPaymaster"
+        ],
+        "max_user_op_gas": 1500000,
+        "enabled_for_claims": true
+    },
+    {
+        "chain": "ARBITRUM",
+        "family": {
+            "evm": {
+                "chain_id": 42161,
+                "rpc_url": "https://arb1.arbitrum.io/rpc",
+                "entry_point": "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+            }
+        },
+        "vault_id": "14",
+        "asset_id": "ETH-AETH",
+        "algo": "ecdsa_secp256k1",
+        "allowed_targets": [
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+        ],
+        "allowed_factories": [
+            "0xYourStealthAccountFactory"
+        ],
+        "allowed_paymasters": [
+            "0xYourPaymaster"
+        ],
+        "max_user_op_gas": 1500000,
+        "enabled_for_claims": true
+    },
+    {
+        "chain": "MONAD",
+        "family": {
+            "evm": {
+                "chain_id": 143,
+                "rpc_url": "https://rpc.monad.xyz",
+                "entry_point": "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+            }
+        },
+        "vault_id": "15",
+        "asset_id": "ETH",
+        "algo": "ecdsa_secp256k1",
+        "allowed_targets": [
+            "0x754704Bc059F8C67012fEd69BC8A327a5aafb603"
+        ],
+        "allowed_factories": [
+            "0xYourStealthAccountFactory"
+        ],
+        "allowed_paymasters": [
+            "0xYourPaymaster"
+        ],
+        "max_user_op_gas": 1500000,
+        "enabled_for_claims": true
+    },
+    {
+        "chain": "STARKNET",
+        "family": {
+            "starknet": {
+                "chain_id": "0x534e5f4d41494e",
+                "account_class_hash": "0xYourStealthAccountClassHash",
+                "udc_address": "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf",
+                "fee_token": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+                "max_fee_fri": "200000000000000000"
+            }
+        },
+        "vault_id": "12",
+        "asset_id": "ETH",
+        "algo": "ecdsa_secp256k1",
+        "allowed_targets": [
+            "0x033068F6539f8e6e6b131e6B2B814e6c34A5224bC66947c47DaB9dFeE93b35fb"
+        ],
+        "allowed_entrypoints": [
+            "transfer",
+            "approve"
+        ],
+        "enabled_for_claims": true
+    },
+    {
+        "chain": "SOLANA",
+        "family": "solana",
+        "vault_id": "13",
+        "asset_id": "SOL",
+        "algo": "ed25519",
+        "allowed_targets": [
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        ],
+        "enabled_for_claims": true
+    }
+]

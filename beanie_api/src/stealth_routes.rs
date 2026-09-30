@@ -1,45 +1,65 @@
-// stealth_route.rs
+// stealth_routes.rs
 //
-// The stealth private key signature (`client_sig`) is produced entirely on
-// the client, over `tx_hash`, before this ever gets called — that's the
-// actual on-chain spend authorization. This route does NOT re-derive that
-// signature or hold any spending key. Its job:
+// POST /api/v1/stealth/claim
+//
+// The stealth private key signature (`client_sig`) is produced entirely on the
+// client, over the chain's signing hash, before this is called. That is the
+// actual on-chain spend authorization. This route holds no spending key.
+// Its job:
 //
 //   1. Prove a verified passkey session authorized *this exact* claim
-//      (chain + derived_address + tx_hash) — anti-abuse / anti-DoS gate,
-//      not the on-chain authorization.
-//   2. Where possible, recompute tx_hash from the submitted `calls` and
-//      chain identity, and reject if the client's tx_hash doesn't match —
-//      otherwise a client could sign one thing and submit calls for
-//      another. Done for EVM below. Starknet is a documented TODO (see
-//      below) pending the account contract's calldata layout.
-//   3. Enqueue for the worker, which does the actual TEE co-sign + relay.
+//      (chain + derived_address + tx_hash): anti-abuse gate, not the on-chain
+//      authorization.
+//   2. Canonicalize inputs by chain FAMILY (from the registry, not a hardcoded
+//      `match chain`).
+//   3. Run `stealth_workers::precheck`, the same function the worker runs. It
+//      recomputes the signing hash from the submitted calls (EVM userOpHash,
+//      Starknet invoke-v3 hash, Solana sha256(message)), enforces allowlists,
+//      and verifies the client signature where it can, so a bad claim gets a
+//      400 now instead of a silent worker failure later.
+//   4. Rate limit, then enqueue for the worker (Fireblocks co-sign + relay).
 //
-// route name: `/api/v1/stealth/claim` (settled — this file, main.rs must
-// register it under that path, not `/execute`).
+// What `tx_hash` means per family (dictated by the account contracts):
+//   EVM       ERC-4337 v0.7 userOpHash. Client signs EIP-191(userOpHash).
+//   Starknet  native INVOKE V3 transaction hash.
+//   Solana    sha256(message_bytes).
 
-use anyhow::Error;
 use axum::{
     Json,
     extract::{ConnectInfo, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use ethers::{
-    abi::{Token, encode},
-    utils::keccak256,
-};
 use serde::{Deserialize, Serialize};
+use solana_sdk::{pubkey::Pubkey, signature::Signer};
+use starknet::core::types::Felt;
+use std::str::FromStr;
 
-use crate::models::{AppState, Chain, SocketAddr, StealthTask, err};
+use crate::models::{AppState, Chain, SocketAddr, StealthTask, err, mpsc};
+use crate::stealth_workers::{FamilyRt, precheck};
 
 const MAX_CALLS: usize = 20;
 const MAX_CALLDATA_ITEMS: usize = 256;
+const MAX_WORD_HEX: usize = 66; // 0x + 64
+const MAX_SOLANA_MESSAGE: usize = 1232;
 
+// ---------- Request types (shared with the worker) ----------
+
+/// Untagged so the existing client payload `{ "r1": .., "s1": .. }` still parses.
+/// `v` is optional: if the client sends none (or a hardcoded 27) the worker
+/// resolves the parity in preflight.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ClientSignature {
-    pub r1: String,
-    pub s1: String,
+#[serde(untagged)]
+pub enum ClientSignature {
+    Ecdsa {
+        r1: String,
+        s1: String,
+        #[serde(default)]
+        v: Option<u8>,
+    },
+    Ed25519 {
+        sig_hex: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -49,14 +69,60 @@ pub struct CallDataPayload {
     pub calldata: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ResourceBoundParam {
+    pub max_amount: String,
+    pub max_price_per_unit: String,
+}
+
+fn zero() -> String {
+    "0".to_string()
+}
+
+/// Starknet only: everything the invoke-v3 hash depends on besides the calls.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StarknetTxParams {
+    /// STARK pubkey (felt) the account was created with.
+    pub client_pubkey: String,
+    /// Salt used for the counterfactual address (deployer = 0, via UDC).
+    pub deploy_salt: String,
+    pub nonce: String,
+    #[serde(default = "zero")]
+    pub tip: String,
+    pub l1_gas: ResourceBoundParam,
+    pub l2_gas: ResourceBoundParam,
+    pub l1_data_gas: ResourceBoundParam,
+}
+
+/// EVM only (USDC EIP-3009): parameters signed by client for TransferWithAuthorization.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Auth3009Params {
+    pub client: String,
+    pub to: String,
+    pub value: String,
+    pub valid_after: String,
+    pub valid_before: String,
+    pub nonce: String,
+    pub salt: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClaimRequest {
     pub chain: Chain,
     pub tx_hash: String,
     pub derived_address: String,
     pub client_sig: ClientSignature,
+    /// EVM/Starknet: the calls. Solana: ignored (send `[]`).
+    #[serde(default)]
     pub calls: Vec<CallDataPayload>,
     pub verified_token: String,
+    #[serde(default)]
+    pub auth3009: Option<Auth3009Params>,
+    #[serde(default)]
+    pub starknet: Option<StarknetTxParams>,
+    /// Solana: hex of the canonically serialized legacy Message.
+    #[serde(default)]
+    pub message_bytes: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,13 +134,59 @@ pub struct ClaimResponse {
 
 // ---------- Sanitizers ----------
 
+fn bad(msg: impl AsRef<str>) -> Response {
+    err(StatusCode::BAD_REQUEST, msg.as_ref())
+}
+
+fn cap(name: &str, s: &str, max: usize) -> Result<(), String> {
+    if s.len() > max {
+        return Err(format!("{name} is too long"));
+    }
+    Ok(())
+}
+
+fn is_hex_word(s: &str) -> bool {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    !t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn sanitize_client_sig(sig: &ClientSignature) -> Result<ClientSignature, String> {
+    match sig {
+        ClientSignature::Ecdsa { r1, s1, v } => {
+            if !is_hex_word(r1) {
+                return Err("Invalid client_sig.r1: expected up to 64 hex chars".into());
+            }
+            if !is_hex_word(s1) {
+                return Err("Invalid client_sig.s1: expected up to 64 hex chars".into());
+            }
+            Ok(ClientSignature::Ecdsa {
+                r1: r1.trim().to_string(),
+                s1: s1.trim().to_string(),
+                v: *v,
+            })
+        }
+        ClientSignature::Ed25519 { sig_hex } => {
+            let s = sig_hex.trim();
+            if s.len() != 128 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("Invalid client_sig.sig_hex: expected 128 hex chars".into());
+            }
+            Ok(ClientSignature::Ed25519 {
+                sig_hex: s.to_string(),
+            })
+        }
+    }
+}
+
 fn parse_and_sanitize_felt(input: &str) -> Result<String, &'static str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("Value cannot be empty");
     }
-    let felt = starknet::core::types::Felt::from_hex(trimmed)
-        .map_err(|_| "Invalid Starknet Felt hex string")?;
+    let felt = Felt::from_hex(trimmed).map_err(|_| "Invalid Starknet Felt hex string")?;
     Ok(format!("{:#064x}", felt))
 }
 
@@ -89,22 +201,166 @@ fn parse_and_sanitize_evm_addr(input: &str) -> Result<String, &'static str> {
     Ok(format!("{:#x}", addr))
 }
 
-fn sanitize_opaque_identifier(
-    input: &str,
-    min_len: usize,
-    max_len: usize,
-) -> Result<String, &'static str> {
-    let trimmed = input.trim();
-    if trimmed.len() < min_len || trimmed.len() > max_len {
-        return Err("Identifier string out of acceptable length bounds");
+/// Strict 32-byte hex -> canonical lowercase `0x` + 64 hex.
+fn canon_hash32(input: &str) -> Result<String, &'static str> {
+    let t = input.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    if t.len() != 64 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("expected a 32-byte hex hash");
     }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=' || c == '+')
-    {
-        return Err("Identifier contains invalid characters");
+    Ok(format!("0x{}", t.to_lowercase()))
+}
+
+struct Canon {
+    derived: String,
+    tx_hash: String,
+    calls: Vec<CallDataPayload>,
+    message_bytes: Option<Vec<u8>>,
+}
+
+fn canonicalize_calls(
+    fam: &FamilyRt,
+    calls: Vec<CallDataPayload>,
+) -> Result<Vec<CallDataPayload>, String> {
+    let mut out = Vec::with_capacity(calls.len());
+    for (idx, call) in calls.into_iter().enumerate() {
+        if call.calldata.len() > MAX_CALLDATA_ITEMS {
+            return Err(format!(
+                "Call at index {idx} exceeds maximum calldata items limit ({MAX_CALLDATA_ITEMS})"
+            ));
+        }
+        let entrypoint = call.entrypoint.trim().to_string();
+        let (contract, calldata) = match fam {
+            FamilyRt::Starknet(_) => {
+                if entrypoint.is_empty() {
+                    return Err(format!("Empty entrypoint at call {idx}"));
+                }
+                let contract = parse_and_sanitize_felt(&call.contract_address)
+                    .map_err(|e| format!("Invalid contract_address at call {idx}: {e}"))?;
+                let mut cd = Vec::with_capacity(call.calldata.len());
+                for (cd_idx, item) in call.calldata.iter().enumerate() {
+                    cd.push(parse_and_sanitize_felt(item).map_err(|e| {
+                        format!("Invalid calldata item at call {idx}, index {cd_idx}: {e}")
+                    })?);
+                }
+                (contract, cd)
+            }
+            FamilyRt::Evm(_) => {
+                let contract = parse_and_sanitize_evm_addr(&call.contract_address)
+                    .map_err(|e| format!("Invalid contract_address at call {idx}: {e}"))?;
+                let cd = call.calldata.iter().map(|s| s.trim().to_string()).collect();
+                (contract, cd)
+            }
+            FamilyRt::Solana => return Err("Solana claims carry no `calls`".into()),
+        };
+        out.push(CallDataPayload {
+            contract_address: contract,
+            entrypoint,
+            calldata,
+        });
     }
-    Ok(trimmed.to_string())
+    Ok(out)
+}
+
+fn canonicalize(
+    fam: &FamilyRt,
+    derived: &str,
+    tx_hash: &str,
+    calls: Vec<CallDataPayload>,
+    message_hex: Option<&str>,
+) -> Result<Canon, String> {
+    match fam {
+        FamilyRt::Evm(_) => {
+            if calls.is_empty() || calls.len() > MAX_CALLS {
+                return Err(format!("`calls` must contain 1..={MAX_CALLS} items"));
+            }
+            Ok(Canon {
+                derived: parse_and_sanitize_evm_addr(derived)
+                    .map_err(|e| format!("Invalid derived_address: {e}"))?,
+                tx_hash: canon_hash32(tx_hash).map_err(|e| format!("Invalid tx_hash: {e}"))?,
+                calls: canonicalize_calls(fam, calls)?,
+                message_bytes: None,
+            })
+        }
+        FamilyRt::Starknet(_) => {
+            if calls.is_empty() || calls.len() > MAX_CALLS {
+                return Err(format!("`calls` must contain 1..={MAX_CALLS} items"));
+            }
+            Ok(Canon {
+                derived: parse_and_sanitize_felt(derived)
+                    .map_err(|e| format!("Invalid derived_address: {e}"))?,
+                tx_hash: parse_and_sanitize_felt(tx_hash)
+                    .map_err(|e| format!("Invalid tx_hash: {e}"))?,
+                calls: canonicalize_calls(fam, calls)?,
+                message_bytes: None,
+            })
+        }
+        FamilyRt::Solana => {
+            if !calls.is_empty() {
+                return Err("Solana claims carry no `calls`; send message_bytes".into());
+            }
+            let derived = Pubkey::from_str(derived.trim())
+                .map_err(|_| "Invalid derived_address: not a base58 pubkey".to_string())?
+                .to_string();
+            let hex_str = message_hex.ok_or("message_bytes is required for Solana")?;
+            cap("message_bytes", hex_str, 2 + 2 * MAX_SOLANA_MESSAGE)?;
+            let t = hex_str.trim();
+            let t = t
+                .strip_prefix("0x")
+                .or_else(|| t.strip_prefix("0X"))
+                .unwrap_or(t);
+            let bytes = hex::decode(t).map_err(|_| "message_bytes is not valid hex".to_string())?;
+            Ok(Canon {
+                derived,
+                tx_hash: canon_hash32(tx_hash).map_err(|e| format!("Invalid tx_hash: {e}"))?,
+                calls: vec![],
+                message_bytes: Some(bytes),
+            })
+        }
+    }
+}
+fn check_param_sizes(
+    req_auth3009: &Option<Auth3009Params>,
+    sn: &Option<StarknetTxParams>,
+) -> Result<(), String> {
+    if let Some(u) = req_auth3009 {
+        cap("auth3009.client", &u.client, MAX_WORD_HEX)?;
+        cap("auth3009.to", &u.to, MAX_WORD_HEX)?;
+        cap("auth3009.value", &u.value, MAX_WORD_HEX)?;
+        cap("auth3009.valid_after", &u.valid_after, MAX_WORD_HEX)?;
+        cap("auth3009.valid_before", &u.valid_before, MAX_WORD_HEX)?;
+        cap("auth3009.nonce", &u.nonce, MAX_WORD_HEX)?;
+        cap("auth3009.salt", &u.salt, MAX_WORD_HEX)?;
+    }
+    if let Some(s) = sn {
+        for (n, v) in [
+            ("starknet.client_pubkey", &s.client_pubkey),
+            ("starknet.deploy_salt", &s.deploy_salt),
+            ("starknet.nonce", &s.nonce),
+            ("starknet.tip", &s.tip),
+            ("starknet.l1_gas.max_amount", &s.l1_gas.max_amount),
+            (
+                "starknet.l1_gas.max_price_per_unit",
+                &s.l1_gas.max_price_per_unit,
+            ),
+            ("starknet.l2_gas.max_amount", &s.l2_gas.max_amount),
+            (
+                "starknet.l2_gas.max_price_per_unit",
+                &s.l2_gas.max_price_per_unit,
+            ),
+            ("starknet.l1_data_gas.max_amount", &s.l1_data_gas.max_amount),
+            (
+                "starknet.l1_data_gas.max_price_per_unit",
+                &s.l1_data_gas.max_price_per_unit,
+            ),
+        ] {
+            cap(n, v, MAX_WORD_HEX)?;
+        }
+    }
+    Ok(())
 }
 
 fn chain_tag(chain: &Chain) -> String {
@@ -114,74 +370,31 @@ fn chain_tag(chain: &Chain) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn evm_chain_id(chain: &Chain) -> Option<u64> {
-    match chain {
-        Chain::Base => Some(8453),
-        Chain::Ethereum => Some(1),
-        _ => None,
-    }
-}
-
-/// Recomputes the EVM sweep hash exactly as the client does, with chain_id
-/// bound into the preimage — a signature captured for Base can no longer be
-/// replayed on Ethereum (or vice versa) even if factory/token addresses
-/// ever collide across the two chains.
-fn recompute_evm_hash(
-    derived_address: &str,
-    contract_address: &str,
-    chain_id: u64,
-    calldata_hex: &str,
-) -> Result<String, &'static str> {
-    let addr_a: ethers::types::Address =
-        derived_address.parse().map_err(|_| "bad derived_address")?;
-    let addr_b: ethers::types::Address = contract_address
-        .parse()
-        .map_err(|_| "bad contract_address")?;
-    let calldata_bytes = hex::decode(calldata_hex.trim_start_matches("0x"))
-        .map_err(|_| "bad calldata hex encoding")?;
-
-    let encoded = encode(&[
-        Token::Address(addr_a),
-        Token::Address(addr_b),
-        Token::Uint(chain_id.into()),
-        Token::Bytes(calldata_bytes),
-    ]);
-
-    Ok(format!("0x{}", hex::encode(keccak256(encoded))))
-}
-
-// TODO(security, blocking before Starknet claims ship):
-// Recomputing the native Starknet invoke-transaction hash requires the
-// deployed account contract's exact `__execute__` calldata layout (the
-// SNIP-6 multicall encoding: call count, then per-call
-// [contract_address, selector, calldata_len, ...calldata]), plus the
-// account's current nonce and the network's chain_id felt. None of that is
-// available here without the Cairo contract source. Until this is wired
-// up, tx_hash is NOT independently verified against `calls` on Starknet —
-// the 2-of-2 TEE cosigner is the only backstop for that chain. Do not
-// treat this as "fixed" until this function actually recomputes and
-// compares the hash.
-#[allow(dead_code)]
-fn recompute_starknet_hash_todo() -> Result<String, Error> {
-    Ok("not implemented — see TODO above; blocked on account contract calldata layout".to_string())
-}
-
 pub async fn execute_stealth_claim(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<ClaimRequest>,
 ) -> Response {
-    // 1. Passkey verification, bound to exactly this claim.
+    let ClaimRequest {
+        chain,
+        tx_hash,
+        derived_address,
+        client_sig,
+        calls,
+        verified_token,
+        starknet,
+        message_bytes,
+        auth3009,
+    } = payload;
+
+    // 1. Passkey verification, bound to exactly this claim (raw, trimmed values).
     let binding = format!(
         "claim:{}:{}:{}",
-        chain_tag(&payload.chain),
-        payload.derived_address.trim(),
-        payload.tx_hash.trim()
+        chain_tag(&chain),
+        derived_address.trim(),
+        tx_hash.trim()
     );
-    let credential_id = match state
-        .auth
-        .consume_verified(&payload.verified_token, &binding)
-    {
+    let credential_id = match state.auth.consume_verified(&verified_token, &binding) {
         Some(id) => id,
         None => {
             return err(
@@ -191,229 +404,95 @@ pub async fn execute_stealth_claim(
         }
     };
 
-    // 2. Bounds checks (anti-DoS).
-    if payload.calls.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "The 'calls' array cannot be empty");
-    }
-    if payload.calls.len() > MAX_CALLS {
+    // 2. Chain resolution from the registry.
+    let rt = match state.stealth_chains.get(chain) {
+        Ok(rt) => rt,
+        Err(_) => {
+            return bad("Provided chain is not supported for stealth transactions");
+        }
+    };
+    if !rt.cfg.enabled_for_claims {
         return err(
-            StatusCode::BAD_REQUEST,
-            &format!("Exceeded maximum allowed calls count ({MAX_CALLS})"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Claims are currently disabled for this chain",
         );
     }
 
-    // 3. Sanitize signature fields.
-    let sanitized_r1 = match sanitize_opaque_identifier(&payload.client_sig.r1, 1, 130) {
-        Ok(v) => v,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid client_sig.r1: {e}"),
-            );
-        }
-    };
-    let sanitized_s1 = match sanitize_opaque_identifier(&payload.client_sig.s1, 1, 130) {
-        Ok(v) => v,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid client_sig.s1: {e}"),
-            );
-        }
+    // 3. Bounds + signature shape (anti-DoS).
+    if calls.len() > MAX_CALLS {
+        return bad(format!(
+            "Exceeded maximum allowed calls count ({MAX_CALLS})"
+        ));
+    }
+    if let Err(e) = check_param_sizes(&auth3009, &starknet) {
+        return bad(e);
+    }
+    let sanitized_sig = match sanitize_client_sig(&client_sig) {
+        Ok(s) => s,
+        Err(e) => return bad(e),
     };
 
-    // 4. Chain-specific address/hash canonicalization.
-    let (sanitized_derived_addr, sanitized_tx_hash) = match payload.chain {
-        Chain::Starknet => {
-            let a = match parse_and_sanitize_felt(&payload.derived_address) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid derived_address: {e}"),
-                    );
-                }
-            };
-            let t = match parse_and_sanitize_felt(&payload.tx_hash) {
-                Ok(v) => v,
-                Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid tx_hash: {e}")),
-            };
-            (a, t)
-        }
-        Chain::Base | Chain::Ethereum => {
-            let a = match parse_and_sanitize_evm_addr(&payload.derived_address) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid derived_address: {e}"),
-                    );
-                }
-            };
-            let t = match sanitize_opaque_identifier(&payload.tx_hash, 64, 66) {
-                Ok(v) => v,
-                Err(e) => return err(StatusCode::BAD_REQUEST, &format!("Invalid tx_hash: {e}")),
-            };
-            (a, t)
-        }
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "Provided chain is not supported for stealth transactions",
-            );
-        }
+    // 4. Canonicalize by family.
+    let canon = match canonicalize(
+        &rt.fam,
+        &derived_address,
+        &tx_hash,
+        calls,
+        message_bytes.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return bad(e),
     };
 
-    // 5. Sanitize each call.
-    let mut sanitized_calls = Vec::with_capacity(payload.calls.len());
-    for (idx, call) in payload.calls.into_iter().enumerate() {
-        if call.calldata.len() > MAX_CALLDATA_ITEMS {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "Call at index {idx} exceeds maximum calldata items limit ({MAX_CALLDATA_ITEMS})"
-                ),
-            );
-        }
+    // 5. Build the task and run the worker's own screening on it.
+    let task = StealthTask {
+        chain,
+        tx_hash: canon.tx_hash.clone(),
+        derived_address: canon.derived.clone(),
+        client_sig: sanitized_sig,
+        credential_id: credential_id.clone(),
+        calls: canon.calls,
+        auth3009,
+        starknet: match rt.fam {
+            FamilyRt::Starknet(_) => starknet,
+            _ => None,
+        },
+        message_bytes: canon.message_bytes,
+    };
 
-        let (contract, entrypoint, calldata) = match payload.chain {
-            Chain::Starknet => {
-                let contract = match parse_and_sanitize_felt(&call.contract_address) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return err(
-                            StatusCode::BAD_REQUEST,
-                            &format!("Invalid contract_address at call {idx}: {e}"),
-                        );
-                    }
-                };
-                let entrypoint = call.entrypoint.trim().to_string();
-                if entrypoint.is_empty() {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Empty entrypoint at call {idx}"),
-                    );
-                }
-                let mut cd = Vec::with_capacity(call.calldata.len());
-                for (cd_idx, item) in call.calldata.into_iter().enumerate() {
-                    match parse_and_sanitize_felt(&item) {
-                        Ok(v) => cd.push(v),
-                        Err(e) => {
-                            return err(
-                                StatusCode::BAD_REQUEST,
-                                &format!(
-                                    "Invalid calldata item at call {idx}, index {cd_idx}: {e}"
-                                ),
-                            );
-                        }
-                    }
-                }
-                (contract, entrypoint, cd)
-            }
-            Chain::Base | Chain::Ethereum => {
-                let contract = match parse_and_sanitize_evm_addr(&call.contract_address) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return err(
-                            StatusCode::BAD_REQUEST,
-                            &format!("Invalid contract_address at call {idx}: {e}"),
-                        );
-                    }
-                };
-                let entrypoint = call.entrypoint.trim().to_string();
-                if entrypoint.is_empty() {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Empty entrypoint at call {idx}"),
-                    );
-                }
-                let cd: Vec<String> = call
-                    .calldata
-                    .into_iter()
-                    .map(|s| s.trim().to_string())
-                    .collect();
-                (contract, entrypoint, cd)
-            }
-            _ => {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    "Provided chain is not supported for stealth transactions",
-                );
-            }
-        };
-
-        sanitized_calls.push(CallDataPayload {
-            contract_address: contract,
-            entrypoint,
-            calldata,
-        });
+    let relayer = state.solana_config.keeper_wallet.pubkey();
+    if let Err(e) = precheck(rt, &relayer, &task) {
+        return bad(format!("Claim rejected: {e:#}"));
     }
 
-    // 6. Chain-identity-bound hash verification — the actual replay fix.
-    match payload.chain {
-        Chain::Base | Chain::Ethereum => {
-            let chain_id = evm_chain_id(&payload.chain).unwrap();
-            let call = &sanitized_calls[0];
-            let calldata_hex = call.calldata.first().map(String::as_str).unwrap_or("0x");
-
-            match recompute_evm_hash(
-                &sanitized_derived_addr,
-                &call.contract_address,
-                chain_id,
-                calldata_hex,
-            ) {
-                Ok(expected) if expected.eq_ignore_ascii_case(&sanitized_tx_hash) => {}
-                Ok(_) => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        "tx_hash does not match submitted calls/chain_id — rejected as a possible replay",
-                    );
-                }
-                Err(e) => return err(StatusCode::BAD_REQUEST, e),
-            }
-        }
-        Chain::Starknet => {
-            // See TODO above `recompute_starknet_hash_todo`. Intentionally
-            // not verified here yet — flagging, not hiding.
-        }
-        _ => {}
-    }
-
-    // 7. Rate limit — single call site, proven credential_id.
+    // 6. Rate limit: single call site, proven credential_id.
     if let Err(msg) = state
         .limiter
-        .check(addr.ip(), &sanitized_derived_addr, &credential_id)
+        .check(addr.ip(), &canon.derived, &credential_id)
     {
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
-    // 8. Enqueue for the worker (TEE co-sign + gasless relay happens there).
-    let task = StealthTask {
-        chain: payload.chain,
-        tx_hash: sanitized_tx_hash.clone(),
-        derived_address: sanitized_derived_addr,
-        client_sig: ClientSignature {
-            r1: sanitized_r1,
-            s1: sanitized_s1,
-        },
-        credential_id,
-        calls: sanitized_calls,
-    };
-
-    if let Err(e) = state.stealth_tx.send(task).await {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to queue execution task: {e}"),
-        );
+    // 7. Enqueue for the worker (Fireblocks co-sign + relay happens there).
+    if let Err(e) = state.stealth_tx.try_send(task) {
+        return match e {
+            mpsc::error::TrySendError::Full(_) => err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Claim queue is full, retry shortly",
+            ),
+            mpsc::error::TrySendError::Closed(_) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Claim worker is not running",
+            ),
+        };
     }
 
     (
         StatusCode::ACCEPTED,
         Json(ClaimResponse {
             status: "queued".to_string(),
-            message: "Transaction payload validated and queued for co-signing and gasless relay."
-                .to_string(),
-            transaction_hash: sanitized_tx_hash,
+            message: "Claim validated and queued for co-signing and gasless relay.".to_string(),
+            transaction_hash: canon.tx_hash,
         }),
     )
         .into_response()
