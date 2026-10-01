@@ -1,155 +1,143 @@
 // stealth.core.js
 //
-// Canonical stealth-account derivation. This is the ONLY place chain
-// config (factory/entrypoint/class-hash/cosigner) and the HKDF-based
-// key-derivation math should live. Both the lane-creation path
-// (stealth.receiver.js, loaded on the main page) and the scan/claim UI
-// (stealth.js) import from here. Do not copy these values into another
-// file — two independently-maintained copies is exactly how a lane
-// created on one derivation gets scanned/claimed against a different
-// one and the funds become unrecoverable.
+// Canonical private-lane derivation. The ONLY place stealth account math
+// lives; lane creation (lane.js) and scan/claim (stealth.js) both use it.
+//
+// MODEL
+//   laneSalt(laneId)  = SHA-256("beanie-stealth-salt-v1:" + laneId)
+//   laneSecret        = passkey PRF(laneSalt)        (32 bytes, one per lane)
+//   spend key         = HKDF(laneSecret, chain + laneId + index) -> curve scalar
+//
+// Every lane has an independent secret, so exposing one lane's secret does not
+// expose another's. The salt is not secret; the authenticator holds the secret.
+// Lane ids are random (see generateLaneId) and are kept in the lane backup.
+//
+// One stealth account per lane, on the SETTLEMENT chain only. Other chains
+// reach it via CCTP.
+//
+// Chain parameters come from chains.js and are validated with stealthReady();
+// with placeholder config this module refuses to derive (fails closed) because
+// an address derived from dummy parameters cannot be recovered.
 
 import { ec as starkEc, CallData, hash } from "./starknet.js";
 import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.js";
+import { chainByKey, stealthReady } from "./chains.js";
 
-export const CHAINS = {
-  starknet: {
-    type: "starknet",
-    rpcUrl: "https://starknet.drpc.org",
-    tokenAddress: "0x33068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-    shieldedPoolAddress: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a", // Cannonical Privacy Pool Address
-    stealthAccountClassHash: "0x1764a400b3131c39a4ecb85199ac75ba2717c498d9a0245e932ec815674a003",
-    litCosignerPubKey: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
-    decimals: 6,
-  },
-  base: {
-    type: "evm",
-    chainId: 8453,
-    rpcUrl: "https://base-mainnet.org",
-    tokenAddress: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    factoryAddress: "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
-    entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-    litCosignerPubKey: "0x0000000000000000000000000000000000000000",
-    byteCodeHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-    decimals: 6,
-  },
-  ethereum: {
-    type: "evm",
-    chainId: 1,
-    rpcUrl: "https://eth.llamarpc.com",
-    tokenAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    factoryAddress: "0x0000000000000000000000000000000000000000",
-    entryPointAddress: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-    litCosignerPubKey: "0x0000000000000000000000000000000000000000",
-    byteCodeHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
-    decimals: 6,
-  },
-};
+const SECP256K1_ORDER = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+const enc = new TextEncoder();
 
-export const STARK_CURVE_ORDER = starkEc.starkCurve.CURVE.n;
-export const SECP256K1_ORDER = BigInt(
-  "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
-);
+export const bytesToHex = (bytes) =>
+  Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
-export function bytesToHex(bytes) {
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+/** Best-effort zeroing of secret material. */
+export function wipe(bytes) {
+  try {
+    if (bytes && typeof bytes.fill === "function") bytes.fill(0);
+  } catch {
+    /* ignore */
+  }
 }
 
-export function bytesToScalar(bytes, curveOrder) {
-  const n = BigInt("0x" + bytesToHex(bytes));
-  return n % curveOrder;
+export async function laneSalt(laneId) {
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(`beanie-stealth-salt-v1:${laneId}`));
+  return new Uint8Array(digest);
 }
 
-export async function hkdf(ikm, info) {
+/**
+ * Unguessable lane id: sha256(seed || 0x00 || 16 random bytes || timestamp).
+ * 69 chars, within the API's 1..128 limit.
+ */
+export async function generateLaneId(seed = "") {
+  const rand = crypto.getRandomValues(new Uint8Array(16));
+  const parts = [enc.encode(String(seed)), new Uint8Array([0]), rand, enc.encode(String(Date.now()))];
+  const buf = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) {
+    buf.set(p, off);
+    off += p.length;
+  }
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+  return `lane_${bytesToHex(digest)}`;
+}
+
+async function hkdf(ikm, info, length = 64) {
   const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode(info) },
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: enc.encode(info) },
     key,
-    256
+    length * 8
   );
   return new Uint8Array(bits);
 }
 
-/**
- * Resolves a chain reference to its canonical config. Accepts either a
- * plain string key ("base", "STARKNET", ...) or an object with a `.key`
- * field — but ALWAYS reads the actual chain parameters (factory,
- * cosigner, class hash, etc.) from this module's own CHAINS, never from
- * fields the caller might have attached to the object. That's what keeps
- * creation and scan/claim from ever disagreeing about an address.
- */
-export function resolveChainKey(chainKeyOrRef) {
-  const raw = typeof chainKeyOrRef === "string" ? chainKeyOrRef : chainKeyOrRef?.key;
-  const chainKey = String(raw || "").toLowerCase();
-  const chainConfig = CHAINS[chainKey];
-  if (!chainConfig) {
-    throw new Error(`stealth-core: unknown chain "${chainKey}"`);
+// 64 bytes reduced mod (n-1), +1: uniform enough (bias ~2^-256) and never zero.
+function bytesToScalar(bytes, order) {
+  return (BigInt(`0x${bytesToHex(bytes)}`) % (order - 1n)) + 1n;
+}
+
+function requireReady(chainKey) {
+  const chain = chainByKey(chainKey);
+  if (!chain) throw new Error(`Unknown chain "${chainKey}".`);
+  if (!stealthReady(chain)) {
+    throw new Error(`Private lanes are not enabled on ${chain.name} yet.`);
   }
-  return { chainKey, chainConfig };
+  return chain;
 }
 
-export async function deriveDeterministicStealthKey(beanMasterSecret, laneId, index, chainKeyOrRef) {
-  const { chainKey, chainConfig } = resolveChainKey(chainKeyOrRef);
-  const curveOrder = chainConfig.type === "starknet" ? STARK_CURVE_ORDER : SECP256K1_ORDER;
-  const spendMasterPriv = await hkdf(beanMasterSecret, `spend-v1:${chainKey}`);
-  const spendMasterScalar = bytesToScalar(spendMasterPriv, curveOrder);
-  const indexBytes = await hkdf(beanMasterSecret, `beanie-lane-index-v1:${laneId}:${chainKey}:${index}`);
-  const indexScalar = bytesToScalar(indexBytes, curveOrder);
-  return (spendMasterScalar + indexScalar) % curveOrder;
-}
+const feltHex = (v) => `0x${BigInt(v).toString(16).padStart(64, "0")}`;
 
-export async function deriveEvmCreate2Salt(beanMasterSecret, laneId, index, chainKeyOrRef) {
-  const { chainKey } = resolveChainKey(chainKeyOrRef);
-  const saltBytes = await hkdf(beanMasterSecret, `evm-create2-salt-v1:${laneId}:${chainKey}:${index}`);
-  return "0x" + bytesToHex(saltBytes);
-}
+async function derive(laneSecret, laneId, index, chainKey, withPrivate) {
+  if (!(laneSecret instanceof Uint8Array) || laneSecret.length < 32) {
+    throw new Error("Invalid lane secret.");
+  }
+  if (!Number.isInteger(index) || index < 0) throw new Error("Invalid derivation index.");
+  const chain = requireReady(chainKey);
+  const info = `beanie-spend-v1:${chain.key}:${laneId}:${index}`;
 
-export function deriveStarknetStealthAddress(clientPubKeyFelt, cosignerPubKeyFelt, classHash) {
-  return hash.calculateContractAddressFromHash(
-    clientPubKeyFelt,
-    classHash,
-    CallData.compile({ client_pubkey: clientPubKeyFelt, cosigner_pubkey: cosignerPubKeyFelt }),
-    0
-  );
-}
-
-export function deriveEvmStealthAddress(clientAddress, cosignerAddress, chainConfig, saltHex) {
-  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-  const constructorArgs = abiCoder.encode(
-    ["address", "address", "address"],
-    [chainConfig.entryPointAddress, clientAddress, cosignerAddress]
-  );
-  const salt = ethers.keccak256(saltHex);
-  const initCodeHash = ethers.keccak256(ethers.concat([chainConfig.byteCodeHash, constructorArgs]));
-  return ethers.getCreate2Address(chainConfig.factoryAddress, salt, initCodeHash);
-}
-
-/**
- * THE canonical (laneId, index, chain) -> (privScalar, address) mapping.
- * Creation, scanning, and claiming should all resolve accounts through
- * this single function rather than re-implementing the branch logic
- * locally, so there's no way for the three call sites to drift apart.
- */
-export async function deriveStealthAccount(masterSecret, laneId, index, chainKeyOrRef) {
-  const { chainKey, chainConfig } = resolveChainKey(chainKeyOrRef);
-  const stealthPrivScalar = await deriveDeterministicStealthKey(masterSecret, laneId, index, chainKey);
-
-  if (chainConfig.type === "starknet") {
-    const G = starkEc.starkCurve.ProjectivePoint.BASE;
-    const clientPoint = G.multiply(stealthPrivScalar);
-    const clientPubKeyFelt = "0x" + clientPoint.x.toString(16);
-    const address = deriveStarknetStealthAddress(
-      clientPubKeyFelt,
-      chainConfig.litCosignerPubKey,
-      chainConfig.stealthAccountClassHash
+  if (chain.kind === "starknet") {
+    const order = starkEc.starkCurve.CURVE.n;
+    const scalar = bytesToScalar(await hkdf(laneSecret, info), order);
+    const privateKey = `0x${scalar.toString(16).padStart(64, "0")}`;
+    const publicKey = starkEc.starkCurve.getStarkKey(privateKey);
+    const address = feltHex(
+      hash.calculateContractAddressFromHash(
+        publicKey,
+        chain.stealth.classHash,
+        CallData.compile({ client_pubkey: publicKey, cosigner_pubkey: chain.stealth.cosignerPubKey }),
+        0
+      )
     );
-    return { chainKey, chainConfig, stealthPrivScalar, address, clientPubKeyFelt };
+    return { chain: chain.key, kind: "starknet", address, publicKey, ...(withPrivate ? { privateKey } : {}) };
   }
 
-  const privKeyHex = "0x" + stealthPrivScalar.toString(16).padStart(64, "0");
-  const wallet = new ethers.Wallet(privKeyHex);
-  const clientAddress = wallet.address;
-  const saltHex = await deriveEvmCreate2Salt(masterSecret, laneId, index, chainKey);
-  const address = deriveEvmStealthAddress(clientAddress, chainConfig.litCosignerPubKey, chainConfig, saltHex);
-  return { chainKey, chainConfig, stealthPrivScalar, address, clientAddress };
+  if (chain.kind === "evm") {
+    const scalar = bytesToScalar(await hkdf(laneSecret, info), SECP256K1_ORDER);
+    const privateKey = `0x${scalar.toString(16).padStart(64, "0")}`;
+    const clientAddress = new ethers.Wallet(privateKey).address;
+    const salt = `0x${bytesToHex(await hkdf(laneSecret, `beanie-create2-salt-v1:${chain.key}:${laneId}:${index}`, 32))}`;
+
+    const ctorArgs = ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "address", "address"],
+      [chain.stealth.entryPoint, clientAddress, chain.stealth.cosigner]
+    );
+    const initCodeHash = ethers.keccak256(ethers.concat([chain.stealth.initCode, ctorArgs]));
+    const address = ethers.getCreate2Address(chain.stealth.factory, salt, initCodeHash).toLowerCase();
+    return {
+      chain: chain.key,
+      kind: "evm",
+      address,
+      publicKey: clientAddress.toLowerCase(),
+      ...(withPrivate ? { privateKey } : {}),
+    };
+  }
+
+  throw new Error(`Private lanes are not supported on ${chain.name}.`);
 }
+
+/** Public result only: { chain, kind, address, publicKey }. Safe to cache. */
+export const deriveStealthAddress = ({ laneSecret, laneId, index = 0, chain }) =>
+  derive(laneSecret, laneId, index, chain, false);
+
+/** As above plus `privateKey` (hex). Only for claiming; wipe/drop it after use. */
+export const deriveStealthSigner = ({ laneSecret, laneId, index = 0, chain }) =>
+  derive(laneSecret, laneId, index, chain, true);

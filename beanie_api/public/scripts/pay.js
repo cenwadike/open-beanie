@@ -1,827 +1,375 @@
-(() => {
-  "use strict";
+// pay.js  (load with <script type="module" src="/scripts/pay.js">)
+//
+// Payer-facing page. Shows the receiver addresses from the link, and offers a
+// gasless "Pay with Beanie" flow. It never asks the server for addresses.
+//
+// Link format (all public data):
+//   /pay?lane=<id>&target=<CHAIN>&merchant=<recipient>&r=<CHAIN>:<receiver>&r=...
 
-  const laneCard = document.querySelector("#laneCard");
-  const shareBtn = document.querySelector("#payShareBtn");
-  const toastStack = document.querySelector("#payToastStack");
+import * as api from "./api.js";
+import { CHAINS, KEEPER_STARKNET_ADDRESS, SOLANA_RECEIVER_KIND, USDC_DECIMALS, canGasless, chainIcon, wire } from "./chains.js";
+import { awaitSolanaSettlement, signEvmTransfer, signSolanaTransfer, signStarknetTransfer } from "./gasless.js";
+import { canonicalAddress } from "./identity.js";
+import { getLane } from "./store.js";
+import { copyText, describeError, escapeHtml, notify, parseDecimalToRawUnits } from "./ui.js";
 
-  const BEANIE_KEEPER_STARKNET_ADDRESS = "0x01d4a73b58909eb341e6357bd085fea917d71c386ebaecd770792f7b5a34615a"; // Beanie's own relayer account — set at build time
+const laneCard = document.querySelector("#laneCard");
+const shareBtn = document.querySelector("#payShareBtn");
 
-  const USDC_DECIMALS = 6;
+const poweredTag = (withEmbed) => `
+  <footer class="powered-tag-wrapper">
+    ${withEmbed
+    ? `<button type="button" class="embed-tag-btn" aria-label="Copy as widget" title="Copy as widget">
+             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="8 6 2 12 8 18"></polyline><polyline points="16 6 22 12 16 18"></polyline></svg>
+           </button>`
+    : ""
+  }
+    <div class="powered-tag" aria-label="Powered by Beanie">
+      <span class="powered-tag__label">powered by</span>
+      <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
+    </div>
+  </footer>`;
 
-  const CHAINS = {
-    BASE: {
-      name: "Base",
-      kind: "evm",
-      chainEnum: "BASE",
-      chainId: 8453,
-      usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    },
-    STARKNET: {
-      name: "Starknet",
-      kind: "starknet",
-      chainEnum: "STARKNET",
-      usdc: "0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-    },
-  };
+/* ---------- link parsing ---------- */
 
-  const chainIcons = {
-    BASE: `<svg viewBox="0 0 42 42" aria-hidden="true"><circle cx="21" cy="21" r="21" fill="#0052ff"/><path d="M21 32.8c6.52 0 11.8-5.28 11.8-11.8S27.52 9.2 21 9.2c-5.82 0-10.66 4.21-11.62 9.75h15.2v4.1H9.38C10.34 28.59 15.18 32.8 21 32.8Z" fill="#fff"/></svg>`,
-    STARKNET: `<svg viewBox="0 0 42 42" aria-hidden="true"><circle cx="21" cy="21" r="21" fill="#0c0c4d"/><path d="M21 8 32 21 21 34 10 21 21 8Z" fill="#ec796b"/></svg>`,
-  };
+function parseLink() {
+  const params = new URLSearchParams(window.location.search);
+  const laneId = params.get("lane") || "";
 
-  const poweredTagHtml = `
-    <footer class="powered-tag-wrapper">
-      <div class="powered-tag" aria-label="Powered by Beanie">
-        <span class="powered-tag__label">powered by</span>
-        <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
-      </div>
-    </footer>
-  `;
+  let routes = params
+    .getAll("r")
+    .map((pair) => {
+      const i = pair.indexOf(":");
+      if (i === -1) return null;
+      const chain = wire(pair.slice(0, i));
+      const address = canonicalAddress(chain, pair.slice(i + 1));
+      return CHAINS[chain] && address ? { chain, address } : null;
+    })
+    .filter(Boolean);
 
-  const embedIconSvg = `
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
-      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <polyline points="8 6 2 12 8 18"></polyline>
-      <polyline points="16 6 22 12 16 18"></polyline>
-    </svg>
-  `;
+  let target = wire(params.get("target"));
+  let merchant = params.get("merchant") || "";
 
-  // Same footer as poweredTagHtml, plus a "get embed code" icon button.
-  // Only used where `routes` actually exist — never on error states.
-  const poweredTagWithEmbedHtml = `
-    <footer class="powered-tag-wrapper">
-      <button type="button" class="embed-tag-btn" aria-label="Copy as widget" title="Copy as widget">
-        ${embedIconSvg}
-      </button>
-      <div class="powered-tag" aria-label="Powered by Beanie">
-        <span class="powered-tag__label">powered by</span>
-        <span class="powered-tag__mark">bean<span class="powered-tag__dot">:</span>ie</span>
-      </div>
-    </footer>
-  `;
-
-  // --- Embed code: built entirely from what this exact page already knows —
-  // its own origin, its own routes, its own current theme. Nothing to re-enter.
-  function rgbVarToHex(varName, fallback) {
-    const raw = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-    const parts = raw.split(",").map((n) => parseInt(n.trim(), 10));
-    if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return fallback;
-    return "#" + parts.map((n) => n.toString(16).padStart(2, "0")).join("");
+  // Merchant's own browser only: fall back to the locally stored lane.
+  if (!routes.length && laneId) {
+    const lane = getLane(laneId);
+    if (lane && !lane.needsVerify) {
+      routes = lane.receivers.map((r) => ({ chain: r.chain, address: r.address }));
+      target = target || lane.targetChain;
+      merchant = merchant || lane.targetRecipient;
+    }
   }
 
-  function buildEmbedSnippet(routes) {
-    const params = new URLSearchParams(window.location.search);
-    const attrs = [];
+  if (!CHAINS[target]) target = "";
+  if (target && !canonicalAddress(target, merchant)) merchant = "";
+  return { params, laneId, routes, target, merchant };
+}
 
-    // 1. Always include data-lane if available
-    const lane = params.get("lane");
-    if (lane) {
-      attrs.push(["data-lane", lane]);
-    }
+/* ---------- theming + embed ---------- */
 
-    // 2. Always pass the explicit routes so external sites don't rely on local storage/DB lookup
-    if (routes.length > 0) {
-      attrs.push(["data-routes", routes.map((r) => `${r.chain.toUpperCase()}:${r.address}`).join(",")]);
-    }
+function applyTheme(params) {
+  const toRgb = (input) => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(input || "");
+    return m ? [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16)).join(", ") : null;
+  };
+  const primary = toRgb(params.get("primaryColor"));
+  if (primary) document.documentElement.style.setProperty("--primary-rgb", primary);
+  const secondary = toRgb(params.get("secondaryColor"));
+  if (secondary) document.documentElement.style.setProperty("--secondary-rgb", secondary);
+}
 
-    // 3. Keep current colors
-    attrs.push(["data-primary-color", rgbVarToHex("--primary-rgb", "#b8c99a")]);
-    attrs.push(["data-secondary-color", rgbVarToHex("--secondary-rgb", "#6248b0")]);
+function rgbVarToHex(name, fallback) {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const parts = raw.split(",").map((n) => parseInt(n.trim(), 10));
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return fallback;
+  return "#" + parts.map((n) => n.toString(16).padStart(2, "0")).join("");
+}
 
-    const attrLines = attrs.map(([k, v]) => `  ${k}="${v}"`).join("\n");
-    return `<div\n  data-beanie-checkout\n${attrLines}\n></div>\n<script src="${window.location.origin}/embed.js"></script>`;
-  }
+function buildEmbedSnippet(link) {
+  const attrs = [];
+  if (link.laneId) attrs.push(["data-lane", link.laneId]);
+  attrs.push(["data-routes", link.routes.map((r) => `${r.chain}:${r.address}`).join(",")]);
+  if (link.target) attrs.push(["data-target", link.target]);
+  if (link.merchant) attrs.push(["data-merchant", link.merchant]);
+  attrs.push(["data-primary-color", rgbVarToHex("--primary-rgb", "#b8c99a")]);
+  attrs.push(["data-secondary-color", rgbVarToHex("--secondary-rgb", "#6248b0")]);
+  const lines = attrs.map(([k, v]) => `  ${k}="${String(v).replace(/"/g, "&quot;")}"`).join("\n");
+  return `<div\n  data-beanie-checkout\n${lines}\n></div>\n<script src="${window.location.origin}/embed.js"></script>`;
+}
 
-  function ensureEmbedOverlay() {
-    let overlay = document.getElementById("embedOverlay");
-    if (overlay) return overlay;
-
+function openEmbedOverlay(link) {
+  let overlay = document.getElementById("embedOverlay");
+  if (!overlay) {
     overlay = document.createElement("div");
     overlay.id = "embedOverlay";
     overlay.className = "embed-overlay";
     overlay.hidden = true;
     overlay.innerHTML = `
       <div class="embed-modal" role="dialog" aria-modal="true" aria-label="Copy as widget">
-        <div class="embed-modal-head">
-          <strong>Copy as widget</strong>
-          <button type="button" class="embed-close" aria-label="Close">×</button>
-        </div>
+        <div class="embed-modal-head"><strong>Copy as widget</strong>
+          <button type="button" class="embed-close" aria-label="Close">×</button></div>
         <pre class="embed-snippet" id="embedSnippetText"></pre>
         <button type="button" class="copy-btn" id="embedCopyBtn">Copy</button>
         <p class="status-hint">Uses the routing and colors you're viewing right now.</p>
-      </div>
-    `;
+      </div>`;
     document.body.append(overlay);
-
-    const close = () => { overlay.hidden = true; };
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    const close = () => (overlay.hidden = true);
+    overlay.addEventListener("click", (e) => e.target === overlay && close());
     overlay.querySelector(".embed-close").addEventListener("click", close);
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !overlay.hidden) close();
-    });
-
-    return overlay;
+    document.addEventListener("keydown", (e) => e.key === "Escape" && !overlay.hidden && close());
   }
-
-  function openEmbedOverlay(routes) {
-    const overlay = ensureEmbedOverlay();
-    const snippet = buildEmbedSnippet(routes);
-    overlay.querySelector("#embedSnippetText").textContent = snippet;
-
-    const copyBtn = overlay.querySelector("#embedCopyBtn");
-    copyBtn.textContent = "Copy";
-    copyBtn.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(snippet);
-        copyBtn.textContent = "Copied";
-        notify("Widget copied to clipboard");
-      } catch {
-        notify("Failed to copy widget");
-        return;
-      }
-      setTimeout(() => { overlay.hidden = true; }, 500);
-    };
-
-    overlay.hidden = false;
-  }
-
-  // Embed theming: ?primaryColor=RRGGBB&secondaryColor=RRGGBB (# optional).
-  // Anything else invalid is ignored and the built-in default theme is kept.
-  function applyEmbedTheme() {
-    const params = new URLSearchParams(window.location.search);
-    const HEX = /^#?([0-9a-f]{6})$/i;
-
-    const toRgb = (input) => {
-      const match = HEX.exec(input || "");
-      if (!match) return null;
-      const hex = match[1];
-      return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(", ");
-    };
-
-    const primaryRgb = toRgb(params.get("primaryColor"));
-    if (primaryRgb) document.documentElement.style.setProperty("--primary-rgb", primaryRgb);
-
-    const secondaryRgb = toRgb(params.get("secondaryColor"));
-    if (secondaryRgb) document.documentElement.style.setProperty("--secondary-rgb", secondaryRgb);
-  }
-
-  function bytesToHex(bytes) {
-    return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  function escapeHtml(value) {
-    return String(value ?? "").replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
-    }[c]));
-  }
-
-  function notify(message) {
-    if (!toastStack) return;
-    const toast = document.createElement("div");
-    toast.className = "live-toast";
-    toast.textContent = message;
-    toastStack.append(toast);
-    setTimeout(() => toast.remove(), 3000);
-  }
-
-  // Converts a user-typed decimal string (e.g. "12.5") into raw base units
-  // (e.g. "12500000" for 6-decimal USDC) WITHOUT going through floating point,
-  // so values like 0.1 or 19.99 can't get mangled by binary float rounding.
-  // Returns null if the string isn't a valid, non-negative, non-zero amount
-  // with at most `decimals` fractional digits.
-  function parseDecimalToRawUnits(input, decimals) {
-    if (typeof input !== "string") return null;
-    const trimmed = input.trim();
-    if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
-
-    const [wholePart, fractionalPart = ""] = trimmed.split(".");
-    if (fractionalPart.length > decimals) return null; // too many decimal places
-
-    const paddedFraction = fractionalPart.padEnd(decimals, "0");
-    const rawString = `${wholePart}${paddedFraction}`.replace(/^0+(?=\d)/, "");
-
-    let rawValue;
-    try {
-      rawValue = BigInt(rawString || "0");
-    } catch {
-      return null;
+  const snippet = buildEmbedSnippet(link);
+  overlay.querySelector("#embedSnippetText").textContent = snippet;
+  const copyBtn = overlay.querySelector("#embedCopyBtn");
+  copyBtn.textContent = "Copy";
+  copyBtn.onclick = async () => {
+    if (await copyText(snippet, "Widget copied to clipboard")) {
+      copyBtn.textContent = "Copied";
+      setTimeout(() => (overlay.hidden = true), 500);
     }
-
-    if (rawValue <= 0n) return null;
-    return rawValue.toString();
-  }
-
-  async function resolveRoutes() {
-    const params = new URLSearchParams(window.location.search);
-
-    const directRoutes = params.getAll("r")
-      .map((pair) => {
-        const colonIndex = pair.indexOf(":");
-        if (colonIndex === -1) return null;
-        return { chain: pair.slice(0, colonIndex).toUpperCase(), address: pair.slice(colonIndex + 1) };
-      })
-      .filter((route) => route && CHAINS[route.chain] && route.address);
-    if (directRoutes.length) return directRoutes;
-
-    const singleChain = (params.get("chain") || "").toUpperCase();
-    const singleAddress = params.get("address") || "";
-    if (CHAINS[singleChain] && singleAddress) return [{ chain: singleChain, address: singleAddress }];
-
-    const laneId = params.get("lane") || window.location.pathname.split("/").pop();
-    if (laneId && laneId !== "pay") {
-      try {
-        const localLanes = JSON.parse(localStorage.getItem("beanie.lanes.v1") || "[]");
-        const foundLane = localLanes.find((l) => l.id === laneId);
-        if (foundLane && Array.isArray(foundLane.receivers)) {
-          const routes = foundLane.receivers
-            .map((r) => ({ chain: (r.chain || "").toUpperCase(), address: r.address || "" }))
-            .filter((r) => CHAINS[r.chain] && r.address);
-          if (routes.length) return routes;
-        }
-      } catch {
-        // no local record on this browser — expected for anyone but the merchant
-        // who created the lane; not an error, just fall through.
-      }
-    }
-
-    return [];
-  }
-
-  // --- Base: sign an EIP-3009 transferWithAuthorization ----------------------
-  function usdcDomainBase() {
-    return { name: "USD Coin", version: "2", chainId: CHAINS.BASE.chainId, verifyingContract: CHAINS.BASE.usdc };
-  }
-
-  async function ensureBaseChain() {
-    const BASE_HEX = "0x2105"; // 8453
-    try {
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: BASE_HEX }],
-      });
-    } catch (err) {
-      // 4902 = chain not added to the wallet yet
-      if (err.code === 4902) {
-        await window.ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [{
-            chainId: BASE_HEX,
-            chainName: "Base",
-            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-            rpcUrls: ["https://base.org"],
-            blockExplorerUrls: ["https://basescan.org"],
-          }],
-        });
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  async function prepareEvmSignedTransfer(receiverAddress, amountRaw) {
-    if (!window.ethereum) throw new Error("No EVM wallet detected.");
-    const [fromAddress] = await window.ethereum.request({ method: "eth_requestAccounts" });
-    await ensureBaseChain();
-
-    const nonce = "0x" + bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
-    const validAfter = 0;
-    const validBefore = Math.floor(Date.now() / 1000) + 600; // 10 minutes
-
-    const message = { from: fromAddress, to: receiverAddress, value: amountRaw, validAfter, validBefore, nonce };
-
-    const typedData = {
-      types: {
-        EIP712Domain: [
-          { name: "name", type: "string" },
-          { name: "version", type: "string" },
-          { name: "chainId", type: "uint256" },
-          { name: "verifyingContract", type: "address" },
-        ],
-        TransferWithAuthorization: [
-          { name: "from", type: "address" },
-          { name: "to", type: "address" },
-          { name: "value", type: "uint256" },
-          { name: "validAfter", type: "uint256" },
-          { name: "validBefore", type: "uint256" },
-          { name: "nonce", type: "bytes32" },
-        ],
-      },
-      domain: usdcDomainBase(),
-      primaryType: "TransferWithAuthorization",
-      message,
-    };
-
-    const signature = await window.ethereum.request({
-      method: "eth_signTypedData_v4",
-      params: [fromAddress, JSON.stringify(typedData)],
-    });
-
-    return { kind: "evm", ...message, signature };
-  }
-
-  // --- Starknet Type Definitions and Utility Helpers -------------------------
-  const typesRev0 = {
-    StarkNetDomain: [
-      { name: "name", type: "felt" },
-      { name: "version", type: "felt" },
-      { name: "chainId", type: "felt" },
-    ],
-    OutsideExecution: [
-      { name: "caller", type: "felt" },
-      { name: "nonce", type: "felt" },
-      { name: "execute_after", type: "felt" },
-      { name: "execute_before", type: "felt" },
-      { name: "calls_len", type: "felt" },
-      { name: "calls", type: "OutsideCall*" },
-    ],
-    OutsideCall: [
-      { name: "to", type: "felt" },
-      { name: "selector", type: "felt" },
-      { name: "calldata_len", type: "felt" },
-      { name: "calldata", type: "felt*" },
-    ],
   };
+  overlay.hidden = false;
+}
 
-  const typesRev1 = {
-    StarknetDomain: [
-      { name: "name", type: "shortstring" },
-      { name: "version", type: "shortstring" },
-      { name: "chainId", type: "shortstring" },
-      { name: "revision", type: "shortstring" },
-    ],
-    OutsideExecution: [
-      { name: "Caller", type: "ContractAddress" },
-      { name: "Nonce", type: "felt" },
-      { name: "Execute After", type: "u128" },
-      { name: "Execute Before", type: "u128" },
-      { name: "Calls", type: "Call*" },
-    ],
-    Call: [
-      { name: "To", type: "ContractAddress" },
-      { name: "Selector", type: "selector" },
-      { name: "Calldata", type: "felt*" },
-    ],
-  };
+/* ---------- QR (generated locally: the address never goes to a third party) ---------- */
 
-  function getDomain(chainId, version) {
-    if (version === "2") {
-      // WARNING! Version and revision are encoded as numbers in the StarkNetDomain type 
-      // and not as shortstring due to a legacy bug kept for compatibility.
-      return {
-        name: "Account.execute_from_outside",
-        version: "2",
-        chainId: chainId,
-        revision: "1",
-      };
-    }
-    return {
-      name: "Account.execute_from_outside",
-      version: "1",
-      chainId: chainId,
-    };
-  }
-
-  function getOutsideCall(call, hashModule) {
-    return {
-      to: call.contractAddress,
-      selector: hashModule.getSelectorFromName(call.entrypoint),
-      calldata: call.calldata ?? [],
-    };
-  }
-
-  function getTypedData(outsideExecution, chainId, version) {
-    if (version === "2") {
-      return {
-        types: typesRev1,
-        primaryType: "OutsideExecution",
-        domain: getDomain(chainId, version),
-        message: {
-          // MUST match the capitalized casing defined in typesRev1
-          Caller: outsideExecution.caller,
-          Nonce: outsideExecution.nonce,
-          "Execute After": outsideExecution.execute_after,
-          "Execute Before": outsideExecution.execute_before,
-          Calls: outsideExecution.calls.map((call) => ({
-            To: call.to,
-            Selector: call.selector,
-            Calldata: call.calldata,
-          })),
-        },
-      };
-    }
-
-    return {
-      types: typesRev0,
-      primaryType: "OutsideExecution",
-      domain: getDomain(chainId, version),
-      message: {
-        ...outsideExecution,
-        calls_len: outsideExecution.calls.length,
-        calls: outsideExecution.calls.map((call) => ({
-          ...call,
-          calldata_len: call.calldata.length,
-          calldata: call.calldata,
-        })),
-      },
-    };
-  }
-
-  // --- Starknet: sign sponsored external call -------------------------
-  // Official SNIP-9 interface IDs:
-  const SNIP9_V1_INTERFACE_ID = "0x68cfd18b92d1907b8ba3cc324900277f5a3622099431ea85dd8089255e4181";
-  const SNIP9_V2_INTERFACE_ID = "0x1d1144bb2138366ff28d8e9ab57456b1d332ac42196230c3a602003c89872";
-  function randomNonceHex() {
-    // 31 bytes → max 2^248 - 1, safely inside the felt range [0, 2^251)
-    const nonceBytes = crypto.getRandomValues(new Uint8Array(31));
-    return (
-      "0x" +
-      Array.from(nonceBytes)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("")
-    );
-  }
-
-  // Prefer the wallet's own native context provider to bypass browser localhost CORS restrictions.
-  async function starknetCallContract(starknetWindow, call) {
-    // 1. Check if the active connected account instance can handle the call directly
-    if (starknetWindow.account && typeof starknetWindow.account.callContract === "function") {
-      return starknetWindow.account.callContract(call);
-    }
-    // 2. Fall back to the unified base provider instance provided by the extension window
-    if (starknetWindow.provider && typeof starknetWindow.provider.callContract === "function") {
-      return starknetWindow.provider.callContract(call);
-    }
-    throw new Error("No valid wallet call provider interface found.");
-  }
-
-  async function detectSnip9Version(address, starknetWindow) {
-    // Look for V2 version implementation first
-    try {
-      const v2 = await starknetCallContract(starknetWindow, {
-        contractAddress: address,
-        entrypoint: "supports_interface",
-        calldata: [SNIP9_V2_INTERFACE_ID],
-      });
-      if (v2 && v2.result && BigInt(v2.result[0]) !== 0n) return "2";
-      if (Array.isArray(v2) && BigInt(v2[0]) !== 0n) return "2";
-    } catch (e) {
-      console.warn("[beanie] Wallet skipped V2 detection checkout:", e.message || e);
-    }
-
-    // Look for V1 version implementation fallback
-    try {
-      const v1 = await starknetCallContract(starknetWindow, {
-        contractAddress: address,
-        entrypoint: "supports_interface",
-        calldata: [SNIP9_V1_INTERFACE_ID],
-      });
-      if (v1 && v1.result && BigInt(v1.result[0]) !== 0n) return "1";
-      if (Array.isArray(v1) && BigInt(v1[0]) !== 0n) return "1";
-    } catch (e) {
-      console.warn("[beanie] Wallet skipped V1 detection checkout:", e.message || e);
-    }
-
-    // Default to version 2 (Standard Argent/Braavos current spec) if checks are blocked
-    return "2";
-  }
-
-  async function prepareStarknetSignedCall(receiverAddress, amountRaw) {
-    const {
-      CallData,
-      validateAndParseAddress,
-      cairo,
-      hash, // getSelectorFromName lives here in starknet.js
-    } = await import("/scripts/starknet.js");
-    const starknetWindow =
-      window.starknet || window.starknet_argentX || window.starknet_braavos;
-    if (!starknetWindow) throw new Error("No Starknet wallet detected.");
-    if (!starknetWindow.isConnected) await starknetWindow.enable();
-    const rawUserAddress =
-      starknetWindow.selectedAddress ||
-      starknetWindow.account?.address;
-    if (!rawUserAddress) throw new Error("Could not resolve Starknet account address.");
-    if (!BEANIE_KEEPER_STARKNET_ADDRESS || BEANIE_KEEPER_STARKNET_ADDRESS.startsWith("0x0....")) {
-      throw new Error("BEANIE_KEEPER_STARKNET_ADDRESS is not configured");
-    }
-    const userAddress = validateAndParseAddress(rawUserAddress);
-    const receiver = validateAndParseAddress(receiverAddress);
-    const usdc = validateAndParseAddress(CHAINS.STARKNET.usdc);
-    const caller = validateAndParseAddress(BEANIE_KEEPER_STARKNET_ADDRESS);
-    const nowSec = Math.floor(Date.now() / 1000);
-    const nonceHex = randomNonceHex();
-    let chainId = "0x534e5f4d41494e"; // SN_MAIN
-    try {
-      if (typeof starknetWindow.account?.getChainId === "function") {
-        chainId = await starknetWindow.account.getChainId();
-      } else if (typeof starknetWindow.provider?.getChainId === "function") {
-        chainId = await starknetWindow.provider.getChainId();
-      } else if (starknetWindow.chainId) {
-        chainId = starknetWindow.chainId;
-      }
-    } catch { /* keep mainnet default */ }
-    const callTarget =
-      starknetWindow.account?.provider ||
-      starknetWindow.provider ||
-      starknetWindow.account;
-    let version = "2";
-    try {
-      // Pass the root window container instead of the nested raw provider to unlock context calls
-      const detected = await detectSnip9Version(userAddress, starknetWindow);
-      if (detected === "1" || detected === "2") version = detected;
-    } catch (err) {
-      console.log("[beanie] Defaulting to Version 2 execution envelope strategy.");
-    }
-
-    // Compile calls natively into raw standard arrays using CallData.compile
-    const rawCompiledCalldata = CallData.compile({
-      recipient: receiver,
-      amount: cairo.uint256(amountRaw),
-    });
-    const calls = [
-      {
-        contractAddress: usdc,
-        entrypoint: "transfer",
-        calldata: rawCompiledCalldata,
-      },
-    ];
-    // Standard structural mapping from baseline calls
-    const outsideCalls = calls.map((c) => getOutsideCall(c, hash));
-    const outsideExecution = {
-      caller,
-      nonce: nonceHex,
-      execute_after: nowSec - 60,
-      execute_before: nowSec + 600,
-      calls: outsideCalls,
-    };
-    // Construct the typedData structurally matching the contract standard requirements
-    const typedData = getTypedData(outsideExecution, chainId, version);
-    console.log("[beanie] aligned standard typedData", JSON.stringify(typedData, null, 2));
-    if (typeof starknetWindow.account?.signMessage !== "function") {
-      throw new Error("Wallet does not support signMessage (required for SNIP-9).");
-    }
-    const signature = await starknetWindow.account.signMessage(typedData, caller);
-    const formattedSignature = Array.isArray(signature)
-      ? signature
-      : [signature.r, signature.s];
-    return {
-      kind: "starknet",
-      outsideExecution,
-      signature: formattedSignature,
-      userAddress,
-      version,
-      entrypoint: version === "2" ? "execute_from_outside_v2" : "execute_from_outside"
-    };
-  }
-
-  function renderCard(routes) {
-    let activeIndex = -1;
-    let isGaslessMode = false;
-
-    function buildHtml() {
-      if (activeIndex === -1) {
-
-        laneCard.innerHTML = `
-         <div class="pay-routes" role="tablist">
-          ${routes.map((r, i) => `
-            <button class="pay-route" type="button" data-index="${i}">
-              <span class="pay-route-icon">${chainIcons[r.chain] || ""}</span>
-              <span class="pay-route-meta">
-                <strong>Send via ${escapeHtml(CHAINS[r.chain]?.name || r.chain)}</strong>
-                <span>Pay in USDC</span>
-              </span>
-              <span class="pay-route-arrow">→</span>
-            </button>
-          `).join("")}
-        </div>
-        <p class="status-hint">Select a payment network above to continue.</p>  
-        ${poweredTagWithEmbedHtml}
-        `;
-        laneCard.querySelectorAll(".pay-route").forEach((btn) => {
-          btn.addEventListener("click", () => { activeIndex = Number(btn.dataset.index); buildHtml(); });
-        });
-        laneCard.querySelector(".embed-tag-btn")?.addEventListener("click", () => openEmbedOverlay(routes));
-        return;
-      }
-
-      const currentRoute = routes[activeIndex];
-      const chainConfig = CHAINS[currentRoute.chain];
-      const chainName = chainConfig?.name || currentRoute.chain;
-
-      const routeTabs = `
-        <div class="pay-routes" role="tablist">
-          ${routes.map((r, i) => `
-            <button class="pay-route ${i === activeIndex ? "active" : ""}" type="button" data-index="${i}">
-              <span class="pay-route-icon">${chainIcons[r.chain] || ""}</span>
-              <span class="pay-route-meta">
-                <strong>Send via ${escapeHtml(CHAINS[r.chain]?.name || r.chain)}</strong>
-                <span>Pay in USDC</span>
-              </span>
-              <span class="pay-route-arrow">📎</span>
-            </button>
-          `).join("")}
-        </div>
-      `;
-
-      if (!isGaslessMode) {
-        const scheme = chainConfig.kind === "evm" ? "ethereum" : "starknet";
-        const qrContent = `${scheme}:${currentRoute.address}`;
-        const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(qrContent)}`;
-
-        laneCard.innerHTML = `
-    ${routeTabs}
-    <div class="address-display-card">
-      <div class="address-val" id="depositAddr">${escapeHtml(currentRoute.address)}</div>
-      <button class="copy-btn" id="copyBtn" type="button">Copy Address</button>
-    </div>
-    <div style="margin-top: 0.25rem; display: flex; justify-content: flex-end;">
-      <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8; display: inline-flex; align-items: center; gap: 6px;">
-        <input type="checkbox" id="modeToggle" style="margin: 0; cursor: pointer;">
-        <span>Gasless Transfer</span>
-      </label>
-    </div>
-    <div class="qr-container">
-      <img src="${qrApiUrl}" alt="Scan to Pay QR Code" class="qr-code-img" width="240" height="240" />
-      <p style="font-size: 0.82rem; margin-top: 0.5rem; opacity: 0.8;">Scan and Pay on ${escapeHtml(chainName)}</p>
-    </div>
-    ${poweredTagWithEmbedHtml}
-  `;
-
-        laneCard.querySelector("#copyBtn")?.addEventListener("click", async () => {
-          try {
-            await navigator.clipboard.writeText(currentRoute.address);
-            notify("Address copied to clipboard");
-          } catch {
-            notify("Failed to copy address");
-          }
-        });
-      } else {
-        // Gasless – QR opens this exact page inside the wallet browser
-        const pageUrl = window.location.href;
-        const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(pageUrl)}`;
-
-        laneCard.innerHTML = `
-    ${routeTabs}
-    <div class="address-display-card">
-      <label class="amount-label" style="display:block; text-align:left; font-size: 0.85rem; opacity: 0.85;">
-        Amount (USDC)
-        <input
-          type="text"
-          inputmode="decimal"
-          id="amountInput"
-          placeholder="0.00"
-          autocomplete="off"
-          style="display:block; width:100%; margin-top:4px; padding:8px 10px; border-radius:6px; border:1px solid rgba(255,255,255,0.25); background:transparent; color:inherit; font-size:0.95rem; box-sizing:border-box;"
-        />
-      </label>
-      <button class="copy-btn" id="actionBtn" type="button" style="margin-top: 0.5rem;">Pay with Beanie</button>
-      <p id="payHint" style="font-size:0.8rem; opacity:0.75; margin-top:0; min-height:0;"></p>
-    </div>
-    <div style="margin-top: 0.25rem; display: flex; justify-content: flex-end;">
-      <label style="font-size: 0.8rem; cursor: pointer; opacity: 0.8; display: inline-flex; align-items: center; gap: 6px;">
-        <input type="checkbox" id="modeToggle" checked style="margin: 0; cursor: pointer;">
-        <span>Gasless Transfer</span>
-      </label>
-    </div>
-    <div class="qr-container">
-      <img src="${qrApiUrl}" alt="Open in wallet browser" class="qr-code-img" width="240" height="240" />
-      <p style="font-size: 0.82rem; margin-top: 0.5rem; opacity: 0.8;">
-        Scan and Authorize Transfer
-      </p>
-    </div>
-    ${poweredTagWithEmbedHtml}
-  `;
-
-        laneCard.querySelector("#amountInput")?.addEventListener("input", (e) => {
-          const input = e.target;
-          const cursorFromEnd = input.value.length - input.selectionStart;
-
-          // Strip anything that isn't a digit or a dot
-          let cleaned = input.value.replace(/[^\d.]/g, "");
-
-          // Collapse to at most one decimal point — keep the first, drop the rest
-          const firstDot = cleaned.indexOf(".");
-          if (firstDot !== -1) {
-            cleaned = cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, "");
-          }
-
-          // Cap fractional digits to USDC_DECIMALS as they type
-          if (firstDot !== -1) {
-            const whole = cleaned.slice(0, firstDot);
-            const frac = cleaned.slice(firstDot + 1, firstDot + 1 + USDC_DECIMALS);
-            cleaned = frac.length ? `${whole}.${frac}` : `${whole}.`;
-          }
-
-          if (cleaned !== input.value) {
-            input.value = cleaned;
-            // Restore cursor position relative to the end, since we may have removed characters
-            const pos = Math.max(0, cleaned.length - cursorFromEnd);
-            input.setSelectionRange(pos, pos);
-          }
-        });
-
-        laneCard.querySelector("#actionBtn")?.addEventListener("click", async () => {
-          const hint = laneCard.querySelector("#payHint");
-          const amountInput = laneCard.querySelector("#amountInput");
-          const params = new URLSearchParams(window.location.search);
-          const txHash = params.get("tx") || "0x0";
-          const merchantAddr = params.get("merchant") || currentRoute.address;
-
-          const amountRaw = parseDecimalToRawUnits(amountInput?.value ?? "", USDC_DECIMALS);
-          if (!amountRaw) {
-            if (hint) hint.textContent = `Enter a valid amount (up to ${USDC_DECIMALS} decimal places).`;
-            amountInput?.focus();
-            return;
-          }
-
-          try {
-            let signaturePayload;
-            let senderAddress;
-
-            if (chainConfig.kind === "evm") {
-              if (hint) hint.textContent = "Sign the transfer authorization in your wallet...";
-              signaturePayload = await prepareEvmSignedTransfer(currentRoute.address, amountRaw);
-              senderAddress = signaturePayload.from;
-            } else {
-              if (hint) hint.textContent = "Sign the sponsored transfer in your wallet...";
-              signaturePayload = await prepareStarknetSignedCall(currentRoute.address, amountRaw);
-              senderAddress = signaturePayload.userAddress;
-            }
-
-            if (hint) hint.textContent = "Relaying request...";
-            const res = await fetch("/api/v1/pay", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                chain: chainConfig.chainEnum,
-                merchant_address: merchantAddr,
-                receiver_address: currentRoute.address,
-                destination_chain: chainConfig.chainEnum,
-                tx_hash: txHash,
-                from_address: senderAddress,
-                amount_raw: amountRaw,
-                webhook_url: null,
-                signature: JSON.stringify(signaturePayload),
-              }),
-            });
-
-            if (!res.ok) {
-              const errData = await res.json().catch(() => ({}));
-              throw new Error(errData.message || `API rejected request: ${res.status}`);
-            }
-
-            const data = await res.json();
-            notify("Payment authorized — processing");
-            if (hint) hint.textContent = `Queued: ${data.message}`;
-          } catch (err) {
-            notify(`Payment failed: ${err.message}`);
-            if (hint) hint.textContent = `Error: ${err.message}`;
-          }
-        });
-      }
-
-      laneCard.querySelectorAll(".pay-route").forEach((btn) => {
-        btn.addEventListener("click", () => { activeIndex = Number(btn.dataset.index); buildHtml(); });
-      });
-      laneCard.querySelector(".embed-tag-btn")?.addEventListener("click", () => openEmbedOverlay(routes));
-      laneCard.querySelector("#modeToggle")?.addEventListener("change", (e) => {
-        isGaslessMode = e.target.checked;
-        buildHtml();
-      });
-    }
-
-    buildHtml();
-  }
-
-  shareBtn?.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(window.location.href);
-      notify("Payment link copied to clipboard");
-    } catch {
-      notify("Failed to copy payment link");
-    }
+let qrLibPromise = null;
+function loadQrLib() {
+  if (window.qrcode) return Promise.resolve(window.qrcode);
+  qrLibPromise ??= new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js";
+    s.crossOrigin = "anonymous";
+    s.onload = () => (window.qrcode ? resolve(window.qrcode) : reject(new Error("qr lib missing")));
+    s.onerror = () => reject(new Error("qr lib failed to load"));
+    document.head.append(s);
   });
+  return qrLibPromise;
+}
 
-  async function init() {
-    applyEmbedTheme();
-    try {
-      const routes = await resolveRoutes();
-      if (!routes.length) {
-        laneCard.innerHTML = `
-          <div class="error">This payment link is missing a destination address.</div>
-          ${poweredTagHtml}
-        `;
-        return;
-      }
-      renderCard(routes);
-    } catch (err) {
-      console.error("Failed to load payment routes:", err);
-      laneCard.innerHTML = `
-        <div class="error">Something went wrong loading this payment link. Please refresh.</div>
-        ${poweredTagHtml}
-      `;
+async function renderQr(container, text) {
+  try {
+    const qrcode = await loadQrLib();
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    container.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+    const svg = container.querySelector("svg");
+    if (svg) {
+      svg.setAttribute("width", "240");
+      svg.setAttribute("height", "240");
+      svg.setAttribute("role", "img");
+      svg.setAttribute("aria-label", "QR code");
     }
+  } catch {
+    container.textContent = ""; // address + copy button remain usable
+  }
+}
+
+function addressQrText(route) {
+  const chain = CHAINS[route.chain];
+  if (chain.kind === "evm" && chain.usdc) {
+    // EIP-681: a USDC transfer to the receiver (plain "ethereum:addr" means ETH).
+    return `ethereum:${chain.usdc}@${chain.chainId}/transfer?address=${route.address}`;
+  }
+  if (chain.kind === "solana" && chain.usdc && SOLANA_RECEIVER_KIND === "wallet") {
+    // Solana Pay transfer request: wallets resolve the associated token account themselves.
+    return `solana:${route.address}?spl-token=${chain.usdc}`;
+  }
+  return route.address;
+}
+
+/* ---------- card ---------- */
+
+function renderCard(link) {
+  const { routes, target, merchant, params } = link;
+  let activeIndex = -1;
+  let gasless = false;
+  let inFlight = false;
+
+  const tabs = () => `
+    <div class="pay-routes" role="tablist">
+      ${routes
+      .map(
+        (r, i) => `
+        <button class="pay-route ${i === activeIndex ? "active" : ""}" type="button" data-index="${i}">
+          <span class="pay-route-icon">${chainIcon(r.chain)}</span>
+          <span class="pay-route-meta"><strong>Send via ${escapeHtml(CHAINS[r.chain].name)}</strong><span>Pay in USDC</span></span>
+          <span class="pay-route-arrow">${i === activeIndex ? "✓" : "→"}</span>
+        </button>`
+      )
+      .join("")}
+    </div>`;
+
+  function bindCommon() {
+    laneCard.querySelectorAll(".pay-route").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        activeIndex = Number(btn.dataset.index);
+        draw();
+      })
+    );
+    laneCard.querySelector(".embed-tag-btn")?.addEventListener("click", () => openEmbedOverlay(link));
+    laneCard.querySelector("#modeToggle")?.addEventListener("change", (e) => {
+      gasless = e.target.checked;
+      draw();
+    });
   }
 
-  init();
+  function draw() {
+    if (activeIndex === -1) {
+      laneCard.innerHTML = `${tabs()}<p class="status-hint">Select a payment network above to continue.</p>${poweredTag(true)}`;
+      bindCommon();
+      return;
+    }
+
+    const route = routes[activeIndex];
+    const chain = CHAINS[route.chain];
+    const gaslessOk = Boolean(target && merchant && canGasless(chain) && (chain.kind !== "starknet" || KEEPER_STARKNET_ADDRESS));
+
+    if (!gasless || !gaslessOk) {
+      laneCard.innerHTML = `
+        ${tabs()}
+        <div class="address-display-card">
+          <div class="address-val" id="depositAddr">${escapeHtml(route.address)}</div>
+          <button class="copy-btn" id="copyBtn" type="button">Copy Address</button>
+        </div>
+        ${gaslessOk
+          ? `<div style="margin-top:.25rem;display:flex;justify-content:flex-end;">
+                 <label style="font-size:.8rem;cursor:pointer;opacity:.8;display:inline-flex;align-items:center;gap:6px;">
+                   <input type="checkbox" id="modeToggle" style="margin:0;cursor:pointer;"><span>Gasless Transfer</span>
+                 </label></div>`
+          : ""
+        }
+        <div class="qr-container"><div id="qrBox" style="width:240px;height:240px;margin:0 auto;"></div>
+          <p style="font-size:.82rem;margin-top:.5rem;opacity:.8;">Scan and pay USDC on ${escapeHtml(chain.name)}</p></div>
+        ${poweredTag(true)}`;
+      bindCommon();
+      laneCard.querySelector("#copyBtn")?.addEventListener("click", () => copyText(route.address, "Address copied to clipboard"));
+      renderQr(laneCard.querySelector("#qrBox"), addressQrText(route));
+      return;
+    }
+
+    laneCard.innerHTML = `
+      ${tabs()}
+      <div class="address-display-card">
+        <label class="amount-label" style="display:block;text-align:left;font-size:.85rem;opacity:.85;">Amount (USDC)
+          <input type="text" inputmode="decimal" id="amountInput" placeholder="0.00" autocomplete="off"
+            style="display:block;width:100%;margin-top:4px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.25);background:transparent;color:inherit;font-size:.95rem;box-sizing:border-box;" />
+        </label>
+        <button class="copy-btn" id="actionBtn" type="button" style="margin-top:.5rem;">Pay with Beanie</button>
+        <p id="payHint" role="status" style="font-size:.8rem;opacity:.75;margin-top:0;"></p>
+      </div>
+      <div style="margin-top:.25rem;display:flex;justify-content:flex-end;">
+        <label style="font-size:.8rem;cursor:pointer;opacity:.8;display:inline-flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="modeToggle" checked style="margin:0;cursor:pointer;"><span>Gasless Transfer</span>
+        </label></div>
+      <div class="qr-container"><div id="qrBox" style="width:240px;height:240px;margin:0 auto;"></div>
+        <p style="font-size:.82rem;margin-top:.5rem;opacity:.8;">Scan to open this page in your wallet browser</p></div>
+      ${poweredTag(true)}`;
+    bindCommon();
+    renderQr(laneCard.querySelector("#qrBox"), window.location.href);
+
+    const hint = laneCard.querySelector("#payHint");
+    const amountInput = laneCard.querySelector("#amountInput");
+    const actionBtn = laneCard.querySelector("#actionBtn");
+
+    amountInput?.addEventListener("input", (e) => {
+      const input = e.target;
+      const fromEnd = input.value.length - input.selectionStart;
+      let v = input.value.replace(/[^\d.]/g, "");
+      const dot = v.indexOf(".");
+      if (dot !== -1) {
+        const whole = v.slice(0, dot);
+        const frac = v.slice(dot + 1).replace(/\./g, "").slice(0, USDC_DECIMALS);
+        v = `${whole}.${frac}`;
+      }
+      if (v !== input.value) {
+        input.value = v;
+        const pos = Math.max(0, v.length - fromEnd);
+        input.setSelectionRange(pos, pos);
+      }
+    });
+
+    actionBtn?.addEventListener("click", async () => {
+      if (inFlight) return;
+      const amountRaw = parseDecimalToRawUnits(amountInput?.value ?? "", USDC_DECIMALS);
+      if (!amountRaw) {
+        hint.textContent = `Enter a valid amount (up to ${USDC_DECIMALS} decimal places).`;
+        amountInput?.focus();
+        return;
+      }
+
+      inFlight = true;
+      actionBtn.disabled = true;
+      try {
+        hint.textContent = "Approve the transfer in your wallet…";
+        const signed =
+          chain.kind === "evm"
+            ? await signEvmTransfer({ chainKey: chain.key, receiver: route.address, amountRaw })
+            : chain.kind === "solana"
+              ? await signSolanaTransfer({ receiver: route.address, amountRaw })
+              : await signStarknetTransfer({ receiver: route.address, amountRaw });
+
+        hint.textContent = "Relaying…";
+        const ref = params.get("ref") || `beanie-${Date.now().toString(36)}`;
+        const res = await api.submitPayment({
+          chain: chain.key,
+          merchantAddress: merchant,
+          receiverAddress: signed.receiverAddress ?? route.address, // Solana: the receiver's token account
+          destinationChain: target, // the ROUTE's settlement chain, not the source chain
+          txRef: ref,
+          fromAddress: signed.from,
+          amountRaw,
+          webhookUrl: null,
+          signature: signed.payload,
+        });
+        notify("Payment authorized", "success", "Processing…");
+        hint.textContent = res?.message ? `Queued: ${res.message}` : "Queued.";
+
+        if (signed.settlement) {
+          // Solana: the relay can silently miss the blockhash window, so wait for the outcome.
+          hint.textContent = "Queued. Waiting for the network to confirm…";
+          const outcome = await awaitSolanaSettlement(signed.settlement);
+          if (outcome === "confirmed") {
+            notify("Payment received", "success");
+            hint.textContent = "Payment confirmed on Solana.";
+          } else if (outcome === "expired") {
+            notify("Payment expired", "error", "The authorization expired before it was processed. Nothing was sent. Please try again.");
+            hint.textContent = "Expired before it was processed. Nothing was sent: tap Pay again.";
+            actionBtn.disabled = false;
+          } else {
+            hint.textContent = "Still processing. Check your wallet or the merchant before paying again.";
+          }
+        }
+      } catch (err) {
+        const msg = describeError(err);
+        notify("Payment failed", "error", msg);
+        hint.textContent = `Error: ${msg}`;
+        actionBtn.disabled = false;
+      } finally {
+        inFlight = false;
+      }
+    });
+  }
+
+  draw();
+}
+
+/* ---------- init ---------- */
+
+shareBtn?.addEventListener("click", () => copyText(window.location.href, "Payment link copied to clipboard"));
+
+(function init() {
+  const link = parseLink();
+  applyTheme(link.params);
+  if (!link.routes.length) {
+    laneCard.innerHTML = `<div class="error">This payment link is missing a destination address.</div>${poweredTag(false)}`;
+    return;
+  }
+  try {
+    renderCard(link);
+  } catch (err) {
+    console.error("Failed to render payment card:", err);
+    laneCard.innerHTML = `<div class="error">Something went wrong loading this payment link. Please refresh.</div>${poweredTag(false)}`;
+  }
 })();

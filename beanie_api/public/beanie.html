@@ -57,9 +57,12 @@
               <span class="settlementChainShell">
                 <select id="settlementChain" class="settlementChain" aria-label="Settlement chain">
                   <option value="" selected disabled hidden>-- choose your address network --</option>
-                  <option value="starknet">Starknet</option>
+                  <option value="ethereum">Ethereum</option>
                   <option value="base">Base</option>
-                  <option value="solana" disabled>Solana (coming soon)</option>
+                  <option value="arbitrum">Arbitrum</option>
+                  <option value="monad">Monad</option>
+                  <option value="starknet">Starknet</option>
+                  <option value="solana">Solana</option>
                 </select>
               </span>
             </label>
@@ -145,9 +148,7 @@
 
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/keccak256@1.0.6/keccak256.min.js"></script>
-  <script src="/scripts/beanie.js" defer></script>
-  <script type="module" src="/scripts/stealth.receiver.js"></script>
+  <script type="module" src="/scripts/beanie.js"></script>
 </body>
 
 </html>
