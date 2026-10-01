@@ -5,6 +5,7 @@ mod create_workers;
 mod models;
 mod payment_routes;
 mod payment_workers;
+mod rpc_proxy;
 mod stealth_routes;
 mod stealth_workers;
 mod transfer_workers;
@@ -39,6 +40,7 @@ use crate::models::PaymentTask;
 use crate::models::{Chain, StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
+// use crate::rpc_proxy::handle;
 use crate::stealth_routes::execute_stealth_claim;
 use crate::stealth_workers::{
     ChainRegistry, FireblocksRest, WorkerCtx, chain_cfgs_from_env, start_stealth_workers,
@@ -309,28 +311,113 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     let evm_chains = vec![
-        (Chain::Base, base_client, Arc::new(base_cfg), base_registry),
+        (
+            Chain::Base,
+            base_client,
+            Arc::new(base_cfg.clone()),
+            base_registry,
+        ),
         (
             Chain::Ethereum,
             ethereum_client,
-            Arc::new(ethereum_cfg),
+            Arc::new(ethereum_cfg.clone()),
             ethereum_registry,
         ),
         (
             Chain::Arbitrum,
             arbitrum_client,
-            Arc::new(arbitrum_cfg),
+            Arc::new(arbitrum_cfg.clone()),
             arbitrum_registry,
         ),
         (
             Chain::Monad,
             monad_client,
-            Arc::new(monad_cfg),
+            Arc::new(monad_cfg.clone()),
             monad_registry,
         ),
     ];
     let starknet_cfg_clone = state.starknet_config.clone();
     let webhook_tx_for_transfer = webhook_tx.clone();
+
+    // Initialize Upstreams for the RPC Proxy
+    let mut upstreams = std::collections::HashMap::new();
+
+    // Base upstream
+    upstreams.insert(
+        "base".to_string(),
+        rpc_proxy::Upstream::new(
+            base_cfg.evm_rpc_url.clone(),
+            rpc_proxy::Family::Evm,
+            &[
+                &base_cfg.clone().factory_address.to_string(),
+                &base_cfg.clone().token_address.to_string(),
+            ], // Pass actual contract addresses
+        ),
+    );
+
+    // Ethereum upstream
+    upstreams.insert(
+        "ethereum".to_string(),
+        rpc_proxy::Upstream::new(
+            ethereum_cfg.evm_rpc_url.clone(),
+            rpc_proxy::Family::Evm,
+            &[
+                &ethereum_cfg.clone().factory_address.to_string(),
+                &ethereum_cfg.clone().token_address.to_string(),
+            ],
+        ),
+    );
+
+    // Arbitrum upstream
+    upstreams.insert(
+        "arbitrum".to_string(),
+        rpc_proxy::Upstream::new(
+            arbitrum_cfg.evm_rpc_url.clone(),
+            rpc_proxy::Family::Evm,
+            &[
+                &arbitrum_cfg.clone().factory_address.to_string(),
+                &arbitrum_cfg.clone().token_address.to_string(),
+            ],
+        ),
+    );
+
+    // Monad upstream
+    upstreams.insert(
+        "monad".to_string(),
+        rpc_proxy::Upstream::new(
+            monad_cfg.evm_rpc_url.clone(),
+            rpc_proxy::Family::Evm,
+            &[
+                &monad_cfg.clone().factory_address.to_string(),
+                &monad_cfg.clone().token_address.to_string(),
+            ],
+        ),
+    );
+
+    // Starknet upstream
+    upstreams.insert(
+        "starknet".to_string(),
+        rpc_proxy::Upstream::new(
+            starknet_cfg.rpc_url.clone(),
+            rpc_proxy::Family::Starknet,
+            &[
+                &starknet_cfg.clone().factory_address.to_string(),
+                &starknet_cfg.clone().token_address.to_string(),
+            ],
+        ),
+    );
+
+    // Solana upstream
+    upstreams.insert(
+        "solana".into(),
+        rpc_proxy::Upstream::new(solana_cfg.rpc_url.clone(), rpc_proxy::Family::Solana, &[]),
+    );
+
+    let proxy = Arc::new(rpc_proxy::RpcProxy::new(
+        reqwest::Client::new(),
+        upstreams,
+        false, // Set to `true` if behind a reverse proxy like Nginx/Cloudflare to parse X-Forwarded-For
+    ));
 
     debug!("app state loaded");
 
@@ -412,6 +499,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/pay", post(receive_payment))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+        .merge(rpc_proxy::router(proxy))
         .fallback(serve_static);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
