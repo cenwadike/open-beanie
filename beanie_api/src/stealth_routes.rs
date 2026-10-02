@@ -27,9 +27,9 @@
 //   Starknet  native INVOKE V3 transaction hash.
 //   Solana    sha256(message_bytes).
 //
-// GET /api/v1/stealth/cosigners publishes the cosigner each chain's accounts
-// bind to. Clients must PIN the expected cosigner out of band; this endpoint
-// is for discovery and monitoring, not trust.
+// GET /api/v1/stealth/cosigners publishes the provider-derived identities used
+// by account derivation and relay. The provider is the configured trust root;
+// there is no separate expected-cosigner pin.
 
 use axum::{
     Json,
@@ -143,13 +143,14 @@ pub struct ClaimResponse {
 
 #[derive(Debug, Serialize)]
 pub struct CosignersResponse {
-    /// One entry per configured chain: algo, cosigner address/pubkey, factory.
+    /// One entry per configured chain: algo, cosigner, and family-specific
+    /// public factory/relayer values.
     /// Public data only.
     pub cosigners: Vec<CosignerInfo>,
     /// 64-byte hex. The `report_data` a TEE quote for this app should commit to
     /// (sha256 of the canonical cosigner list || 32 zero bytes), so a client
     /// holding a quote can check "these exact cosigners belong to this attested
-    /// app". Not a substitute for pinning.
+    /// app" when the runtime exposes compatible quote verification.
     pub report_data: String,
 }
 
@@ -390,12 +391,15 @@ fn chain_tag(chain: &Chain) -> String {
 /// cosigner, salt); Starknet: constructor args; Solana: derive_multisig), a
 /// client can verify every address it derives.
 ///
-/// PINNING: clients MUST ship the expected cosigner per chain (hardcoded or
-/// published in docs) and refuse to create an account if this response differs.
-/// A cosigner fetched only from this endpoint proves nothing against whoever
-/// controls the API: they could return their own key and hold funds hostage.
+/// The provider is the trust root for the cosigner it uses. Clients use this
+/// response both to derive a new lane and to preserve the derivation settings
+/// for that lane. `report_data` commits to the returned public identities.
 pub async fn list_cosigners(State(state): State<AppState>) -> Response {
-    let report_data = match state.stealth_chains.attestation_report_data() {
+    let solana_relayer = state.solana_config.keeper_wallet.pubkey();
+    let report_data = match state
+        .stealth_chains
+        .attestation_report_data(&solana_relayer)
+    {
         Ok(rd) => hex::encode(rd),
         Err(_) => {
             return err(
@@ -405,7 +409,7 @@ pub async fn list_cosigners(State(state): State<AppState>) -> Response {
         }
     };
     Json(CosignersResponse {
-        cosigners: state.stealth_chains.public_info(),
+        cosigners: state.stealth_chains.public_info(&solana_relayer),
         report_data,
     })
     .into_response()

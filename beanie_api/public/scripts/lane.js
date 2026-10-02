@@ -27,7 +27,7 @@ import {
     stealthReady,
     wire,
 } from "./chains.js";
-import { canonicalAddress, cctpRoute, merchantIdentity } from "./identity.js";
+import { canonicalAddress, canonicalEvm, cctpRoute, merchantIdentity } from "./identity.js";
 import { contractExists, discoverSolanaReceiver, headBlock, predictReceiver, verifySolanaReceiver } from "./onchain.js";
 import { usdcAta } from "./solana.js";
 import { getVerifiedToken, getVerifiedTokenWithPrf } from "./passkey.js";
@@ -42,38 +42,50 @@ export class LaneError extends Error {
     }
 }
 
-function samePinnedValue(chain, a, b) {
+function sameIdentity(chain, a, b) {
     if (!a || !b) return false;
     try {
-        if (chain.kind === "evm") return String(a).toLowerCase() === String(b).toLowerCase();
-        if (chain.kind === "starknet") return BigInt(a) === BigInt(b);
+        if (chain.kind === "evm" || chain.kind === "starknet") return String(a).toLowerCase() === String(b).toLowerCase();
         return a === b;
     } catch {
         return false;
     }
 }
 
-/** Check API discovery against the locally pinned identity; API data is never trusted as config. */
-export async function assertPinnedStealthConfig(chainOrKey, snapshot = null) {
+/** Resolve provider-owned public derivation settings and preserve existing lane identity. */
+export async function resolveStealthConfig(chainOrKey, snapshot = null) {
     const chain = typeof chainOrKey === "string" ? chainByKey(chainOrKey) : chainOrKey;
-    const pinned = stealthConfigFor(chain);
-    const config = snapshot ?? pinned;
-    if (!chain || !config?.cosigner || !pinned?.cosigner || !samePinnedValue(chain, config.cosigner, pinned.cosigner)) {
-        throw new LaneError(`The pinned ${chain?.name ?? "chain"} cosigner is missing or differs from this lane's derivation settings.`);
+    if (!chain || !stealthReady(chain)) {
+        throw new LaneError(`Private lanes are not enabled on ${chain?.name ?? "this chain"}.`);
     }
-    if (chain.kind === "evm" && (!config.factory || !pinned.factory || !samePinnedValue(chain, config.factory, pinned.factory))) {
-        throw new LaneError(`The pinned ${chain.name} stealth factory is missing or differs from this lane's derivation settings.`);
-    }
+    const base = stealthConfigFor(chain);
 
     const response = await api.getStealthCosigners();
     const published = response?.cosigners?.find((item) => String(item.chain).toUpperCase() === chain.key);
-    if (!published || !samePinnedValue(chain, published.cosigner, config.cosigner)) {
-        throw new LaneError(`The ${chain.name} cosigner does not match the locally pinned value. Refusing to create or claim this private lane.`);
+    if (!published) {
+        throw new LaneError(`The API did not publish a cosigner for ${chain.name}.`);
     }
-    if (chain.kind === "evm" && !samePinnedValue(chain, published.factory, config.factory)) {
-        throw new LaneError(`The ${chain.name} stealth factory does not match the locally pinned value. Refusing to continue.`);
+
+    const live = {
+        cosigner: chain.kind === "starknet"
+            ? canonicalEvm(published.cosigner)
+            : canonicalAddress(chain.key, published.cosigner),
+    };
+    if (chain.kind === "evm") live.factory = canonicalAddress(chain.key, published.factory);
+    if (chain.kind === "solana") live.relayer = canonicalAddress("SOLANA", published.relayer);
+    if (!live.cosigner || (chain.kind === "evm" && !live.factory) || (chain.kind === "solana" && !live.relayer)) {
+        throw new LaneError(`The API returned incomplete stealth settings for ${chain.name}.`);
     }
-    return config;
+
+    if (snapshot) {
+        for (const key of ["cosigner", ...(chain.kind === "evm" ? ["factory"] : []), ...(chain.kind === "solana" ? ["relayer"] : [])]) {
+            if (!sameIdentity(chain, snapshot[key], live[key])) {
+                throw new LaneError(`The ${chain.name} ${key} returned by the API differs from the value used to derive this lane.`);
+            }
+        }
+        return { ...base, ...snapshot };
+    }
+    return { ...base, ...live };
 }
 
 /** Predicts the receiver on every chain we can predict, exactly as the backend will register them. */
@@ -146,7 +158,7 @@ export async function createLane({ wallet, targetChain, webhookUrl = null, priva
         if (!stealthReady(targetCfg)) {
             throw new LaneError(`Private lanes are not enabled on ${targetCfg.name} yet.`);
         }
-        stealthConfig = await assertPinnedStealthConfig(targetCfg);
+        stealthConfig = await resolveStealthConfig(targetCfg);
         laneId = await generateLaneId(String(wallet || ""));
         onStep("Confirm passkey…");
         const r = await getVerifiedTokenWithPrf(`create-lane:${laneId}`, await laneSalt(laneId), { maxUses: 1 });

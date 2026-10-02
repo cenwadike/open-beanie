@@ -16,8 +16,7 @@
 import * as api from "./api.js";
 import { CHAINS, apiChain, chainByKey, chainIcon, chainLabel, wire } from "./chains.js";
 import { canonicalAddress } from "./identity.js";
-import { assertPinnedStealthConfig } from "./lane.js";
-import { verifyLane } from "./lane.js";
+import { resolveStealthConfig, verifyLane } from "./lane.js";
 import { tokenBalance } from "./onchain.js";
 import { evaluatePrf, getVerifiedToken } from "./passkey.js";
 import { deriveStealthSigner, laneSalt, wipe } from "./stealth.core.js";
@@ -149,7 +148,7 @@ async function claim() {
     let secret = null;
     let signer = null;
     try {
-        const config = await assertPinnedStealthConfig(chain, lane.stealthConfig ?? null);
+        const config = await resolveStealthConfig(chain, lane.stealthConfig ?? null);
         setStatus("Confirm your passkey to unlock this lane…");
         secret = await evaluatePrf(await laneSalt(lane.id), lane.prfCredentialId || undefined);
         signer = await deriveStealthSigner({

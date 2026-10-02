@@ -350,9 +350,9 @@ The route runs the worker's own `precheck`, recomputes the family-specific signi
 
 ### `GET /api/v1/stealth/cosigners`
 
-Returns `{ "cosigners": [...], "report_data": "0x..." }`. Each configured chain entry contains its rendered chain name, signature algorithm, cosigner identity, and an EVM factory address where applicable. `report_data` commits to the canonical public cosigner list for use in TEE quote verification.
+Returns `{ "cosigners": [...], "report_data": "0x..." }`. Each configured chain entry contains its rendered chain name, signature algorithm, and runtime-derived cosigner identity, plus `factory` for EVM or `relayer` for Solana. `report_data` commits to the canonical public identity list for runtimes that support checking it against an attestation.
 
-This endpoint is for discovery and monitoring, not trust. Clients must compare the returned cosigner (and EVM factory) with values pinned out of band before deriving an account or creating a private lane. The registry also checks `expected_cosigner` at startup and refuses to boot if the derived key does not match.
+The provider's returned values are the configuration source of truth. The frontend uses them to derive new lane addresses and stores them in the browser record/backup for later re-derivation. This is an explicit provider-trust model: there is no separately configured `expected_cosigner` value or startup comparison.
 
 ---
 
@@ -425,9 +425,43 @@ Loaded from the environment (`.env` is read automatically). Each chain has its o
 | EVM (per chain) | Prefixed `BASE`, `ETHEREUM`, `ARBITRUM`, `MONAD`: RPC URL, keeper key, factory, webhook registry, USDC token, Subsquid Portal URL and key, start blocks |
 | Starknet | RPC URL, events RPC URL and key, keeper key and address, factory, token, start blocks |
 | Solana | `SOLANA_PROGRAM_ID`, `SOLANA_MINT`, `SOLANA_KEEPER_PRIVATE_KEY`, `SOLANA_RPC_URL`, `SOLANA_REGISTRY_START_SLOT`, `SOLANA_DEPOSIT_START_SLOT`, `SOLANA_SUBSQUID_PORTAL_URL`, `SOLANA_SUBSQUID_PORTAL_API_KEY` |
-| Stealth | `STEALTH_CHAINS_PATH` or `STEALTH_CHAINS_JSON`; per-chain factory/token/domain/class hash, key source, `expected_cosigner`, and allowlists are defined by `ChainCfg` in `stealth_chains.json` |
+| Stealth | `STEALTH_CHAINS_PATH` or `STEALTH_CHAINS_JSON`; per-chain factory/token/domain/class hash, key source, and allowlists are defined by `ChainCfg` in `stealth_chains.json` |
 
-Cosigner keys normally come from the dstack KMS using a distinct `key_source.dstack.path` per chain. For local development only, `key_source.dev_env` requires `ALLOW_DEV_KEYS=1` and the named environment variable. Never use development keys in production. Startup fails fast for an invalid chain list, reused key sources or cosigners, mismatched `expected_cosigner`, wrong EVM chain IDs or token domain separators, and incompatible factories. Replace every `REPLACE_WITH_*` value in the checked-in example before using it as a live config. The Solana treasury token account is read from the on-chain factory config, not from the environment.
+Cosigner keys normally come from the dstack guest agent using a distinct `key_source.dstack.path` per chain. The pinned `dstack-sdk` calls legacy `POST /GetKey` over `/var/run/dstack.sock`; the guest agent's newer `/v1/GetKey` intentionally derives different keys. Startup fails fast for an invalid chain list, reused key sources or cosigners, wrong EVM chain IDs or token domain separators, and incompatible factories. Replace every `REPLACE_WITH_*` value in the checked-in example before using it as a live config. The Solana treasury token account is read from the on-chain factory config, not from the environment.
+
+#### Akash confidential-compute note
+
+The Docker image is prepared for Akash TEE deployment (numeric UID, public-image-compatible, non-distroless runtime). A service uses the Akash TEE capability like this:
+
+```yaml
+services:
+  beanie-api:
+    image: ghcr.io/<publisher>/beanie-api:<tag>
+    params:
+      tee: cpu
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+```
+
+Publish the image to a public registry; Akash TEE deployments currently cannot pull authenticated private images. Akash's standard `params.tee: cpu` runtime provides its own attestation sidecar, not the dstack guest-agent `/GetKey` service. The production `key_source.dstack` therefore works on Akash only if the deployment separately provides that compatible socket. Akash SDL environment values are visible to the provider, so do not put cosigner or keeper private keys in SDL `env` and treat them as protected by the TEE. A compatible attested key service/source is still required before stealth signing can operate there.
+
+#### dstack guest-agent access
+
+Beanie does **not** need a dstack API key. The pinned `dstack-sdk` 0.1.3 calls the guest agent over its Unix socket, normally `/var/run/dstack.sock`, and requests `POST /GetKey`. The current guest agent still serves this legacy endpoint for compatibility. When running Beanie in a container inside dstack, make the host socket available to the API container, for example:
+
+```yaml
+services:
+  beanie-api:
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+```
+
+Each `key_source.dstack.path` in `stealth_chains.json` is a distinct deterministic key namespace; Beanie also supplies its fixed `beanie-cosigner-v1` purpose. Keep the paths stable. The guest agent's newer `/v1/GetKey` intentionally derives different material than legacy `/GetKey`; changing SDK/API version or derivation settings changes cosigner addresses and can make existing stealth accounts unrecoverable. Treat such a migration as an account migration, not a routine dependency upgrade.
+
+For local development without a dstack guest agent, use `key_source.dev_env` with `ALLOW_DEV_KEYS=1` and provide the named variable in your local environment. Do not use this mode in production. The SDK also recognizes `DSTACK_SIMULATOR_ENDPOINT` for a local dstack simulator; this is an endpoint setting, not an API key.
 
 ---
 

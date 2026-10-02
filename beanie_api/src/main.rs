@@ -31,6 +31,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use log::{debug, info};
+use solana_sdk::signature::Signer as SolanaSigner;
 
 use crate::auth::{
     AuthState, RateLimiter, auth_finish, auth_start, register_finish, register_start,
@@ -192,9 +193,8 @@ async fn main() -> anyhow::Result<()> {
     // cosigners routes read it (allowlists, chain family, enabled_for_claims,
     // published cosigners). Cosigner keys come from the dstack KMS (or the
     // dev_env source locally). Refuses to start if STEALTH_CHAINS_JSON is
-    // invalid, if a derived cosigner differs from `expected_cosigner`, if two
-    // chains share a key source or cosigner address, or if an EVM RPC reports
-    // the wrong chain id.
+    // invalid, if two chains share a key source or cosigner address, or if an
+    // EVM RPC reports the wrong chain id.
     let stealth_chains = Arc::new(ChainRegistry::build(chain_cfgs_from_env()?).await?);
 
     // Every EVM-family chain the announce worker can target, each with its
@@ -349,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize Upstreams for the RPC Proxy
     let mut upstreams = std::collections::HashMap::new();
     let stealth_factories: HashMap<String, String> = stealth_chains
-        .public_info()
+        .public_info(&solana_cfg.keeper_wallet.pubkey())
         .into_iter()
         .filter_map(|info| {
             info.factory

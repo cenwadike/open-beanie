@@ -205,15 +205,15 @@ Validation binds the signed authorization to the request. The payer, receiver, a
 
 ### Stealth lanes and claims
 
-A private lane derives one client signing key from the lane's passkey PRF. Its payout address is bound to that client and the chain's pinned TEE cosigner:
+A private lane derives one client signing key from the lane's passkey PRF. Its payout address is bound to that client and the provider-derived TEE cosigner:
 
 | Family | Account and claim authorization |
 |---|---|
 | EVM | The configured `StealthAccountFactory` derives the account from `(client, cosigner, salt)`. A claim signs a USDC EIP-3009 `TransferWithAuthorization`: `tx_hash` is its EIP-712 digest `D`, and the client signs EIP-191(`D`). The worker co-signs, creates the account if needed, then submits the authorization atomically. This claim path uses ERC-1271 and does not use ERC-4337, an EntryPoint, or a paymaster. |
-| Starknet | The account address is derived from the class hash, deployment salt, client STARK public key, and pinned Ethereum cosigner address. A claim contains an allowlisted USDC `transfer` call and a native INVOKE V3 hash signed by the client; the worker co-signs and deploys via the UDC if needed. |
-| Solana | The client key and pinned Ed25519 cosigner determine a seeded SPL multisig account. A claim is one USDC `TransferChecked` message signed by the client; the worker adds the cosigner signature and keeper fee-payer signature. |
+| Starknet | The account address is derived from the class hash, deployment salt, client STARK public key, and provider-derived Ethereum cosigner address. A claim contains an allowlisted USDC `transfer` call and a native INVOKE V3 hash signed by the client; the worker co-signs and deploys via the UDC if needed. |
+| Solana | The client key and provider-derived Ed25519 cosigner determine a seeded SPL multisig account. A claim is one USDC `TransferChecked` message signed by the client; the worker adds the cosigner signature and keeper fee-payer signature. |
 
-Before creating a private lane, the frontend calls `GET /api/v1/stealth/cosigners` and compares the response with locally pinned values. Treat this endpoint as discovery and monitoring, not as a trust root: pin the expected cosigner out of band. The response contains `cosigners` (`chain`, `algo`, `cosigner`, and EVM `factory`) plus `report_data`, a commitment intended for TEE quote verification.
+Before creating a private lane, the frontend calls `GET /api/v1/stealth/cosigners` and uses the provider's returned cosigner (plus EVM factory or Solana fee payer) to derive the account. Those values are stored in the browser lane record and backup so the same address can be re-derived later. This design trusts the provider to operate its configured key source honestly and reliably; the API does not compare against a separate, hardcoded expected-cosigner pin. The response includes `report_data`, a commitment over the public identity list for runtimes that support verifying it against an attestation.
 
 The browser builds each family-specific claim, checks it locally, and asks for a second passkey assertion bound to `claim:{chain}:{derived_address}:{tx_hash}` before submission. The API recomputes the hash and validates the request before enqueueing it. Claims sweep the full lane balance to one destination. The API response echoes the signing hash as `transaction_hash`; it is not the relayed chain transaction hash. There is no claim-status endpoint, so the frontend checks the lane balance after enqueueing.
 
@@ -221,7 +221,7 @@ EVM claim prechecks require a nonzero value, an unused authorization nonce, a de
 
 ### `GET /api/v1/stealth/cosigners`
 
-Returns the configured public cosigner identity for each chain and the `report_data` commitment. It contains no private key and does not prove the API's response is trustworthy on its own. Compare every returned cosigner (and EVM factory) to values pinned in the client or deployment documentation.
+Returns the runtime-derived public identity for each configured chain and the `report_data` commitment. Each entry contains `chain`, `algo`, `cosigner`, and optional `factory` (EVM) or `relayer` (Solana). It contains no private key. Clients use these values as the provider's configuration and save them with the lane; this is a provider-trust model, not an out-of-band pinning model.
 
 ### `POST /api/v1/stealth/claim`
 
@@ -408,7 +408,7 @@ cd beanie_api
 cargo run
 ```
 
-This starts the API, the workers and the static frontend in one process.
+This starts the API, the workers and the static frontend in one process. The checked-in stealth config uses dstack key sources and requires the dstack guest-agent socket. A normal local run without that socket will not initialize those cosigners; use a separate local config with `key_source.dev_env` and `ALLOW_DEV_KEYS=1` only for development.
 
 ### Build the contracts
 

@@ -17,7 +17,6 @@
                 "path": "beanie/cosigner/base"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_BASE_COSIGNER",
         "algo": "ecdsa_secp256k1",
         "allowed_targets": [
             "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -42,7 +41,6 @@
                 "path": "beanie/cosigner/ethereum"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_ETHEREUM_COSIGNER",
         "algo": "ecdsa_secp256k1",
         "allowed_targets": [
             "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -67,7 +65,6 @@
                 "path": "beanie/cosigner/arbitrum"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_ARBITRUM_COSIGNER",
         "algo": "ecdsa_secp256k1",
         "allowed_targets": [
             "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
@@ -92,7 +89,6 @@
                 "path": "beanie/cosigner/monad"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_MONAD_COSIGNER",
         "algo": "ecdsa_secp256k1",
         "allowed_targets": [
             "0x754704Bc059F8C67012fEd69BC8A327a5aafb603"
@@ -115,7 +111,6 @@
                 "path": "beanie/cosigner/starknet"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_STARKNET_EVM_COSIGNER",
         "algo": "ecdsa_secp256k1",
         "allowed_targets": [
             "0x033068F6539f8e6e6b131e6B2B814e6c34A5224bC66947c47DaB9dFeE93b35fb"
@@ -133,7 +128,6 @@
                 "path": "beanie/cosigner/solana"
             }
         },
-        "expected_cosigner": "REPLACE_WITH_PINNED_SOLANA_COSIGNER_PUBKEY",
         "algo": "ed25519",
         "allowed_targets": [
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"

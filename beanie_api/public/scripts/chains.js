@@ -54,7 +54,6 @@ export const SOLANA_RECEIVER_KIND = "wallet";
 export const SOLANA_CCTP_RECIPIENT = "wallet";
 
 export const SOLANA_PLACEHOLDER_KEEPER = "11111111111111111111111111111111"; // all-zero key: signs nothing
-export const SOLANA_STEALTH_COSIGNER = null; // TODO: pin GET /stealth/cosigners out of band
 
 /** Internal read API (keeps provider keys server-side). See rpc_proxy.rs. */
 export const RPC_PROXY_ENABLED = true;
@@ -106,11 +105,7 @@ export const CHAINS = {
         explorerAddress: "https://basescan.org/address/",
         explorerBase: "https://basescan.org",
         eip712: USDC_EIP712,
-        stealth: {
-            // Pin both values out of band before enabling private lanes.
-            factory: null, // TODO: deployed StealthAccountFactory address
-            cosigner: ZERO_ADDR, // TODO
-        },
+        stealth: { maxAuthWindowSecs: 86400 },
     },
     ETHEREUM: {
         key: "ETHEREUM",
@@ -123,11 +118,7 @@ export const CHAINS = {
         explorerAddress: "https://etherscan.io/address/",
         explorerBase: "https://etherscan.io",
         eip712: USDC_EIP712,
-        stealth: {
-            // Pin both values out of band before enabling private lanes.
-            factory: null, // TODO: deployed StealthAccountFactory address
-            cosigner: ZERO_ADDR, // TODO
-        },
+        stealth: { maxAuthWindowSecs: 86400 },
     },
     ARBITRUM: {
         key: "ARBITRUM",
@@ -140,11 +131,7 @@ export const CHAINS = {
         explorerAddress: "https://arbiscan.io/address/",
         explorerBase: "https://arbiscan.io",
         eip712: USDC_EIP712,
-        stealth: {
-            // Pin both values out of band before enabling private lanes.
-            factory: null, // TODO: deployed StealthAccountFactory address
-            cosigner: ZERO_ADDR, // TODO
-        },
+        stealth: { maxAuthWindowSecs: 86400 },
     },
     MONAD: {
         key: "MONAD",
@@ -157,11 +144,7 @@ export const CHAINS = {
         explorerAddress: null,
         explorerBase: null,
         eip712: MONAD_USDC_EIP712,
-        stealth: {
-            // Pin both values out of band before enabling private lanes.
-            factory: null, // TODO: deployed StealthAccountFactory address
-            cosigner: ZERO_ADDR, // TODO
-        },
+        stealth: { maxAuthWindowSecs: 86400 },
     },
     STARKNET: {
         key: "STARKNET",
@@ -173,7 +156,6 @@ export const CHAINS = {
         explorerAddress: "https://starkscan.co/contract/",
         stealth: {
             classHash: null, // TODO: pin the deployed current StealthAccount class hash
-            cosigner: ZERO_ADDR, // TODO: pin the secp256k1 Ethereum address
             chainId: "0x534e5f4d41494e",
             maxFeeFri: "200000000000000000", // 0.2 STRK; must match backend config
             resourceBounds: {
@@ -242,18 +224,16 @@ export const canGasless = (c) =>
 export function stealthReady(c) {
     const s = c?.stealth;
     if (c?.kind === "solana") {
-        return Boolean(c.usdc && c.keeper && c.keeper !== SOLANA_PLACEHOLDER_KEEPER && !isPlaceholder(SOLANA_STEALTH_COSIGNER));
+        return Boolean(c.usdc && c.program?.id);
     }
     if (!s) return false;
     if (c.kind === "evm") {
         return (
-            isEvmAddress(s.factory) && !isPlaceholder(s.factory) &&
-            isEvmAddress(s.cosigner) && !isPlaceholder(s.cosigner) &&
             isEvmAddress(c.usdc) && Boolean(c.eip712?.name && c.eip712?.version && c.chainId)
         );
     }
     if (c.kind === "starknet") {
-        return isFelt(s.classHash) && !isPlaceholder(s.classHash) && isEvmAddress(s.cosigner) && !isPlaceholder(s.cosigner) &&
+        return isFelt(s.classHash) && !isPlaceholder(s.classHash) &&
             Boolean(s.chainId && c.usdc && s.maxFeeFri && s.resourceBounds);
     }
     return false;
@@ -265,7 +245,7 @@ export function stealthConfigFor(chainOrKey) {
     const chain = typeof chainOrKey === "string" ? chainByKey(chainOrKey) : chainOrKey;
     if (!chain) return null;
     if (chain.kind === "solana") {
-        return { cosigner: SOLANA_STEALTH_COSIGNER, relayer: chain.keeper, usdc: chain.usdc };
+        return { usdc: chain.usdc };
     }
     if (chain.kind === "evm") {
         return {

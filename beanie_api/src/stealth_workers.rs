@@ -21,10 +21,9 @@
 // and the one remaining authority, outside this file.
 //
 // The final key is derived: sha256(domain || algo || path || kms_material),
-// so we rely only on the KMS returning stable secret bytes. The cosigner
-// ADDRESS is derived from the key, never configured. `expected_cosigner` (the
-// address clients pinned) turns any drift (app identity change, wrong path)
-// into a refusal to boot, instead of silently moving to a new address.
+// so we rely on the provider returning stable secret bytes for the configured
+// app and path. The cosigner address is derived from that key and published by
+// the API; clients store the returned identity with each lane for recovery.
 //
 // The factory is immutable, has no owner, and takes the cosigner PER ACCOUNT:
 // the account address commits to (entryPoint, client, cosigner, salt). One
@@ -230,7 +229,6 @@ fn yes() -> bool {
 ///                    "usdc":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
 ///                    "domain_name":"USD Coin","domain_version":"2"}},
 ///   "key_source":{"dstack":{"path":"beanie/cosigner/base"}},
-///   "expected_cosigner":"0x<published cosigner>",
 ///   "algo":"ecdsa_secp256k1",
 ///   "allowed_targets":["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]},
 ///  {"chain":"STARKNET",
@@ -253,12 +251,6 @@ pub struct ChainCfg {
     pub family: ChainFamily,
     /// Where the cosigner key material comes from (dstack KMS in production).
     pub key_source: KeySourceCfg,
-    /// STRONGLY RECOMMENDED. The cosigner address/pubkey you published and
-    /// clients pinned. Boot is refused if the derived one differs (app
-    /// identity change, wrong path, changed KEY_PURPOSE), because accounts
-    /// bind to the old address and a silent change would strand funds.
-    #[serde(default)]
-    pub expected_cosigner: Option<String>,
     pub algo: SigAlgo,
     /// EVM: the USDC contract (must equal `family.evm.usdc`). Starknet: token +
     /// pool contracts. Solana: mints (base58).
@@ -424,14 +416,17 @@ pub struct CosignerInfo {
     pub chain: String,
     pub algo: &'static str,
     pub cosigner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub factory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relayer: Option<String>,
 }
 
 impl ChainRegistry {
-    /// Loads each cosigner key from its source, derives its address, and
-    /// refuses to start if two chains share a key source or a cosigner
-    /// address, if a derived cosigner differs from `expected_cosigner`, or if
-    /// the config is too loose to be safe.
+    /// Loads each cosigner key from its source and derives its public identity.
+    /// The API publishes this identity; account derivation and claim validation
+    /// use the same runtime value, with no separately configured expected key.
+    /// Refuse duplicate key sources/cosigners or incomplete chain policies.
     pub async fn build(cfgs: Vec<ChainCfg>) -> Result<Self> {
         ensure!(!cfgs.is_empty(), "STEALTH_CHAINS_JSON has no chains");
         let mut chains = HashMap::new();
@@ -471,18 +466,6 @@ impl ChainRegistry {
                 CosignerId::Eth(a) => format!("{a:?}"),
                 CosignerId::Ed25519(p) => p.to_string(),
             };
-            if let Some(want) = &cfg.expected_cosigner {
-                ensure!(
-                    norm_target(want) == norm_target(&addr_key),
-                    "{chain:?}: derived cosigner {addr_key} != expected_cosigner {want}. \
-                     App identity, key path or KEY_PURPOSE changed? Do NOT proceed: \
-                     existing accounts bind to the old address."
-                );
-            } else {
-                warn!(
-                    "{chain:?}: no expected_cosigner set; publish {addr_key} and pin it in config"
-                );
-            }
             if let Some(other) = addr_owner.insert(addr_key.clone(), chain) {
                 bail!("cosigner {addr_key} shared by {other:?} and {chain:?}");
             }
@@ -543,10 +526,9 @@ impl ChainRegistry {
     }
 
     /// Public data only, in a canonical order. Serve this at
-    /// GET /api/v1/stealth/cosigners. Clients must ALSO pin the expected
-    /// cosigner out of band (app / docs): a value fetched only from the API
-    /// proves nothing against whoever controls the API.
-    pub fn public_info(&self) -> Vec<CosignerInfo> {
+    /// GET /api/v1/stealth/cosigners. The Solana relayer is included because
+    /// it is the fee payer embedded in client-built claim messages.
+    pub fn public_info(&self, solana_relayer: &Pubkey) -> Vec<CosignerInfo> {
         let mut v: Vec<CosignerInfo> = self
             .chains
             .iter()
@@ -564,6 +546,7 @@ impl ChainRegistry {
                     FamilyRt::Evm(ev) => Some(format!("{:?}", ev.factory)),
                     _ => None,
                 },
+                relayer: matches!(rt.fam, FamilyRt::Solana).then(|| solana_relayer.to_string()),
             })
             .collect();
         v.sort_by(|a, b| a.chain.cmp(&b.chain));
@@ -573,8 +556,8 @@ impl ChainRegistry {
     /// 64-byte TEE quote `report_data`: sha256(canonical cosigner list) || 32
     /// zero bytes. Request a quote with this so a client can verify "these
     /// exact cosigners are held by this attested app".
-    pub fn attestation_report_data(&self) -> Result<[u8; 64]> {
-        let json = serde_json::to_vec(&self.public_info())?;
+    pub fn attestation_report_data(&self, solana_relayer: &Pubkey) -> Result<[u8; 64]> {
+        let json = serde_json::to_vec(&self.public_info(solana_relayer))?;
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&Sha256::digest(json));
         Ok(out)
