@@ -6,30 +6,25 @@
 // and cached in the lane record. The passkey is used only to (a) verify a lane
 // restored from a backup, and (b) sign a claim.
 //
-// CLAIMING IS GATED. The backend's /stealth/claim expects chain-specific
-// payloads (EVM: ERC-4337 v0.7 userOpHash + auth3009; Starknet: INVOKE V3 hash
-// + `starknet` object) that its `precheck` validates byte for byte. Register
-// builders below once those formats are confirmed; until then the button
-// explains itself instead of sending a payload the server would reject.
+// Claims are built locally in stealth.claim.js in the exact formats validated
+// by the backend: EIP-3009 digest, Starknet INVOKE V3 hash, or Solana message hash.
 //
 // A builder receives { lane, signer, destination, balance } and returns
 //   { txHash, clientSig, calls, auth3009?, starknet?, messageBytes? }
 // where txHash is exactly the hash the claim binding and signature use.
 
 import * as api from "./api.js";
-import { CHAINS, apiChain, chainIcon, chainLabel, wire } from "./chains.js";
+import { CHAINS, apiChain, chainByKey, chainIcon, chainLabel, wire } from "./chains.js";
 import { canonicalAddress } from "./identity.js";
+import { assertPinnedStealthConfig } from "./lane.js";
 import { verifyLane } from "./lane.js";
 import { tokenBalance } from "./onchain.js";
 import { evaluatePrf, getVerifiedToken } from "./passkey.js";
 import { deriveStealthSigner, laneSalt, wipe } from "./stealth.core.js";
+import { CLAIM_BUILDERS } from "./stealth.claim.js";
 import * as store from "./store.js";
 import { $, describeError, downloadText, escapeHtml, formatUsdc, notify, short } from "./ui.js";
-
-export const CLAIM_BUILDERS = {
-    // BASE: async ({ lane, signer, destination, balance }) => ({ ... }),
-    // STARKNET: async ({ lane, signer, destination, balance }) => ({ ... }),
-};
+import { ApiError } from "./api.js";
 
 let rows = []; // { lane, balance: bigint|null }
 let selected = null;
@@ -97,6 +92,42 @@ function render() {
 
 /* ---------- claim ---------- */
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function pollClaimBalance(lane, previousBalance, reference) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+        await delay(4000);
+        try {
+            const balance = await tokenBalance(lane.targetChain, lane.targetRecipient);
+            rows = rows.map((row) => row.lane.id === lane.id ? { ...row, balance } : row);
+            if (selected?.lane.id === lane.id) selected = { lane, balance };
+            render();
+            if (balance < previousBalance) {
+                if (selected?.lane.id === lane.id) {
+                    setStatus(`Claim reference ${short(reference)} processed. Remaining balance: ${formatUsdc(balance)} USDC.`);
+                }
+                return;
+            }
+        } catch {
+            // The queue has no status route; keep checking the chain balance.
+        }
+    }
+    if (selected?.lane.id === lane.id) {
+        setStatus(`Claim reference ${short(reference)} is queued. The balance has not changed yet.`);
+    }
+}
+
+function claimErrorMessage(err) {
+    if (!(err instanceof ApiError)) return describeError(err);
+    if (err.status === 400) return `Claim rejected: ${err.message.replace(/^Claim rejected:\s*/i, "")}`;
+    if (err.status === 401) return "The passkey approval expired or did not match this claim. Please try again.";
+    if (err.status === 429) return err.retryAfter
+        ? `Too many claim attempts. Try again in ${err.retryAfter} seconds.`
+        : "Too many claim attempts. Try again later.";
+    if (err.status === 503) return "Claims are temporarily unavailable for this chain. Your funds remain in the private lane.";
+    return describeError(err);
+}
+
 async function claim() {
     if (busy) return;
     if (!selected) return setStatus("Select a lane first.");
@@ -105,10 +136,11 @@ async function claim() {
     if (!destination) return setStatus(`Enter a valid ${chainLabel(lane.targetChain)} destination address.`);
     if (!(balance > 0n)) return setStatus("Nothing to claim on this lane.");
 
-    const builder = CLAIM_BUILDERS[wire(lane.targetChain)];
+    const chain = chainByKey(lane.targetChain);
+    const builder = CLAIM_BUILDERS[chain?.kind];
     if (!builder) {
         return setStatus(
-            `Claiming on ${chainLabel(lane.targetChain)} is not enabled yet. Your funds are safe: the passkey and lane backup can claim them once it is.`
+            `Claiming on ${chainLabel(lane.targetChain)} is not supported yet.`
         );
     }
 
@@ -117,27 +149,34 @@ async function claim() {
     let secret = null;
     let signer = null;
     try {
+        const config = await assertPinnedStealthConfig(chain, lane.stealthConfig ?? null);
         setStatus("Confirm your passkey to unlock this lane…");
         secret = await evaluatePrf(await laneSalt(lane.id), lane.prfCredentialId || undefined);
-        signer = await deriveStealthSigner({ laneSecret: secret, laneId: lane.id, index: lane.index || 0, chain: lane.targetChain });
+        signer = await deriveStealthSigner({
+            laneSecret: secret,
+            laneId: lane.id,
+            index: lane.index || 0,
+            chain: lane.targetChain,
+            config,
+        });
         if (signer.address !== lane.targetRecipient) {
             throw new Error("This passkey does not match the lane. Use the passkey the lane was created with.");
         }
 
         // Order matters: build -> hash -> token (bound to the hash) -> post.
         setStatus("Building claim…");
-        const built = await builder({ lane, signer, destination, balance });
-        if (!built?.txHash || !built?.clientSig) throw new Error("Claim builder returned an incomplete result.");
+        const built = await builder({ lane, signer, destination, balance, config });
+        if (!built?.txHash || !built?.clientSig || !built?.derivedAddress) throw new Error("Claim builder returned an incomplete result.");
 
         setStatus("Confirm again to authorize this claim…");
-        const binding = `claim:${apiChain(lane.targetChain)}:${lane.targetRecipient}:${built.txHash}`;
+        const binding = `claim:${apiChain(lane.targetChain)}:${built.derivedAddress}:${built.txHash}`;
         const { verifiedToken } = await getVerifiedToken(binding, { maxUses: 1 });
 
         setStatus("Submitting…");
         const res = await api.submitStealthClaim({
             chain: lane.targetChain,
             txHash: built.txHash,
-            derivedAddress: lane.targetRecipient,
+            derivedAddress: built.derivedAddress,
             clientSig: built.clientSig,
             verifiedToken,
             calls: built.calls,
@@ -145,12 +184,13 @@ async function claim() {
             starknet: built.starknet,
             messageBytes: built.messageBytes,
         });
-        setStatus(`Claim queued. Reference: ${res?.transaction_hash || built.txHash}`);
-        notify("Claim queued", "success");
-        setTimeout(() => refresh().catch(() => { }), 15000);
+        const reference = res?.transaction_hash || built.txHash;
+        setStatus(`Claim queued. Claim reference: ${short(reference)}. Checking balance…`);
+        notify("Claim queued", "success", `Claim reference ${short(reference)}`);
+        void pollClaimBalance(lane, balance, reference);
     } catch (err) {
         console.error("[stealth] claim failed", err);
-        setStatus(`Claim failed: ${describeError(err)}`);
+        setStatus(`Claim failed: ${claimErrorMessage(err)}`);
     } finally {
         wipe(secret);
         signer = null;

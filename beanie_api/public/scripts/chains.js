@@ -54,6 +54,7 @@ export const SOLANA_RECEIVER_KIND = "wallet";
 export const SOLANA_CCTP_RECIPIENT = "wallet";
 
 export const SOLANA_PLACEHOLDER_KEEPER = "11111111111111111111111111111111"; // all-zero key: signs nothing
+export const SOLANA_STEALTH_COSIGNER = null; // TODO: pin GET /stealth/cosigners out of band
 
 /** Internal read API (keeps provider keys server-side). See rpc_proxy.rs. */
 export const RPC_PROXY_ENABLED = true;
@@ -73,8 +74,12 @@ export const STRICT_PREDICTION = true;
 export function isPlaceholder(value) {
     if (!value) return true;
     const v = String(value).toLowerCase();
-    return /^0x0*$/.test(v) || v.includes("0123456789abcdef0123456789abcdef");
+    return v === SOLANA_PLACEHOLDER_KEEPER.toLowerCase() || /^0x0*$/.test(v) ||
+        v.includes("0123456789abcdef0123456789abcdef") || v.includes("your") || v.includes("placeholder");
 }
+
+const isEvmAddress = (value) => /^0x[0-9a-f]{40}$/i.test(String(value ?? ""));
+const isFelt = (value) => /^0x[0-9a-f]{1,64}$/i.test(String(value ?? ""));
 
 export const USDC_DECIMALS = 6;
 
@@ -87,6 +92,7 @@ export const KEEPER_STARKNET_ADDRESS =
     "0x01d4a73b58909eb341e6357bd085fea917d71c386ebaecd770792f7b5a34615a";
 
 const USDC_EIP712 = { name: "USD Coin", version: "2" };
+const MONAD_USDC_EIP712 = { name: "USDC", version: "2" };
 
 export const CHAINS = {
     BASE: {
@@ -101,15 +107,9 @@ export const CHAINS = {
         explorerBase: "https://basescan.org",
         eip712: USDC_EIP712,
         stealth: {
-            // The stealth account factory (CREATE2 deployer). CONFIRM it is the
-            // receiver factory address and not a separate contract.
-            factory: "0x51E9813CAd0d94b0eBC8AedC27706bDE2a94d49A",
-            entryPoint: "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-            cosigner: ZERO_ADDR, // TODO: real TEE cosigner address
-            // TODO: creation bytecode (hex, WITHOUT constructor args) of the
-            // stealth account. CREATE2 needs keccak256(creationCode ++ ctorArgs),
-            // so a bare bytecode *hash* is not enough to compute the address.
-            initCode: null,
+            // Pin both values out of band before enabling private lanes.
+            factory: null, // TODO: deployed StealthAccountFactory address
+            cosigner: ZERO_ADDR, // TODO
         },
     },
     ETHEREUM: {
@@ -123,7 +123,11 @@ export const CHAINS = {
         explorerAddress: "https://etherscan.io/address/",
         explorerBase: "https://etherscan.io",
         eip712: USDC_EIP712,
-        stealth: null,
+        stealth: {
+            // Pin both values out of band before enabling private lanes.
+            factory: null, // TODO: deployed StealthAccountFactory address
+            cosigner: ZERO_ADDR, // TODO
+        },
     },
     ARBITRUM: {
         key: "ARBITRUM",
@@ -136,7 +140,11 @@ export const CHAINS = {
         explorerAddress: "https://arbiscan.io/address/",
         explorerBase: "https://arbiscan.io",
         eip712: USDC_EIP712,
-        stealth: null,
+        stealth: {
+            // Pin both values out of band before enabling private lanes.
+            factory: null, // TODO: deployed StealthAccountFactory address
+            cosigner: ZERO_ADDR, // TODO
+        },
     },
     MONAD: {
         key: "MONAD",
@@ -144,12 +152,16 @@ export const CHAINS = {
         kind: "evm",
         chainId: 143, // VERIFY
         rpc: "https://rpc.monad.xyz", // VERIFY
-        usdc: null, // TODO
+        usdc: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
         factory: null, // TODO
         explorerAddress: null,
         explorerBase: null,
-        eip712: null, // TODO: USDC domain name/version on Monad
-        stealth: null,
+        eip712: MONAD_USDC_EIP712,
+        stealth: {
+            // Pin both values out of band before enabling private lanes.
+            factory: null, // TODO: deployed StealthAccountFactory address
+            cosigner: ZERO_ADDR, // TODO
+        },
     },
     STARKNET: {
         key: "STARKNET",
@@ -160,14 +172,13 @@ export const CHAINS = {
         factory: "0x074fc53d92ed14249d7d7f37a22d879ad6d5660c2f86bcf5ae74e3d22347e30c",
         explorerAddress: "https://starkscan.co/contract/",
         stealth: {
-            classHash: "0x1764a400b3131c39a4ecb85199ac75ba2717c498d9a0245e932ec815674a003",
-            cosignerPubKey: "0x0456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01", // TODO: dummy value
-            shieldedPool: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a",
-            // Invoke-v3 resource bounds for gasless claims. TUNE: they must cover
-            // the UDC deploy + approve + shield_deposit execution.
+            classHash: null, // TODO: pin the deployed current StealthAccount class hash
+            cosigner: ZERO_ADDR, // TODO: pin the secp256k1 Ethereum address
+            chainId: "0x534e5f4d41494e",
+            maxFeeFri: "200000000000000000", // 0.2 STRK; must match backend config
             resourceBounds: {
                 l1_gas: { max_amount: "0x2710", max_price_per_unit: "0x174876e800" },
-                l2_gas: { max_amount: "0x1c9c380", max_price_per_unit: "0x2540be400" },
+                l2_gas: { max_amount: "0x112a880", max_price_per_unit: "0x2540be400" },
                 l1_data_gas: { max_amount: "0x1b58", max_price_per_unit: "0x174876e800" },
             },
         },
@@ -230,20 +241,46 @@ export const canGasless = (c) =>
 /** Stealth config is complete and free of placeholder values. */
 export function stealthReady(c) {
     const s = c?.stealth;
+    if (c?.kind === "solana") {
+        return Boolean(c.usdc && c.keeper && c.keeper !== SOLANA_PLACEHOLDER_KEEPER && !isPlaceholder(SOLANA_STEALTH_COSIGNER));
+    }
     if (!s) return false;
     if (c.kind === "evm") {
         return (
-            Boolean(s.factory && s.entryPoint) &&
-            !isPlaceholder(s.cosigner) &&
-            !isPlaceholder(s.initCode)
+            isEvmAddress(s.factory) && !isPlaceholder(s.factory) &&
+            isEvmAddress(s.cosigner) && !isPlaceholder(s.cosigner) &&
+            isEvmAddress(c.usdc) && Boolean(c.eip712?.name && c.eip712?.version && c.chainId)
         );
     }
     if (c.kind === "starknet") {
-        return Boolean(s.classHash && s.shieldedPool) && !isPlaceholder(s.cosignerPubKey);
+        return isFelt(s.classHash) && !isPlaceholder(s.classHash) && isEvmAddress(s.cosigner) && !isPlaceholder(s.cosigner) &&
+            Boolean(s.chainId && c.usdc && s.maxFeeFri && s.resourceBounds);
     }
     return false;
 }
 export const stealthChains = () => Object.values(CHAINS).filter(stealthReady);
+
+/** Snapshot of the pinned parameters used to derive a private lane. */
+export function stealthConfigFor(chainOrKey) {
+    const chain = typeof chainOrKey === "string" ? chainByKey(chainOrKey) : chainOrKey;
+    if (!chain) return null;
+    if (chain.kind === "solana") {
+        return { cosigner: SOLANA_STEALTH_COSIGNER, relayer: chain.keeper, usdc: chain.usdc };
+    }
+    if (chain.kind === "evm") {
+        return {
+            ...chain.stealth,
+            chainId: chain.chainId,
+            usdc: chain.usdc,
+            eip712: chain.eip712,
+            maxAuthWindowSecs: chain.stealth.maxAuthWindowSecs ?? 86400,
+        };
+    }
+    if (chain.kind === "starknet") {
+        return { ...chain.stealth, usdc: chain.usdc };
+    }
+    return null;
+}
 
 export function chainIcon(key, size = 24) {
     const k = wire(key);

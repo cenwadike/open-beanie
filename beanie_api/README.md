@@ -36,7 +36,7 @@ flowchart LR
     W1 & W2 & W3 & T --> CH["EVM x4, Starknet, Solana"]
 ```
 
-The API follows an **accept, then process** model. Every write endpoint checks the request, enqueues a task and returns `202 Accepted`. The result of the on-chain work is delivered by signed webhook, not in the HTTP response.
+The API follows an **accept, then process** model. Write endpoints validate and enqueue work, usually returning `202 Accepted`. Payment and receiver work can produce signed webhooks; stealth claims have no status route or claim webhook, so the frontend checks the lane balance after enqueueing.
 
 | Chain family | Chains |
 |---|---|
@@ -135,6 +135,7 @@ A redemption requires an exact (case-insensitive) binding match and a live TTL. 
 | `POST` | `/api/v1/create` | `verified_token` | Announce receivers on all six chains. |
 | `POST` | `/api/v1/pay` | payer signature | Submit a gasless payment. |
 | `POST` | `/api/v1/stealth/claim` | `verified_token` + client signature | Spend a stealth payment. |
+| `GET` | `/api/v1/stealth/cosigners` | none | Publish public cosigner identities and their attestation commitment. |
 
 Any other path falls through to the static frontend handler.
 
@@ -299,27 +300,33 @@ curl -X POST https://<host>/api/v1/pay \
 
 ### `POST /api/v1/stealth/claim`
 
-Spends a stealth payment. The **client signature** (`client_sig`) is the real on-chain spend authorization. The passkey is an anti-abuse gate, and the server holds no spending key. A TEE co-signer and the relayer complete the 2-of-2 gaslessly.
+Spends the full USDC balance of one private lane to a single destination. The **client signature** (`client_sig`) is the spend authorization. The passkey token is an anti-abuse gate bound to the exact chain, account, and signing hash; the API does not hold the client key. A per-chain TEE cosigner and keeper complete the family-specific relay.
 
 | Field | Type | Applies to | Description |
 |---|---|---|---|
 | `chain` | string | all | Must be enabled for claims. |
 | `tx_hash` | string | all | Family-specific signing hash (see below). |
-| `derived_address` | string | all | The stealth account being spent. |
-| `client_sig` | object | all | `{ r1, s1, v? }` (ECDSA) or `{ sig_hex }` (Ed25519, 128 hex chars). |
+| `derived_address` | string | all | EVM/Starknet smart account or Solana client Ed25519 signer address. |
+| `client_sig` | object | all | EVM `{ r1, s1, v? }` (secp256k1), Starknet `{ r1, s1 }` (STARK curve), or Solana `{ sig_hex }` (128 hex chars). |
 | `verified_token` | string | all | Bound to `claim:{chain}:{derived_address}:{tx_hash}`. |
-| `calls` | array | EVM, Starknet | `{ contract_address, entrypoint, calldata[] }`, 1..20 calls. Send `[]` on Solana. |
-| `auth3009` | object | EVM | EIP-3009 parameters the client signed. |
-| `starknet` | object | Starknet | Invoke-v3 hash inputs: pubkey, salt, nonce, tip, resource bounds. |
-| `message_bytes` | string | Solana | Hex of the serialized legacy `Message`, at most 1232 bytes. |
+| `calls` | array | Starknet | `{ contract_address, entrypoint, calldata[] }`, 1..20 calls. EVM/Solana send `[]`; Starknet targets and entrypoints are allowlisted. |
+| `auth3009` | object | EVM | `client`, `to`, `value`, `valid_after`, `valid_before`, `nonce`, and `salt`. `client` is the EVM client signing address; the signed authorization `from` is `derived_address`. |
+| `starknet` | object | Starknet | `client_pubkey`, `deploy_salt`, `nonce`, `tip`, `l1_gas`, `l2_gas`, and `l1_data_gas`. |
+| `message_bytes` | string | Solana | Hex of the canonical serialized legacy `Message`, at most 1232 bytes. |
 
 | Family | `tx_hash` is |
 |---|---|
-| EVM | ERC-4337 v0.7 `userOpHash`. Client signs EIP-191 of it. |
+| EVM | EIP-712 EIP-3009 `TransferWithAuthorization` digest `D`. Client signs EIP-191(`D`). This path uses ERC-1271 and does not use ERC-4337 or an EntryPoint. |
 | Starknet | Native INVOKE V3 transaction hash. |
 | Solana | `sha256(message_bytes)`. |
 
-The route runs the worker's own `precheck`. It recomputes the signing hash from the submitted calls, enforces allowlists and verifies the client signature where possible, so a bad claim fails with `400` now instead of silently in the worker.
+For EVM, `auth3009` describes one USDC authorization and `calls` must be empty. The worker checks that the factory derives `derived_address` for `(client, cosigner, salt)`, that the authorization nonce is unused, and that the destination, value, time window, and token domain are valid. If the account is undeployed, `createAccount` and the USDC authorization execute in one atomic Multicall3 transaction.
+
+For Starknet, `calls` must contain the transfer and the worker recomputes the INVOKE V3 hash from the calls, nonce, tip, and resource bounds. The account is deployed through the UDC if needed, and the keeper funds up to the configured `max_fee_fri`.
+
+For Solana, `message_bytes` must encode exactly one allowlisted-mint SPL `TransferChecked`; the keeper is fee payer, and the client/cosigner must match the seeded multisig authority. The client signature is verified over the exact serialized message.
+
+The route runs the worker's own `precheck`, recomputes the family-specific signing hash, enforces allowlists and verifies the client signature before enqueueing. A `202` means queued, not confirmed. The `transaction_hash` response field echoes the signing hash; it is not the on-chain transaction hash. There is no claim status endpoint or claim webhook.
 
 **Response `202`**
 
@@ -340,6 +347,12 @@ The route runs the worker's own `precheck`. It recomputes the signing hash from 
 | `429` | Rate limit exceeded. |
 | `503` | Chain disabled for claims, or claim queue full (non-blocking `try_send`). |
 | `500` | Claim worker is not running. |
+
+### `GET /api/v1/stealth/cosigners`
+
+Returns `{ "cosigners": [...], "report_data": "0x..." }`. Each configured chain entry contains its rendered chain name, signature algorithm, cosigner identity, and an EVM factory address where applicable. `report_data` commits to the canonical public cosigner list for use in TEE quote verification.
+
+This endpoint is for discovery and monitoring, not trust. Clients must compare the returned cosigner (and EVM factory) with values pinned out of band before deriving an account or creating a private lane. The registry also checks `expected_cosigner` at startup and refuses to boot if the derived key does not match.
 
 ---
 
@@ -392,7 +405,7 @@ All queues are bounded Tokio `mpsc` channels created at startup.
 |---|---|---|---|
 | Announce | 2048 | `/create` | Announce worker: calls `announceReceiver` on each chain. On Solana it also prepares and announces the pre-signed registration. |
 | Payment | 2048 | `/pay` | Payment worker: submits the gasless transfer and sweeps. |
-| Stealth | 2048 | `/stealth/claim` | Stealth workers: Fireblocks co-sign, then relay. |
+| Stealth | 2048 | `/stealth/claim` | Stealth workers: in-process TEE co-sign, then chain-specific relay. |
 | Webhook | 4096 | Transfer and payment workers | Webhook worker: signed delivery with retries. |
 
 The **transfer worker** has no queue. It runs one task per chain, indexing announces and deposits, registering receivers just in time, and sweeping. A periodic reconciliation pass re-checks known receivers' balances so a failed sweep is retried.
@@ -412,9 +425,9 @@ Loaded from the environment (`.env` is read automatically). Each chain has its o
 | EVM (per chain) | Prefixed `BASE`, `ETHEREUM`, `ARBITRUM`, `MONAD`: RPC URL, keeper key, factory, webhook registry, USDC token, Subsquid Portal URL and key, start blocks |
 | Starknet | RPC URL, events RPC URL and key, keeper key and address, factory, token, start blocks |
 | Solana | `SOLANA_PROGRAM_ID`, `SOLANA_MINT`, `SOLANA_KEEPER_PRIVATE_KEY`, `SOLANA_RPC_URL`, `SOLANA_REGISTRY_START_SLOT`, `SOLANA_DEPOSIT_START_SLOT`, `SOLANA_SUBSQUID_PORTAL_URL`, `SOLANA_SUBSQUID_PORTAL_API_KEY` |
-| Stealth | `STEALTH_CHAINS_JSON` and the Fireblocks credentials |
+| Stealth | `STEALTH_CHAINS_PATH` or `STEALTH_CHAINS_JSON`; per-chain factory/token/domain/class hash, key source, `expected_cosigner`, and allowlists are defined by `ChainCfg` in `stealth_chains.json` |
 
-Startup fails fast when configuration is unusable: a missing or invalid stealth chain list, duplicate vault or cosigner addresses, an EVM RPC reporting the wrong chain id, or an unreadable Solana factory config. The Solana treasury token account is read from the on-chain factory config, not from the environment.
+Cosigner keys normally come from the dstack KMS using a distinct `key_source.dstack.path` per chain. For local development only, `key_source.dev_env` requires `ALLOW_DEV_KEYS=1` and the named environment variable. Never use development keys in production. Startup fails fast for an invalid chain list, reused key sources or cosigners, mismatched `expected_cosigner`, wrong EVM chain IDs or token domain separators, and incompatible factories. Replace every `REPLACE_WITH_*` value in the checked-in example before using it as a live config. The Solana treasury token account is read from the on-chain factory config, not from the environment.
 
 ---
 
@@ -465,7 +478,7 @@ Unmatched routes are served from `public/`:
 | HTTP semantics | RFC 9110 |
 | Passkeys | W3C WebAuthn (Level 2) |
 | EVM gasless transfer | ERC-3009, EIP-712, EIP-191 |
-| EVM account abstraction | ERC-4337 v0.7 |
+| EVM account interface compatibility | ERC-4337 v0.7; the stealth EVM claim relay uses ERC-1271 with EIP-3009, not ERC-4337. |
 | Starknet gasless execution | SNIP-9 (outside execution) |
 | Cross-chain settlement | Circle CCTP V2 |
 | Webhook de-duplication | `Idempotency-Key` header |

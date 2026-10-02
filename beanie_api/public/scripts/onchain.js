@@ -14,10 +14,14 @@ import {
     RPC_PROXY_ENABLED, RPC_PROXY_PATH, SOLANA_RECEIVER_KIND, STARKNET_TRANSFER_SELECTOR, STRICT_PREDICTION, chainByKey,
 } from "./chains.js";
 import { TOKEN_PROGRAM, fromBase64, receiverFromAnnouncedEvent, receiverPdas, usdcAta } from "./solana.js";
+import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.js";
 
 const EVM_PREDICT_SELECTOR = "0xf05b69dd"; // predictReceiverAddress(address,bytes32,bytes32)
 const STARKNET_PREDICT_SELECTOR = "0x28d4d0fe094b456bae50b2d871903c993ba153ec519b7f4f1c71252fa4304cf";
 const STARKNET_BALANCEOF_SELECTOR = "0x2e4263afad30923c891518314c3c95dbe830a16874e8abc5777a9a20b54c76";
+const STEALTH_FACTORY = new ethers.Interface([
+    "function getAddress(address client,address cosigner,bytes32 salt) view returns (address)",
+]);
 const EVM_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 const EVM_LOG_WINDOW = 2000; // proxy allows up to 5000
@@ -110,7 +114,6 @@ export async function rpc(chainKey, method, params, { direct = false, proxyOnly 
 }
 
 // ---- receiver prediction ----------------------------------------------------
-
 async function predictVia(chain, merchant, route, opts) {
     if (chain.kind === "evm") {
         const data = EVM_PREDICT_SELECTOR + pad32(merchant) + route.chain32.slice(2) + route.recipient32.slice(2);
@@ -162,6 +165,56 @@ export async function predictReceiver(chainKey, merchant, route) {
     if (viaDirect.status === "fulfilled") return viaDirect.value;
     if (viaProxy.status === "fulfilled") return viaProxy.value;
     throw viaDirect.reason;
+}
+
+async function stealthAddressVia(chain, factory, client, cosigner, salt, opts) {
+    const data = STEALTH_FACTORY.encodeFunctionData("getAddress", [client, cosigner, salt]);
+    const result = await rpc(chain.key, "eth_call", [{ to: factory, data }, "latest"], opts);
+    const [address] = STEALTH_FACTORY.decodeFunctionResult("getAddress", result);
+    return address.toLowerCase();
+}
+
+/** Two-source-confirmed CREATE2 address from the current StealthAccountFactory. */
+export async function predictStealthAccount(chainKey, client, cosigner, salt, factory) {
+    const chain = requireChain(chainKey);
+    if (chain.kind !== "evm") throw new Error(`${chain.name} does not use an EVM stealth factory.`);
+    const targetFactory = factory || chain.stealth?.factory;
+    if (!targetFactory) throw new Error(`The ${chain.name} StealthAccountFactory address is not configured.`);
+    if (!/^0x[0-9a-f]{64}$/i.test(String(salt))) throw new Error("Invalid private-lane salt.");
+    if (!RPC_PROXY_ENABLED) {
+        return stealthAddressVia(chain, targetFactory, client, cosigner, salt, { direct: true });
+    }
+
+    const [viaProxy, viaDirect] = await Promise.allSettled([
+        stealthAddressVia(chain, targetFactory, client, cosigner, salt, { proxyOnly: true }),
+        stealthAddressVia(chain, targetFactory, client, cosigner, salt, { direct: true }),
+    ]);
+    if (viaProxy.status === "fulfilled" && viaDirect.status === "fulfilled") {
+        if (!sameAddress(chain.kind, viaProxy.value, viaDirect.value)) {
+            throw new Error(`The ${chain.name} stealth account differs between RPC sources; refusing to continue.`);
+        }
+        return viaDirect.value;
+    }
+    if (STRICT_PREDICTION) {
+        const why = (viaProxy.status === "rejected" ? viaProxy.reason : viaDirect.reason)?.message;
+        throw new Error(`Could not confirm the ${chain.name} stealth account with two independent RPC sources (${why}). Try again.`);
+    }
+    if (viaDirect.status === "fulfilled") return viaDirect.value;
+    if (viaProxy.status === "fulfilled") return viaProxy.value;
+    throw viaDirect.reason;
+}
+
+/** Account nonce for a Starknet contract; an explicitly undeployed address has nonce zero. */
+export async function starknetAccountNonce(chainKey, address) {
+    const chain = requireChain(chainKey);
+    if (chain.kind !== "starknet") throw new Error(`${chain.name} does not have a Starknet account nonce.`);
+    try {
+        const nonce = await rpc(chain.key, "starknet_getNonce", ["latest", address], { direct: true });
+        return BigInt(nonce);
+    } catch (e) {
+        if (e instanceof RpcError && (e.code === 20 || /contract.?not.?found/i.test(e.message))) return 0n;
+        throw e;
+    }
 }
 
 // ---- balances / existence ---------------------------------------------------

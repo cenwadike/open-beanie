@@ -1,15 +1,36 @@
 // ============================================================================
-// stealth_workers.rs
+// stealth_workers.rs  (dstack/Phala: cosigner key derived inside the TEE)
 //
 // One "round" = one StealthTask dequeued and driven to a confirmed tx:
 //   1 resolve   chain registry lookup, claims enabled?
 //   2 screen    `precheck`: allowlists, hash recompute, client-sig check.
 //               Pure and sync. The route runs the SAME function, so a claim
 //               the worker would reject is rejected with a 400 instead.
-//   3 cosign    ask the chain's own Fireblocks vault; VERIFY the result
+//   3 cosign    sign with the chain's own in-process cosigner key (lives only
+//               in the TEE's encrypted RAM); VERIFY the result
 //   4 assemble  build the 2-of-2 signature / transaction
 //   5 preflight simulate (bad sigs fail here, before fees)
 //   6 relay     keeper submits, we wait for on-chain success
+//
+// Cosigner keys (trust model): each provider runs its OWN worker as a dstack
+// app (confidential VM). Key material comes from the dstack KMS, bound to the
+// app's identity and a per-chain `path`, so the same app gets the same key on
+// every restart and on any host, and no human ever holds it. Which code may
+// run as that app is controlled by the provider's own dstack authorization
+// (their IaC / on-chain allowlist); that is the provider's security posture
+// and the one remaining authority, outside this file.
+//
+// The final key is derived: sha256(domain || algo || path || kms_material),
+// so we rely only on the KMS returning stable secret bytes. The cosigner
+// ADDRESS is derived from the key, never configured. `expected_cosigner` (the
+// address clients pinned) turns any drift (app identity change, wrong path)
+// into a refusal to boot, instead of silently moving to a new address.
+//
+// The factory is immutable, has no owner, and takes the cosigner PER ACCOUNT:
+// the account address commits to (entryPoint, client, cosigner, salt). One
+// factory per chain therefore serves every provider; there is nothing to pin
+// at the factory. The binding check is
+//     factory.getAddress(client, OUR_COSIGNER, salt) == from
 //
 // What each chain's contract forces (read from StealthAccount.sol/.cairo):
 //
@@ -23,14 +44,14 @@
 //                  hash_message(D), never raw D.
 //         sig    = client65 || cosigner65 (130 bytes), passed to the `bytes`
 //                  overload of transferWithAuthorization (FiatTokenV2_2).
-//         tx     = Multicall3.aggregate3([factory.createAccount (only if the
-//                  account has no code yet), usdc.transferWithAuthorization]).
+//         tx     = Multicall3.aggregate3([factory.createAccount(client,
+//                  cosigner, salt) (only if the account has no code yet),
+//                  usdc.transferWithAuthorization]).
 //       USDC verifies via ERC-1271, which needs code, so createAccount goes
 //       first in the same atomic batch. `to`, `value` and `nonce` are inside
 //       what is signed, so a relayer cannot redirect funds, and replay is
-//       blocked on-chain by USDC's authorizationState. The factory pins our
-//       cosigner, so `factory.getAddress(client, salt) == from` proves the
-//       account is bound to OUR vault key. One claim = one authorization.
+//       blocked on-chain by USDC's authorizationState. One claim = one
+//       authorization.
 //       Sends go through the shared `SignerProvider` (NonceManagerMiddleware),
 //       the same client the payment/sweep workers use, so nonces never drift.
 //
@@ -56,16 +77,17 @@ use anchor_lang::solana_program::system_instruction;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use beanie_keeper::evm_keeper::{Call3, MULTICALL3_ADDRESS, Multicall3, SignerProvider};
 use beanie_keeper::starknet_keeper::build_starknet_account;
+use dstack_sdk::dstack_client::DstackClient;
 use ethers::abi::{Token, encode};
 use ethers::contract::abigen;
 use ethers::providers::{Http, Middleware, Provider};
+use ethers::signers::{LocalWallet, Signer as EthSigner};
 use ethers::types::{
     Address, Bytes, Eip1559TransactionRequest, H256, Signature as EthSignature, U256,
 };
 use ethers::utils::{hash_message, keccak256};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode as jwt_encode};
 use log::{error, info, warn};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::CommitmentConfig;
@@ -73,7 +95,7 @@ use solana_sdk::{
     message::Message as SolanaMessage,
     program_pack::Pack,
     pubkey::Pubkey,
-    signature::{Keypair, Signature as SolanaSignature, Signer as SolSigner},
+    signature::{Keypair, Signature as SolanaSignature, Signer as SolSigner, keypair_from_seed},
     transaction::Transaction as SolanaTransaction,
 };
 use spl_token::instruction::TokenInstruction;
@@ -87,7 +109,6 @@ use starknet::core::utils::{get_contract_address, get_selector_from_name};
 use starknet::providers::{Provider as StarknetProvider, ProviderError};
 use starknet_crypto::poseidon_hash_many;
 use tokio::sync::{Mutex, Semaphore, mpsc};
-use uuid::Uuid;
 
 use crate::models::{AppState, Chain, StealthTask};
 use crate::stealth_routes::{Auth3009Params, ClientSignature, StarknetTxParams};
@@ -95,8 +116,6 @@ use crate::stealth_routes::{Auth3009Params, ClientSignature, StarknetTxParams};
 const MAX_CONCURRENT_ROUNDS: usize = 8;
 const ROUND_TIMEOUT: Duration = Duration::from_secs(300);
 const DEDUPE_TTL: Duration = Duration::from_secs(3600);
-const FB_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const FB_POLL_ATTEMPTS: usize = 60;
 const EVM_RECEIPT_POLL: Duration = Duration::from_secs(2);
 const EVM_RECEIPT_ATTEMPTS: usize = 90;
 const STARK_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -113,8 +132,12 @@ const MAX_CALLS: usize = 20;
 const MAX_SOLANA_MESSAGE: usize = 1232;
 const MULTISIG_SEED_DOMAIN: &[u8] = b"beanie-multisig-v1";
 
+/// Domain separation + dstack `purpose` for cosigner key derivation. Changing
+/// this changes every cosigner address: never change it after launch.
+const KEY_PURPOSE: &str = "beanie-cosigner-v1";
+
 /// An EVM authorization must still be valid this long after the worker starts
-/// on it: cosigning (MPC) and inclusion both take time.
+/// on it: cosigning and inclusion both take time.
 const MIN_AUTH_TTL_SECS: u64 = 120;
 
 // Starknet resource names inside the V3 fee-fields hash.
@@ -142,7 +165,8 @@ pub enum ChainFamily {
         /// Used for the startup checks only. Runtime traffic goes through the
         /// shared keeper `SignerProvider`.
         rpc_url: String,
-        /// StealthAccountFactory (one per chain; pins entryPoint + OUR cosigner).
+        /// StealthAccountFactory (immutable, no owner; takes the cosigner per
+        /// account, so one factory per chain serves every provider).
         factory: String,
         /// The EIP-3009 token (Circle USDC, FiatTokenV2_2 with the `bytes`
         /// signature overload). Must also be listed in `allowed_targets`.
@@ -183,13 +207,16 @@ pub enum SigAlgo {
     Ed25519,
 }
 
-impl SigAlgo {
-    fn fireblocks_name(self) -> &'static str {
-        match self {
-            SigAlgo::EcdsaSecp256k1 => "MPC_ECDSA_SECP256K1",
-            SigAlgo::Ed25519 => "MPC_EDDSA_ED25519",
-        }
-    }
+/// Where a chain's cosigner key material comes from.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySourceCfg {
+    /// Material from the dstack KMS, bound to THIS app's identity. `path`
+    /// separates chains: same app + same path => same key, always.
+    Dstack { path: String },
+    /// Local development only. Refused unless ALLOW_DEV_KEYS=1. `env` is the
+    /// NAME of an env var holding arbitrary secret text.
+    DevEnv { env: String },
 }
 
 fn yes() -> bool {
@@ -202,21 +229,36 @@ fn yes() -> bool {
 ///                    "factory":"0x<StealthAccountFactory>",
 ///                    "usdc":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
 ///                    "domain_name":"USD Coin","domain_version":"2"}},
-///   "vault_id":"11","asset_id":"<verify in Fireblocks>","algo":"ecdsa_secp256k1",
+///   "key_source":{"dstack":{"path":"beanie/cosigner/base"}},
+///   "expected_cosigner":"0x<published cosigner>",
+///   "algo":"ecdsa_secp256k1",
 ///   "allowed_targets":["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]},
 ///  {"chain":"STARKNET",
 ///   "family":{"starknet":{"chain_id":"0x534e5f4d41494e","account_class_hash":"0x..",
 ///     "udc_address":"0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf",
 ///     "fee_token":"0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
 ///     "max_fee_fri":"200000000000000000"}},
-///   "vault_id":"12","asset_id":"ETH","algo":"ecdsa_secp256k1",
-///   "allowed_targets":["0x<token>","0x<pool>"],"allowed_entrypoints":["transfer","approve"]}]
+///   "key_source":{"dstack":{"path":"beanie/cosigner/starknet"}},
+///   "algo":"ecdsa_secp256k1",
+///   "allowed_targets":["0x<token>","0x<pool>"],"allowed_entrypoints":["transfer","approve"]},
+///  {"chain":"SOLANA","family":"solana",
+///   "key_source":{"dstack":{"path":"beanie/cosigner/solana"}},
+///   "algo":"ed25519",
+///   "allowed_targets":["<usdc mint base58>"]}]
+///
+/// Never put a key in this JSON.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ChainCfg {
     pub chain: Chain,
     pub family: ChainFamily,
-    pub vault_id: String,
-    pub asset_id: String,
+    /// Where the cosigner key material comes from (dstack KMS in production).
+    pub key_source: KeySourceCfg,
+    /// STRONGLY RECOMMENDED. The cosigner address/pubkey you published and
+    /// clients pinned. Boot is refused if the derived one differs (app
+    /// identity change, wrong path, changed KEY_PURPOSE), because accounts
+    /// bind to the old address and a silent change would strand funds.
+    #[serde(default)]
+    pub expected_cosigner: Option<String>,
     pub algo: SigAlgo,
     /// EVM: the USDC contract (must equal `family.evm.usdc`). Starknet: token +
     /// pool contracts. Solana: mints (base58).
@@ -243,6 +285,92 @@ pub fn chain_cfgs_from_env() -> Result<Vec<ChainCfg>> {
 pub enum CosignerId {
     Eth(Address),
     Ed25519(Pubkey),
+}
+
+/// The cosigner's private key, held in process memory only (the TEE's
+/// encrypted RAM). Never logged, never serialized.
+pub enum CosignerKey {
+    Secp256k1(LocalWallet),
+    Ed25519(Keypair),
+}
+
+impl CosignerKey {
+    fn id(&self) -> CosignerId {
+        match self {
+            CosignerKey::Secp256k1(w) => CosignerId::Eth(w.address()),
+            CosignerKey::Ed25519(k) => CosignerId::Ed25519(k.pubkey()),
+        }
+    }
+}
+
+/// Pure and deterministic: (algo, label, KMS material) -> 32-byte key.
+/// Hashing means we depend only on the KMS returning stable secret bytes, not
+/// on how it encodes them. Lengths are prefixed so fields cannot bleed into
+/// each other. The counter covers the negligible chance of an invalid scalar.
+fn derive_key_bytes(algo: SigAlgo, label: &str, material: &[u8]) -> Result<[u8; 32]> {
+    for ctr in 0u8..=255 {
+        let mut h = Sha256::new();
+        h.update(KEY_PURPOSE.as_bytes());
+        h.update([algo as u8]);
+        h.update((label.len() as u32).to_be_bytes());
+        h.update(label.as_bytes());
+        h.update((material.len() as u32).to_be_bytes());
+        h.update(material);
+        h.update([ctr]);
+        let out: [u8; 32] = h.finalize().into();
+        match algo {
+            SigAlgo::Ed25519 => return Ok(out),
+            SigAlgo::EcdsaSecp256k1 => {
+                if LocalWallet::from_bytes(&out).is_ok() {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    bail!("no valid key derived")
+}
+
+fn key_from_bytes(algo: SigAlgo, b: &[u8; 32]) -> Result<CosignerKey> {
+    match algo {
+        SigAlgo::EcdsaSecp256k1 => Ok(CosignerKey::Secp256k1(
+            LocalWallet::from_bytes(b).map_err(|e| anyhow!("invalid secp256k1 key: {e}"))?,
+        )),
+        SigAlgo::Ed25519 => Ok(CosignerKey::Ed25519(
+            keypair_from_seed(b).map_err(|e| anyhow!("invalid ed25519 seed: {e}"))?,
+        )),
+    }
+}
+
+/// Fetches the key material for one chain and derives its cosigner key.
+/// dstack calls assume `DstackClient::new(None)` (default /var/run/dstack.sock)
+/// and `get_key(path, purpose)` returning a response with a `key` string.
+/// Verify against the SDK version you pin.
+async fn load_cosigner_key(cfg: &ChainCfg) -> Result<CosignerKey> {
+    let (label, material): (String, Vec<u8>) = match &cfg.key_source {
+        KeySourceCfg::Dstack { path } => {
+            let client = DstackClient::new(None);
+            let resp = client
+                .get_key(Some(path.clone()), Some(KEY_PURPOSE.to_string()))
+                .await
+                .map_err(|e| anyhow!("dstack get_key({path}) failed: {e}"))?;
+            ensure!(
+                !resp.key.is_empty(),
+                "dstack returned an empty key for {path}"
+            );
+            (path.clone(), resp.key.into_bytes())
+        }
+        KeySourceCfg::DevEnv { env } => {
+            ensure!(
+                std::env::var("ALLOW_DEV_KEYS").as_deref() == Ok("1"),
+                "dev_env key source refused: set ALLOW_DEV_KEYS=1 (never in production)"
+            );
+            let v = std::env::var(env).with_context(|| format!("env var {env} is not set"))?;
+            ensure!(!v.trim().is_empty(), "env var {env} is empty");
+            (env.clone(), v.trim().as_bytes().to_vec())
+        }
+    };
+    let bytes = derive_key_bytes(cfg.algo, &label, &material)?;
+    key_from_bytes(cfg.algo, &bytes)
 }
 
 pub struct EvmRt {
@@ -272,7 +400,10 @@ pub enum FamilyRt {
 
 pub struct ChainRuntime {
     pub cfg: ChainCfg,
+    /// Public identity, derived from `key` at startup.
     pub cosigner: CosignerId,
+    /// The private key. Only `cosign_*` touch it.
+    key: CosignerKey,
     pub fam: FamilyRt,
     /// Serializes the Starknet keeper's deploy/top-up nonce use per chain.
     /// (EVM sends go through the shared NonceManager-backed SignerProvider.)
@@ -287,14 +418,24 @@ fn norm_set(s: &HashSet<String>) -> HashSet<String> {
     s.iter().map(|t| norm_target(t)).collect()
 }
 
+/// Public cosigner identity for one chain. Contains no secret.
+#[derive(serde::Serialize, Debug)]
+pub struct CosignerInfo {
+    pub chain: String,
+    pub algo: &'static str,
+    pub cosigner: String,
+    pub factory: Option<String>,
+}
+
 impl ChainRegistry {
-    /// Resolves each cosigner address live from its vault and refuses to start
-    /// if two chains share a vault or a cosigner address, or if the config is
-    /// too loose to be safe.
-    pub async fn build(cfgs: Vec<ChainCfg>, backend: &FireblocksRest) -> Result<Self> {
+    /// Loads each cosigner key from its source, derives its address, and
+    /// refuses to start if two chains share a key source or a cosigner
+    /// address, if a derived cosigner differs from `expected_cosigner`, or if
+    /// the config is too loose to be safe.
+    pub async fn build(cfgs: Vec<ChainCfg>) -> Result<Self> {
         ensure!(!cfgs.is_empty(), "STEALTH_CHAINS_JSON has no chains");
         let mut chains = HashMap::new();
-        let mut vault_owner: HashMap<String, Chain> = HashMap::new();
+        let mut source_owner: HashMap<String, Chain> = HashMap::new();
         let mut addr_owner: HashMap<String, Chain> = HashMap::new();
 
         for mut cfg in cfgs {
@@ -315,24 +456,33 @@ impl ChainRegistry {
                 !cfg.allowed_targets.is_empty(),
                 "{chain:?}: allowed_targets must not be empty"
             );
-            if let Some(other) = vault_owner.insert(cfg.vault_id.clone(), chain) {
+            let source_id = format!("{:?}", cfg.key_source);
+            if let Some(other) = source_owner.insert(source_id.clone(), chain) {
                 bail!(
-                    "vault {} used by {other:?} and {chain:?}: one vault per chain required",
-                    cfg.vault_id
+                    "key source {source_id} used by {other:?} and {chain:?}: one key per chain required"
                 );
             }
-            let addr = backend
-                .address(&cfg.vault_id, &cfg.asset_id)
+
+            let key = load_cosigner_key(&cfg)
                 .await
-                .with_context(|| format!("resolving cosigner address for {chain:?}"))?;
-            let cosigner = match cfg.algo {
-                SigAlgo::EcdsaSecp256k1 => CosignerId::Eth(addr.parse()?),
-                SigAlgo::Ed25519 => CosignerId::Ed25519(Pubkey::from_str(&addr)?),
-            };
+                .with_context(|| format!("loading cosigner key for {chain:?}"))?;
+            let cosigner = key.id();
             let addr_key = match cosigner {
                 CosignerId::Eth(a) => format!("{a:?}"),
                 CosignerId::Ed25519(p) => p.to_string(),
             };
+            if let Some(want) = &cfg.expected_cosigner {
+                ensure!(
+                    norm_target(want) == norm_target(&addr_key),
+                    "{chain:?}: derived cosigner {addr_key} != expected_cosigner {want}. \
+                     App identity, key path or KEY_PURPOSE changed? Do NOT proceed: \
+                     existing accounts bind to the old address."
+                );
+            } else {
+                warn!(
+                    "{chain:?}: no expected_cosigner set; publish {addr_key} and pin it in config"
+                );
+            }
             if let Some(other) = addr_owner.insert(addr_key.clone(), chain) {
                 bail!("cosigner {addr_key} shared by {other:?} and {chain:?}");
             }
@@ -373,6 +523,7 @@ impl ChainRegistry {
                 ChainRuntime {
                     cfg,
                     cosigner,
+                    key,
                     fam,
                     nonce_lock: Mutex::new(()),
                 },
@@ -390,6 +541,44 @@ impl ChainRegistry {
     pub fn len(&self) -> usize {
         self.chains.len()
     }
+
+    /// Public data only, in a canonical order. Serve this at
+    /// GET /api/v1/stealth/cosigners. Clients must ALSO pin the expected
+    /// cosigner out of band (app / docs): a value fetched only from the API
+    /// proves nothing against whoever controls the API.
+    pub fn public_info(&self) -> Vec<CosignerInfo> {
+        let mut v: Vec<CosignerInfo> = self
+            .chains
+            .iter()
+            .map(|(chain, rt)| CosignerInfo {
+                chain: format!("{chain:?}"),
+                algo: match rt.cfg.algo {
+                    SigAlgo::EcdsaSecp256k1 => "ecdsa_secp256k1",
+                    SigAlgo::Ed25519 => "ed25519",
+                },
+                cosigner: match rt.cosigner {
+                    CosignerId::Eth(a) => format!("{a:?}"),
+                    CosignerId::Ed25519(p) => p.to_string(),
+                },
+                factory: match &rt.fam {
+                    FamilyRt::Evm(ev) => Some(format!("{:?}", ev.factory)),
+                    _ => None,
+                },
+            })
+            .collect();
+        v.sort_by(|a, b| a.chain.cmp(&b.chain));
+        v
+    }
+
+    /// 64-byte TEE quote `report_data`: sha256(canonical cosigner list) || 32
+    /// zero bytes. Request a quote with this so a client can verify "these
+    /// exact cosigners are held by this attested app".
+    pub fn attestation_report_data(&self) -> Result<[u8; 64]> {
+        let json = serde_json::to_vec(&self.public_info())?;
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&Sha256::digest(json));
+        Ok(out)
+    }
 }
 
 /// Lowercase, strip 0x and leading zeros for hex; leave base58 untouched.
@@ -402,201 +591,12 @@ pub fn norm_target(s: &str) -> String {
 }
 
 // ============================================================================
-// Cosigner backend (Fireblocks, hand-rolled JWT). Swap the impl, not the worker.
-// ============================================================================
-
-pub struct RawSignature {
-    pub r: Option<String>,
-    pub s: Option<String>,
-    pub full_sig: Vec<u8>,
-}
-
-/// REST implementation. NOT verified against a live workspace: `assetId` being
-/// accepted on RAW, the addresses_paginated path, and that RAW ECDSA signs the
-/// 32-byte `content` as-is (no extra hashing). The last one is enforced by the
-/// recovery check in `cosign_secp256k1`, so a wrong assumption fails closed.
-pub struct FireblocksRest {
-    http: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    private_key_pem: String,
-}
-
-#[derive(Deserialize)]
-struct FbCreateResp {
-    id: String,
-}
-#[derive(Deserialize)]
-struct FbSig {
-    #[serde(rename = "fullSig")]
-    full_sig: String,
-    r: Option<String>,
-    s: Option<String>,
-}
-#[derive(Deserialize)]
-struct FbSigned {
-    signature: FbSig,
-}
-#[derive(Deserialize)]
-struct FbTx {
-    status: String,
-    #[serde(rename = "subStatus")]
-    sub_status: Option<String>,
-    #[serde(rename = "signedMessages")]
-    signed_messages: Option<Vec<FbSigned>>,
-}
-#[derive(Deserialize)]
-struct FbAddrPage {
-    addresses: Vec<FbAddr>,
-}
-#[derive(Deserialize)]
-struct FbAddr {
-    address: String,
-}
-
-const FB_TERMINAL_FAILURES: &[&str] = &["FAILED", "CANCELLED", "REJECTED", "BLOCKED"];
-
-impl FireblocksRest {
-    pub fn from_env(http: reqwest::Client) -> Result<Self> {
-        let pem = match std::env::var("FIREBLOCKS_SECRET_PEM") {
-            Ok(v) => v,
-            Err(_) => std::fs::read_to_string(
-                std::env::var("FIREBLOCKS_SECRET_PATH")
-                    .context("set FIREBLOCKS_SECRET_PEM or FIREBLOCKS_SECRET_PATH")?,
-            )?,
-        };
-        Ok(Self {
-            http,
-            base_url: std::env::var("FIREBLOCKS_BASE_URL")
-                .unwrap_or_else(|_| "https://api.fireblocks.io".into()),
-            api_key: std::env::var("FIREBLOCKS_API_KEY").context("FIREBLOCKS_API_KEY")?,
-            private_key_pem: pem,
-        })
-    }
-
-    fn jwt(&self, path: &str, body: &[u8]) -> Result<String> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        let claims = serde_json::json!({
-            "uri": path,
-            "nonce": Uuid::new_v4().to_string(),
-            "iat": now,
-            "exp": now + 30,
-            "sub": self.api_key,
-            "bodyHash": hex::encode(Sha256::digest(body)),
-        });
-        let key = EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes())
-            .context("invalid Fireblocks RSA key")?;
-        Ok(jwt_encode(&Header::new(Algorithm::RS256), &claims, &key)?)
-    }
-
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let res = self
-            .http
-            .get(format!("{}{}", self.base_url, path))
-            .header("X-API-Key", &self.api_key)
-            .header("Authorization", format!("Bearer {}", self.jwt(path, b"")?))
-            .send()
-            .await?;
-        if !res.status().is_success() {
-            bail!(
-                "Fireblocks GET {path} failed: {}",
-                res.text().await.unwrap_or_default()
-            );
-        }
-        Ok(res.json().await?)
-    }
-
-    async fn address(&self, vault_id: &str, asset_id: &str) -> Result<String> {
-        let page: FbAddrPage = self
-            .get_json(&format!(
-                "/v1/vault/accounts/{vault_id}/{asset_id}/addresses_paginated"
-            ))
-            .await?;
-        Ok(page
-            .addresses
-            .into_iter()
-            .next()
-            .context("vault asset has no address")?
-            .address)
-    }
-
-    async fn sign_raw(
-        &self,
-        vault_id: &str,
-        asset_id: &str,
-        algo: SigAlgo,
-        content_hex: &str,
-        note: &str,
-    ) -> Result<RawSignature> {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "operation": "RAW",
-            "assetId": asset_id,
-            "source": { "type": "VAULT_ACCOUNT", "id": vault_id },
-            "note": note,
-            "extraParameters": { "rawMessageData": {
-                "messages": [{ "content": content_hex }],
-                "algorithm": algo.fireblocks_name(),
-            }},
-        }))?;
-        let path = "/v1/transactions";
-        let res = self
-            .http
-            .post(format!("{}{}", self.base_url, path))
-            .header("X-API-Key", &self.api_key)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.jwt(path, &body)?),
-            )
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await?;
-        if !res.status().is_success() {
-            bail!(
-                "Fireblocks createTransaction rejected: {}",
-                res.text().await.unwrap_or_default()
-            );
-        }
-        let tx_id = res.json::<FbCreateResp>().await?.id;
-
-        // MPC signing is asynchronous: poll to a terminal state.
-        let get_path = format!("/v1/transactions/{tx_id}");
-        for _ in 0..FB_POLL_ATTEMPTS {
-            tokio::time::sleep(FB_POLL_INTERVAL).await;
-            let tx: FbTx = self.get_json(&get_path).await?;
-            if FB_TERMINAL_FAILURES.contains(&tx.status.as_str()) {
-                bail!(
-                    "Fireblocks tx {tx_id} ended {} ({:?})",
-                    tx.status,
-                    tx.sub_status
-                );
-            }
-            if tx.status == "COMPLETED" {
-                let sig = tx
-                    .signed_messages
-                    .and_then(|m| m.into_iter().next())
-                    .context("COMPLETED without signedMessages")?
-                    .signature;
-                return Ok(RawSignature {
-                    r: sig.r,
-                    s: sig.s,
-                    full_sig: hex::decode(sig.full_sig.trim_start_matches("0x"))
-                        .context("fullSig is not hex")?,
-                });
-            }
-        }
-        bail!("Fireblocks tx {tx_id} did not complete in time")
-    }
-}
-
-// ============================================================================
 // Worker context + loop
 // ============================================================================
 
 pub struct WorkerCtx {
     pub state: Arc<AppState>,
     pub chains: Arc<ChainRegistry>,
-    pub cosigner: Arc<FireblocksRest>,
     /// The SAME per-chain keeper clients the payment and sweep workers use
     /// (NonceManagerMiddleware inside), so stealth txs never desync nonces.
     pub evm_clients: HashMap<Chain, Arc<SignerProvider>>,
@@ -634,7 +634,7 @@ pub async fn start_stealth_workers(ctx: Arc<WorkerCtx>, mut rx: mpsc::Receiver<S
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_ROUNDS));
     let recent = Arc::new(Recent::default());
     while let Some(task) = rx.recv().await {
-        // Backpressure: a slow Fireblocks poll no longer blocks every other claim.
+        // Backpressure: a slow receipt poll no longer blocks every other claim.
         let Ok(permit) = permits.clone().acquire_owned().await else {
             break;
         };
@@ -811,57 +811,44 @@ struct Secp256k1Cosig {
     recid: u8, // 0 or 1
 }
 
-/// Step 3 for secp256k1 chains. Does not trust Fireblocks' `v`: normalizes to
-/// low-s, then finds the recovery id that recovers to the registered cosigner
-/// address. Fails closed if none does (wrong vault/asset/digest/hashing).
-async fn cosign_secp256k1(
-    ctx: &WorkerCtx,
-    rt: &ChainRuntime,
+/// Signs `digest` with `wallet`, normalizes to low-s, then finds the recovery
+/// id that recovers to `expected`. We never trust the library's `v`: if the
+/// low-s flip changed the parity, recovery picks the right one. Fails closed
+/// if none recovers. (`sign_hash` signs the 32 bytes as-is, no extra hashing.)
+fn sign_secp256k1_with(
+    wallet: &LocalWallet,
+    expected: Address,
     digest: [u8; 32],
-    label: &str,
 ) -> Result<Secp256k1Cosig> {
-    let CosignerId::Eth(expected) = rt.cosigner else {
-        bail!("cosigner is not a secp256k1 address")
-    };
-    let note = format!(
-        "stealth {:?} {label} {}",
-        rt.cfg.chain,
-        chrono::Utc::now().to_rfc3339()
-    );
-    let raw = ctx
-        .cosigner
-        .sign_raw(
-            &rt.cfg.vault_id,
-            &rt.cfg.asset_id,
-            rt.cfg.algo,
-            &hex::encode(digest),
-            &note,
-        )
-        .await?;
-
-    let (r, s) = if let (Some(r), Some(s)) = (&raw.r, &raw.s) {
-        (pad32(r)?, pad32(s)?)
-    } else {
-        ensure!(raw.full_sig.len() >= 64, "fullSig too short");
-        (
-            raw.full_sig[..32].try_into()?,
-            raw.full_sig[32..64].try_into()?,
-        )
-    };
-    let (s, _) = low_s(s);
-    let r_u = U256::from_big_endian(&r);
-    let s_u = U256::from_big_endian(&s);
+    let sig = wallet
+        .sign_hash(H256::from(digest))
+        .map_err(|e| anyhow!("cosigner signing failed: {e}"))?;
+    let r = to_be32(sig.r);
+    let (s, _) = low_s(to_be32(sig.s));
+    let (r_u, s_u) = (U256::from_big_endian(&r), U256::from_big_endian(&s));
     for recid in [0u8, 1u8] {
-        let sig = EthSignature {
+        let candidate = EthSignature {
             r: r_u,
             s: s_u,
             v: 27 + recid as u64,
         };
-        if sig.recover(H256::from(digest)).ok() == Some(expected) {
+        if candidate.recover(H256::from(digest)).ok() == Some(expected) {
             return Ok(Secp256k1Cosig { r, s, recid });
         }
     }
     bail!("cosignature does not recover to the registered cosigner {expected:?}")
+}
+
+/// Step 3 for secp256k1 chains (EVM + Starknet). Synchronous: the key is in
+/// process memory, so there is no network round trip and no polling.
+fn cosign_secp256k1(rt: &ChainRuntime, digest: [u8; 32]) -> Result<Secp256k1Cosig> {
+    let CosignerId::Eth(expected) = rt.cosigner else {
+        bail!("cosigner is not a secp256k1 address")
+    };
+    let CosignerKey::Secp256k1(wallet) = &rt.key else {
+        bail!("cosigner key is not secp256k1")
+    };
+    sign_secp256k1_with(wallet, expected, digest)
 }
 
 // ============================================================================
@@ -877,12 +864,13 @@ abigen!(
     ]"#
 );
 
+// The factory takes the cosigner per account: no `cosigner()` getter exists.
 abigen!(
     StealthFactory,
     r#"[
-        function createAccount(address client, bytes32 salt) external returns (address)
-        function getAddress(address client, bytes32 salt) external view returns (address)
-        function cosigner() external view returns (address)
+        function createAccount(address client, address cosigner, bytes32 salt) external returns (address)
+        function getAddress(address client, address cosigner, bytes32 salt) external view returns (address)
+        function entryPoint() external view returns (address)
     ]"#
 );
 
@@ -1033,19 +1021,26 @@ async fn build_evm_rt(chain: Chain, cfg: &ChainCfg, cosigner: CosignerId) -> Res
         hex::encode(domain_separator)
     );
 
-    // 2. The factory must pin OUR cosigner, else `getAddress == from` proves nothing.
-    let CosignerId::Eth(expected_cosigner) = cosigner else {
+    // 2. The factory is immutable and takes the cosigner per account, so there
+    //    is nothing to pin here. Prove it is a StealthAccountFactory with the
+    //    3-arg ABI and that it accepts OUR cosigner address.
+    let CosignerId::Eth(our_cosigner) = cosigner else {
         bail!("evm cosigner must be a secp256k1 address")
     };
-    let pinned = StealthFactory::new(factory_addr, provider.clone())
-        .cosigner()
+    let fac = StealthFactory::new(factory_addr, provider.clone());
+    let entry_point = fac
+        .entry_point()
         .call()
         .await
-        .context("factory.cosigner() failed (wrong factory address?)")?;
+        .context("factory.entryPoint() failed (wrong factory address?)")?;
     ensure!(
-        pinned == expected_cosigner,
-        "factory pins cosigner {pinned:?} but the vault resolves to {expected_cosigner:?}"
+        entry_point != Address::zero(),
+        "factory reports a zero entryPoint"
     );
+    fac.get_address(Address::repeat_byte(1), our_cosigner, [0u8; 32])
+        .call()
+        .await
+        .context("factory.getAddress(client, cosigner, salt) failed (wrong factory version?)")?;
 
     // 3. The `bytes` overload only exists in FiatTokenV2_2.
     probe_bytes_overload(&token).await?;
@@ -1205,19 +1200,24 @@ async fn relay_evm(
         .with_context(|| format!("no keeper client for {:?}", task.chain))?
         .clone();
     let a = plan.auth;
+    let CosignerId::Eth(our_cosigner) = rt.cosigner else {
+        bail!("evm cosigner must be a secp256k1 address")
+    };
 
-    // 3a. BEFORE spending a cosignature: the account must be the one OUR
-    //     factory derives for (client, salt), i.e. bound to OUR vault key, and
-    //     the authorization must still be unused.
+    // 3a. BEFORE spending a cosignature: the account must be the one the
+    //     factory derives for (client, OUR cosigner, salt), and the
+    //     authorization must still be unused.
     let factory = StealthFactory::new(ev.factory, sp.clone());
     let expected_from = factory
-        .get_address(plan.client, plan.salt)
+        .get_address(plan.client, our_cosigner, plan.salt)
         .call()
         .await
         .context("factory.getAddress failed")?;
+    // The address commits to (entryPoint, client, cosigner, salt), so a match
+    // proves the account is bound to OUR cosigner. Any other address is refused.
     ensure!(
         expected_from == a.from,
-        "derived_address {:?} != factory.getAddress(client, salt) {expected_from:?}",
+        "derived_address {:?} != factory.getAddress(client, our cosigner, salt) {expected_from:?}",
         a.from
     );
     let usdc = Erc3009UsdcBytes::new(ev.usdc, sp.clone());
@@ -1236,8 +1236,8 @@ async fn relay_evm(
         .0
         .is_empty();
 
-    // 3. cosign EIP-191(D). Both signers sign this same 32-byte hash.
-    let co = cosign_secp256k1(ctx, rt, plan.signed, "eip3009").await?;
+    // 3. cosign EIP-191(D) locally. Both signers sign this same 32-byte hash.
+    let co = cosign_secp256k1(rt, plan.signed)?;
 
     // 4. assemble: sig = client65 || cosigner65, then the atomic batch.
     let mut sig130 = Vec::with_capacity(130);
@@ -1250,7 +1250,7 @@ async fn relay_evm(
             target: ev.factory,
             allow_failure: false, // idempotent, and the transfer needs it
             call_data: factory
-                .create_account(plan.client, plan.salt)
+                .create_account(plan.client, our_cosigner, plan.salt)
                 .calldata()
                 .context("encode createAccount")?,
         });
@@ -1470,7 +1470,7 @@ fn precheck_starknet(
 
     // Bind (client_pubkey, our cosigner) to the account address: the address
     // is class + ctor args, so the account at `sender` can only be one whose
-    // cosigner is OUR vault key. UDC unique=false => deployer 0.
+    // cosigner is OUR cosigner key. UDC unique=false => deployer 0.
     let CosignerId::Eth(cosigner) = rt.cosigner else {
         bail!("starknet cosigner must be a secp256k1 address")
     };
@@ -1561,8 +1561,8 @@ async fn relay_starknet(
     st: &StarknetRt,
     plan: StarknetPlan,
 ) -> Result<String> {
-    // 3 cosign FIRST: if the vault is misconfigured we have not spent keeper funds.
-    let co = cosign_secp256k1(ctx, rt, plan.hash.to_bytes_be(), "invoke").await?;
+    // 3 cosign FIRST: if the key is misconfigured we have not spent keeper funds.
+    let co = cosign_secp256k1(rt, plan.hash.to_bytes_be())?;
 
     let keeper = build_starknet_account(&ctx.state.starknet_config)
         .map_err(|e| anyhow!("keeper account: {e:?}"))?;
@@ -1711,7 +1711,7 @@ pub struct SolanaPlan {
 
 /// Deterministic, non-PDA multisig address. Rediscoverable from the client
 /// pubkey alone, so no database. `base` = the cosigner, so only the cosigner's
-/// vault key can create it. The client must derive the same address:
+/// key can create it. The client must derive the same address:
 ///   seed = hex(sha256("beanie-multisig-v1" || client_pubkey))[..32]
 ///   addr = sha256(base || seed || spl_token_program_id)   (createWithSeed)
 pub fn derive_multisig(client: &Pubkey, cosigner: &Pubkey) -> Result<(Pubkey, String)> {
@@ -1852,26 +1852,16 @@ fn precheck_solana(rt: &ChainRuntime, relayer: &Pubkey, task: &StealthTask) -> R
     })
 }
 
-async fn cosign_ed25519(
-    ctx: &WorkerCtx,
-    rt: &ChainRuntime,
-    msg: &[u8],
-    note: &str,
-) -> Result<SolanaSignature> {
+/// Step 3 for Solana. Signs `msg` with the in-process ed25519 key and verifies
+/// the result against the registered cosigner pubkey before returning it.
+fn cosign_ed25519(rt: &ChainRuntime, msg: &[u8]) -> Result<SolanaSignature> {
     let CosignerId::Ed25519(pk) = rt.cosigner else {
         bail!("cosigner is not ed25519")
     };
-    let raw = ctx
-        .cosigner
-        .sign_raw(
-            &rt.cfg.vault_id,
-            &rt.cfg.asset_id,
-            rt.cfg.algo,
-            &hex::encode(msg),
-            note,
-        )
-        .await?;
-    let sig = SolanaSignature::try_from(raw.full_sig.as_slice()).context("bad ed25519 sig")?;
+    let CosignerKey::Ed25519(kp) = &rt.key else {
+        bail!("cosigner key is not ed25519")
+    };
+    let sig = kp.sign_message(msg);
     ensure!(
         sig.verify(pk.as_ref(), msg),
         "cosignature does not verify against cosigner {pk}"
@@ -1924,7 +1914,7 @@ async fn ensure_multisig(
     ];
     let blockhash = rpc.get_latest_blockhash().await?;
     let msg = SolanaMessage::new_with_blockhash(&ixs, Some(&relayer.pubkey()), &blockhash);
-    let co = cosign_ed25519(ctx, rt, &msg.serialize(), "stealth multisig create").await?;
+    let co = cosign_ed25519(rt, &msg.serialize())?;
     let mut tx = SolanaTransaction::new_unsigned(msg.clone());
     let pos = msg
         .account_keys
@@ -1946,7 +1936,7 @@ async fn ensure_multisig(
 async fn relay_solana(ctx: &WorkerCtx, rt: &ChainRuntime, plan: SolanaPlan) -> Result<String> {
     // 3 cosign (after the multisig exists; creation is cosigner-gated too)
     ensure_multisig(ctx, rt, &plan.client, &plan.cosigner).await?;
-    let co = cosign_ed25519(ctx, rt, &plan.bytes, "stealth solana claim").await?;
+    let co = cosign_ed25519(rt, &plan.bytes)?;
 
     // 4 assemble
     let message = plan.message;
@@ -2020,9 +2010,102 @@ mod tests {
 }
 
 #[cfg(test)]
+mod key_derivation_tests {
+    use super::*;
+
+    #[test]
+    fn same_inputs_same_key_different_path_different_key() {
+        let m = b"kms-material";
+        let a = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "beanie/cosigner/base", m).unwrap();
+        let b = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "beanie/cosigner/base", m).unwrap();
+        let c = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "beanie/cosigner/starknet", m).unwrap();
+        assert_eq!(a, b, "derivation must be deterministic across restarts");
+        assert_ne!(a, c, "paths must separate chains");
+    }
+
+    #[test]
+    fn algo_and_material_separate_keys() {
+        let m = b"kms-material";
+        let e = derive_key_bytes(SigAlgo::Ed25519, "p", m).unwrap();
+        let s = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "p", m).unwrap();
+        let s2 = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "p", b"other").unwrap();
+        assert_ne!(e, s);
+        assert_ne!(
+            s, s2,
+            "different app/KMS material must give a different key"
+        );
+    }
+
+    #[test]
+    fn length_prefixing_prevents_field_bleed() {
+        // ("ab","c") and ("a","bc") must not collide
+        let x = derive_key_bytes(SigAlgo::Ed25519, "ab", b"c").unwrap();
+        let y = derive_key_bytes(SigAlgo::Ed25519, "a", b"bc").unwrap();
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn derived_keys_load_for_both_algos() {
+        let k = derive_key_bytes(SigAlgo::EcdsaSecp256k1, "p", b"m").unwrap();
+        assert!(matches!(
+            key_from_bytes(SigAlgo::EcdsaSecp256k1, &k).unwrap(),
+            CosignerKey::Secp256k1(_)
+        ));
+        let k = derive_key_bytes(SigAlgo::Ed25519, "p", b"m").unwrap();
+        assert!(matches!(
+            key_from_bytes(SigAlgo::Ed25519, &k).unwrap(),
+            CosignerKey::Ed25519(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod cosigner_tests {
+    use super::*;
+
+    fn wallet() -> LocalWallet {
+        "0x0123456789012345678901234567890123456789012345678901234567890123"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn local_cosign_recovers_to_own_address_and_is_low_s() {
+        let w = wallet();
+        for i in 0u8..32 {
+            let digest = keccak256([i]);
+            let co = sign_secp256k1_with(&w, w.address(), digest).unwrap();
+            assert!(!low_s(co.s).1, "s must already be low");
+            let sig = EthSignature {
+                r: U256::from_big_endian(&co.r),
+                s: U256::from_big_endian(&co.s),
+                v: 27 + co.recid as u64,
+            };
+            assert_eq!(sig.recover(H256::from(digest)).unwrap(), w.address());
+        }
+    }
+
+    #[test]
+    fn local_cosign_fails_closed_for_wrong_expected_address() {
+        let w = wallet();
+        let digest = keccak256(b"x");
+        assert!(sign_secp256k1_with(&w, Address::repeat_byte(7), digest).is_err());
+    }
+
+    #[test]
+    fn ed25519_seed_gives_stable_pubkey_and_valid_sig() {
+        let seed = [7u8; 32];
+        let a = keypair_from_seed(&seed).unwrap();
+        let b = keypair_from_seed(&seed).unwrap();
+        assert_eq!(a.pubkey(), b.pubkey());
+        let sig = a.sign_message(b"hello");
+        assert!(sig.verify(a.pubkey().as_ref(), b"hello"));
+    }
+}
+
+#[cfg(test)]
 mod evm_tests {
     use super::*;
-    use ethers::signers::{LocalWallet, Signer};
 
     const USDC_BASE: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 

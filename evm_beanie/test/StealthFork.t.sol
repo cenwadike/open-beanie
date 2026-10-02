@@ -7,6 +7,7 @@ import "../src/StealthAccount.sol";
 import "../src/StealthFactory.sol";
 
 interface IEntryPointV07 {
+    function depositTo(address account) external payable;
     function handleOps(
         PackedUserOperation[] calldata ops,
         address payable beneficiary
@@ -74,7 +75,7 @@ contract StealthAccountForkTest is Test {
 
         client = vm.addr(clientPk);
         cosigner = vm.addr(cosignerPk);
-        factory = new StealthAccountFactory(ENTRY_POINT, cosigner);
+        factory = new StealthAccountFactory(ENTRY_POINT);
         token = new ForkToken();
     }
 
@@ -88,7 +89,7 @@ contract StealthAccountForkTest is Test {
                 address(factory),
                 abi.encodeCall(
                     StealthAccountFactory.createAccount,
-                    (client, SALT)
+                    (client, cosigner, SALT)
                 )
             );
     }
@@ -150,7 +151,7 @@ contract StealthAccountForkTest is Test {
 
     /// Funds the counterfactual account and submits a signed first claim.
     function _firstClaim(uint256 amount) internal returns (address sender) {
-        sender = factory.getAddress(client, SALT);
+        sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
         vm.deal(sender, 0.01 ether); // no paymaster here: account prefunds its own gas
 
@@ -189,7 +190,7 @@ contract StealthAccountForkTest is Test {
 
     function test_Fork_LocalUserOpHashMatchesEntryPoint() public {
         vm.skip(!forked);
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         PackedUserOperation memory op = _op(
             sender,
             0,
@@ -250,9 +251,11 @@ contract StealthAccountForkTest is Test {
 
     function test_Fork_BadCosignerIsRejectedAndNothingDeploys() public {
         vm.skip(!forked);
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
         vm.deal(sender, 0.01 ether);
+        vm.prank(sender);
+        ep.depositTo{value: 0.01 ether}(sender);
 
         PackedUserOperation memory op = _op(
             sender,
@@ -277,7 +280,7 @@ contract StealthAccountForkTest is Test {
 
     function test_Fork_ReplayedSignatureIsRejected() public {
         vm.skip(!forked);
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
         vm.deal(sender, 0.01 ether);
 
@@ -298,9 +301,11 @@ contract StealthAccountForkTest is Test {
 
     function test_Fork_TamperedCallDataInvalidatesSignature() public {
         vm.skip(!forked);
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
         vm.deal(sender, 0.01 ether);
+        vm.prank(sender);
+        ep.depositTo{value: 0.01 ether}(sender);
 
         PackedUserOperation memory op = _op(
             sender,

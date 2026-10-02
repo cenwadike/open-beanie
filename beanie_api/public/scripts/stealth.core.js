@@ -21,7 +21,10 @@
 
 import { ec as starkEc, CallData, hash } from "./starknet.js";
 import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.js";
-import { chainByKey, stealthReady } from "./chains.js";
+import { ed25519 } from "https://esm.sh/@noble/curves@1.8.2/ed25519?bundle";
+import { chainByKey, isPlaceholder, stealthConfigFor, stealthReady } from "./chains.js";
+import { predictStealthAccount } from "./onchain.js";
+import { base58Encode, concatBytes, pubkeyBytes, TOKEN_PROGRAM } from "./solana.js";
 
 const SECP256K1_ORDER = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
 const enc = new TextEncoder();
@@ -75,23 +78,46 @@ function bytesToScalar(bytes, order) {
   return (BigInt(`0x${bytesToHex(bytes)}`) % (order - 1n)) + 1n;
 }
 
-function requireReady(chainKey) {
+function requireReady(chainKey, configOverride) {
   const chain = chainByKey(chainKey);
   if (!chain) throw new Error(`Unknown chain "${chainKey}".`);
-  if (!stealthReady(chain)) {
+  const config = configOverride ?? stealthConfigFor(chain);
+  const valid = chain.kind === "evm"
+    ? Boolean(config?.factory && config?.usdc && config?.eip712 && config?.chainId) &&
+    !isPlaceholder(config.factory) && !isPlaceholder(config.cosigner)
+    : chain.kind === "starknet"
+      ? Boolean(config?.classHash && config?.cosigner && config?.chainId && config?.usdc) &&
+      !isPlaceholder(config.classHash) && !isPlaceholder(config.cosigner)
+      : chain.kind === "solana"
+        ? Boolean(config?.cosigner && config?.relayer && config?.usdc) && !isPlaceholder(config.cosigner) && !isPlaceholder(config.relayer)
+        : false;
+  if (!valid || (!configOverride && !stealthReady(chain))) {
     throw new Error(`Private lanes are not enabled on ${chain.name} yet.`);
   }
-  return chain;
+  return { chain, config };
 }
 
 const feltHex = (v) => `0x${BigInt(v).toString(16).padStart(64, "0")}`;
 
-async function derive(laneSecret, laneId, index, chainKey, withPrivate) {
+async function deriveSolanaMultisig(client, cosigner) {
+  const seedHash = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    concatBytes(enc.encode("beanie-multisig-v1"), pubkeyBytes(client, "client key"))
+  ));
+  const seed = bytesToHex(seedHash.slice(0, 16));
+  const addressHash = new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    concatBytes(pubkeyBytes(cosigner, "cosigner"), enc.encode(seed), pubkeyBytes(TOKEN_PROGRAM))
+  ));
+  return base58Encode(addressHash);
+}
+
+async function derive(laneSecret, laneId, index, chainKey, withPrivate, configOverride) {
   if (!(laneSecret instanceof Uint8Array) || laneSecret.length < 32) {
     throw new Error("Invalid lane secret.");
   }
   if (!Number.isInteger(index) || index < 0) throw new Error("Invalid derivation index.");
-  const chain = requireReady(chainKey);
+  const { chain, config } = requireReady(chainKey, configOverride);
   const info = `beanie-spend-v1:${chain.key}:${laneId}:${index}`;
 
   if (chain.kind === "starknet") {
@@ -102,12 +128,18 @@ async function derive(laneSecret, laneId, index, chainKey, withPrivate) {
     const address = feltHex(
       hash.calculateContractAddressFromHash(
         publicKey,
-        chain.stealth.classHash,
-        CallData.compile({ client_pubkey: publicKey, cosigner_pubkey: chain.stealth.cosignerPubKey }),
+        config.classHash,
+        CallData.compile({ client_pubkey: publicKey, cosigner_eth_address: config.cosigner }),
         0
       )
     );
-    return { chain: chain.key, kind: "starknet", address, publicKey, ...(withPrivate ? { privateKey } : {}) };
+    return {
+      chain: chain.key,
+      kind: "starknet",
+      address,
+      publicKey,
+      ...(withPrivate ? { privateKey, clientAddress: publicKey, salt: publicKey } : {}),
+    };
   }
 
   if (chain.kind === "evm") {
@@ -115,19 +147,27 @@ async function derive(laneSecret, laneId, index, chainKey, withPrivate) {
     const privateKey = `0x${scalar.toString(16).padStart(64, "0")}`;
     const clientAddress = new ethers.Wallet(privateKey).address;
     const salt = `0x${bytesToHex(await hkdf(laneSecret, `beanie-create2-salt-v1:${chain.key}:${laneId}:${index}`, 32))}`;
-
-    const ctorArgs = ethers.AbiCoder.defaultAbiCoder().encode(
-      ["address", "address", "address"],
-      [chain.stealth.entryPoint, clientAddress, chain.stealth.cosigner]
-    );
-    const initCodeHash = ethers.keccak256(ethers.concat([chain.stealth.initCode, ctorArgs]));
-    const address = ethers.getCreate2Address(chain.stealth.factory, salt, initCodeHash).toLowerCase();
+    const address = await predictStealthAccount(chain.key, clientAddress, config.cosigner, salt, config.factory);
     return {
       chain: chain.key,
       kind: "evm",
       address,
       publicKey: clientAddress.toLowerCase(),
-      ...(withPrivate ? { privateKey } : {}),
+      ...(withPrivate ? { privateKey, clientAddress: clientAddress.toLowerCase(), salt } : {}),
+    };
+  }
+
+  if (chain.kind === "solana") {
+    const seed = await hkdf(laneSecret, info, 32);
+    const clientBytes = ed25519.getPublicKey(seed);
+    const clientAddress = base58Encode(clientBytes);
+    const address = await deriveSolanaMultisig(clientAddress, config.cosigner);
+    return {
+      chain: chain.key,
+      kind: "solana",
+      address,
+      publicKey: clientAddress,
+      ...(withPrivate ? { privateKey: `0x${bytesToHex(seed)}`, clientAddress, salt: null } : {}),
     };
   }
 
@@ -135,9 +175,9 @@ async function derive(laneSecret, laneId, index, chainKey, withPrivate) {
 }
 
 /** Public result only: { chain, kind, address, publicKey }. Safe to cache. */
-export const deriveStealthAddress = ({ laneSecret, laneId, index = 0, chain }) =>
-  derive(laneSecret, laneId, index, chain, false);
+export const deriveStealthAddress = ({ laneSecret, laneId, index = 0, chain, config }) =>
+  derive(laneSecret, laneId, index, chain, false, config);
 
 /** As above plus `privateKey` (hex). Only for claiming; wipe/drop it after use. */
-export const deriveStealthSigner = ({ laneSecret, laneId, index = 0, chain }) =>
-  derive(laneSecret, laneId, index, chain, true);
+export const deriveStealthSigner = ({ laneSecret, laneId, index = 0, chain, config }) =>
+  derive(laneSecret, laneId, index, chain, true, config);

@@ -21,16 +21,18 @@ export class ApiError extends Error {
     }
 }
 
-async function request(path, body) {
+async function request(path, body, method = "POST") {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     let res;
     try {
         res = await fetch(path, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: body === undefined ? undefined : JSON.stringify(body),
+            method,
+            ...(body === undefined ? {} : {
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            }),
             signal: controller.signal,
         });
     } catch (e) {
@@ -66,6 +68,10 @@ export const webauthn = {
 };
 
 // ---- Business routes -------------------------------------------------------
+
+export function getStealthCosigners() {
+    return request("/api/v1/stealth/cosigners", undefined, "GET");
+}
 
 /**
  * One call announces receivers on all six chains (the backend fans out).

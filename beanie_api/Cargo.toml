@@ -39,3 +39,6 @@ anchor-lang = "1.2.0"
 chrono = "0.4.45"
 jsonwebtoken = "11.1.0"
 starknet-types-core = { version = "1.0.0", features = ["hash"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = "3.0.0"
+dstack-sdk = "0.1.3"

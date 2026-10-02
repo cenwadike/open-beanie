@@ -7,10 +7,10 @@
 // Lane record (v2):
 //   { v, id, privacy, targetChain, targetRecipient, merchantAddress|null,
 //     index, prfCredentialId|null, webhookUrl|null, createdAt, needsVerify?,
-//     receivers: [{ chain, address, merchant, startBlock|null }] }
+//     stealthConfig?, receivers: [{ chain, address, merchant, startBlock|null }] }
 
 import { chainByKey, wire } from "./chains.js";
-import { canonicalAddress } from "./identity.js";
+import { canonicalAddress, canonicalEvm } from "./identity.js";
 
 const K = {
     lanes: "beanie.lanes.v2",
@@ -156,6 +156,54 @@ export function exportBackup() {
 
 const optString = (v) => (typeof v === "string" && v.length <= 2048 ? v : null);
 const optInt = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
+const feltString = (v) => typeof v === "string" && /^0x[0-9a-f]{1,64}$/i.test(v) ? v.toLowerCase() : null;
+const addressString = (chain, v) => canonicalAddress(chain, v);
+
+function sanitizeStealthConfig(raw, chain) {
+    if (!raw || typeof raw !== "object") return null;
+    const kind = chainByKey(chain)?.kind;
+    if (kind === "evm") {
+        const factory = addressString(chain, raw.factory);
+        const cosigner = addressString(chain, raw.cosigner);
+        const chainId = optInt(Number(raw.chainId));
+        const usdc = addressString(chain, raw.usdc);
+        const name = optString(raw.eip712?.name);
+        const version = optString(raw.eip712?.version);
+        if (!factory || !cosigner || !chainId || !usdc || !name || !version) return null;
+        return { factory, cosigner, chainId, usdc, eip712: { name, version }, maxAuthWindowSecs: optInt(raw.maxAuthWindowSecs) ?? 86400 };
+    }
+    if (kind === "starknet") {
+        const classHash = feltString(raw.classHash);
+        const cosigner = canonicalEvm(raw.cosigner);
+        const chainId = feltString(raw.chainId);
+        const usdc = addressString(chain, raw.usdc);
+        const maxFeeFri = optString(raw.maxFeeFri);
+        const resourceBounds = raw.resourceBounds;
+        const validBounds = resourceBounds && ["l1_gas", "l2_gas", "l1_data_gas"].every((key) =>
+            [resourceBounds[key]?.max_amount, resourceBounds[key]?.max_price_per_unit]
+                .every((value) => typeof value === "string" && /^(0x[0-9a-f]+|[0-9]+)$/i.test(value))
+        );
+        if (!classHash || !cosigner || !chainId || !usdc || !maxFeeFri || !validBounds) return null;
+        return {
+            classHash,
+            cosigner,
+            chainId,
+            usdc,
+            maxFeeFri,
+            resourceBounds: Object.fromEntries(["l1_gas", "l2_gas", "l1_data_gas"].map((key) => [key, {
+                max_amount: resourceBounds[key].max_amount,
+                max_price_per_unit: resourceBounds[key].max_price_per_unit,
+            }])),
+        };
+    }
+    if (kind === "solana") {
+        const cosigner = addressString(chain, raw.cosigner);
+        const relayer = addressString(chain, raw.relayer);
+        const usdc = addressString(chain, raw.usdc);
+        return cosigner && relayer && usdc ? { cosigner, relayer, usdc } : null;
+    }
+    return null;
+}
 
 function sanitizeLane(raw) {
     if (!raw || typeof raw.id !== "string" || !LANE_ID.test(raw.id)) return null;
@@ -184,6 +232,7 @@ function sanitizeLane(raw) {
         prfCredentialId: optString(raw.prfCredentialId),
         webhookUrl: optString(raw.webhookUrl),
         createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(),
+        stealthConfig: sanitizeStealthConfig(raw.stealthConfig, target),
         receivers,
         // A backup file is untrusted input: until the addresses are re-derived
         // locally (lane.verifyLane) the lane must not be shared.

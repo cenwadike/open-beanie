@@ -1,6 +1,7 @@
 // stealth_routes.rs
 //
 // POST /api/v1/stealth/claim
+// GET  /api/v1/stealth/cosigners
 //
 // The stealth private key signature (`client_sig`) is produced entirely on the
 // client, over the chain's signing hash, before this is called. That is the
@@ -13,16 +14,22 @@
 //   2. Canonicalize inputs by chain FAMILY (from the registry, not a hardcoded
 //      `match chain`).
 //   3. Run `stealth_workers::precheck`, the same function the worker runs. It
-//      recomputes the signing hash from the submitted calls (EVM userOpHash,
-//      Starknet invoke-v3 hash, Solana sha256(message)), enforces allowlists,
-//      and verifies the client signature where it can, so a bad claim gets a
-//      400 now instead of a silent worker failure later.
-//   4. Rate limit, then enqueue for the worker (Fireblocks co-sign + relay).
+//      recomputes the signing hash from the submitted data (EVM EIP-3009
+//      digest, Starknet invoke-v3 hash, Solana sha256(message)), enforces
+//      allowlists, and verifies the client signature where it can, so a bad
+//      claim gets a 400 now instead of a silent worker failure later.
+//   4. Rate limit, then enqueue for the worker (in-TEE co-sign + relay).
 //
 // What `tx_hash` means per family (dictated by the account contracts):
-//   EVM       ERC-4337 v0.7 userOpHash. Client signs EIP-191(userOpHash).
+//   EVM       EIP-712 digest D of the USDC TransferWithAuthorization. The
+//             client signs EIP-191(D). No `calls`: one claim = one
+//             authorization, described by `auth3009`.
 //   Starknet  native INVOKE V3 transaction hash.
 //   Solana    sha256(message_bytes).
+//
+// GET /api/v1/stealth/cosigners publishes the cosigner each chain's accounts
+// bind to. Clients must PIN the expected cosigner out of band; this endpoint
+// is for discovery and monitoring, not trust.
 
 use axum::{
     Json,
@@ -36,7 +43,7 @@ use starknet::core::types::Felt;
 use std::str::FromStr;
 
 use crate::models::{AppState, Chain, SocketAddr, StealthTask, err, mpsc};
-use crate::stealth_workers::{FamilyRt, precheck};
+use crate::stealth_workers::{CosignerInfo, FamilyRt, precheck};
 
 const MAX_CALLS: usize = 20;
 const MAX_CALLDATA_ITEMS: usize = 256;
@@ -95,6 +102,8 @@ pub struct StarknetTxParams {
 }
 
 /// EVM only (USDC EIP-3009): parameters signed by client for TransferWithAuthorization.
+/// The cosigner is deliberately NOT a request field: the worker always uses its
+/// own, and the account address must match factory.getAddress(client, ours, salt).
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Auth3009Params {
     pub client: String,
@@ -112,7 +121,7 @@ pub struct ClaimRequest {
     pub tx_hash: String,
     pub derived_address: String,
     pub client_sig: ClientSignature,
-    /// EVM/Starknet: the calls. Solana: ignored (send `[]`).
+    /// Starknet: the calls. EVM and Solana: ignored (send `[]`).
     #[serde(default)]
     pub calls: Vec<CallDataPayload>,
     pub verified_token: String,
@@ -130,6 +139,18 @@ pub struct ClaimResponse {
     pub status: String,
     pub message: String,
     pub transaction_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CosignersResponse {
+    /// One entry per configured chain: algo, cosigner address/pubkey, factory.
+    /// Public data only.
+    pub cosigners: Vec<CosignerInfo>,
+    /// 64-byte hex. The `report_data` a TEE quote for this app should commit to
+    /// (sha256 of the canonical cosigner list || 32 zero bytes), so a client
+    /// holding a quote can check "these exact cosigners belong to this attested
+    /// app". Not a substitute for pinning.
+    pub report_data: String,
 }
 
 // ---------- Sanitizers ----------
@@ -221,8 +242,8 @@ struct Canon {
     message_bytes: Option<Vec<u8>>,
 }
 
-fn canonicalize_calls(
-    fam: &FamilyRt,
+/// Starknet only. EVM and Solana claims carry no `calls`.
+fn canonicalize_starknet_calls(
     calls: Vec<CallDataPayload>,
 ) -> Result<Vec<CallDataPayload>, String> {
     let mut out = Vec::with_capacity(calls.len());
@@ -233,33 +254,21 @@ fn canonicalize_calls(
             ));
         }
         let entrypoint = call.entrypoint.trim().to_string();
-        let (contract, calldata) = match fam {
-            FamilyRt::Starknet(_) => {
-                if entrypoint.is_empty() {
-                    return Err(format!("Empty entrypoint at call {idx}"));
-                }
-                let contract = parse_and_sanitize_felt(&call.contract_address)
-                    .map_err(|e| format!("Invalid contract_address at call {idx}: {e}"))?;
-                let mut cd = Vec::with_capacity(call.calldata.len());
-                for (cd_idx, item) in call.calldata.iter().enumerate() {
-                    cd.push(parse_and_sanitize_felt(item).map_err(|e| {
-                        format!("Invalid calldata item at call {idx}, index {cd_idx}: {e}")
-                    })?);
-                }
-                (contract, cd)
-            }
-            FamilyRt::Evm(_) => {
-                let contract = parse_and_sanitize_evm_addr(&call.contract_address)
-                    .map_err(|e| format!("Invalid contract_address at call {idx}: {e}"))?;
-                let cd = call.calldata.iter().map(|s| s.trim().to_string()).collect();
-                (contract, cd)
-            }
-            FamilyRt::Solana => return Err("Solana claims carry no `calls`".into()),
-        };
+        if entrypoint.is_empty() {
+            return Err(format!("Empty entrypoint at call {idx}"));
+        }
+        let contract = parse_and_sanitize_felt(&call.contract_address)
+            .map_err(|e| format!("Invalid contract_address at call {idx}: {e}"))?;
+        let mut cd = Vec::with_capacity(call.calldata.len());
+        for (cd_idx, item) in call.calldata.iter().enumerate() {
+            cd.push(parse_and_sanitize_felt(item).map_err(|e| {
+                format!("Invalid calldata item at call {idx}, index {cd_idx}: {e}")
+            })?);
+        }
         out.push(CallDataPayload {
             contract_address: contract,
             entrypoint,
-            calldata,
+            calldata: cd,
         });
     }
     Ok(out)
@@ -274,14 +283,17 @@ fn canonicalize(
 ) -> Result<Canon, String> {
     match fam {
         FamilyRt::Evm(_) => {
-            if calls.is_empty() || calls.len() > MAX_CALLS {
-                return Err(format!("`calls` must contain 1..={MAX_CALLS} items"));
+            // One claim = one EIP-3009 authorization (see `auth3009`). The
+            // worker's precheck rejects non-empty `calls`, so reject it here
+            // with a clear message instead.
+            if !calls.is_empty() {
+                return Err("EVM claims carry no `calls`; send `auth3009`".into());
             }
             Ok(Canon {
                 derived: parse_and_sanitize_evm_addr(derived)
                     .map_err(|e| format!("Invalid derived_address: {e}"))?,
                 tx_hash: canon_hash32(tx_hash).map_err(|e| format!("Invalid tx_hash: {e}"))?,
-                calls: canonicalize_calls(fam, calls)?,
+                calls: vec![],
                 message_bytes: None,
             })
         }
@@ -294,7 +306,7 @@ fn canonicalize(
                     .map_err(|e| format!("Invalid derived_address: {e}"))?,
                 tx_hash: parse_and_sanitize_felt(tx_hash)
                     .map_err(|e| format!("Invalid tx_hash: {e}"))?,
-                calls: canonicalize_calls(fam, calls)?,
+                calls: canonicalize_starknet_calls(calls)?,
                 message_bytes: None,
             })
         }
@@ -322,6 +334,7 @@ fn canonicalize(
         }
     }
 }
+
 fn check_param_sizes(
     req_auth3009: &Option<Auth3009Params>,
     sn: &Option<StarknetTxParams>,
@@ -369,6 +382,36 @@ fn chain_tag(chain: &Chain) -> String {
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string())
 }
+
+// ---------- GET /api/v1/stealth/cosigners ----------
+
+/// Publishes the cosigner each chain's accounts will be bound to. Because the
+/// cosigner is part of the account address (EVM: factory.getAddress(client,
+/// cosigner, salt); Starknet: constructor args; Solana: derive_multisig), a
+/// client can verify every address it derives.
+///
+/// PINNING: clients MUST ship the expected cosigner per chain (hardcoded or
+/// published in docs) and refuse to create an account if this response differs.
+/// A cosigner fetched only from this endpoint proves nothing against whoever
+/// controls the API: they could return their own key and hold funds hostage.
+pub async fn list_cosigners(State(state): State<AppState>) -> Response {
+    let report_data = match state.stealth_chains.attestation_report_data() {
+        Ok(rd) => hex::encode(rd),
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not compute cosigner commitment",
+            );
+        }
+    };
+    Json(CosignersResponse {
+        cosigners: state.stealth_chains.public_info(),
+        report_data,
+    })
+    .into_response()
+}
+
+// ---------- POST /api/v1/stealth/claim ----------
 
 pub async fn execute_stealth_claim(
     State(state): State<AppState>,
@@ -452,7 +495,10 @@ pub async fn execute_stealth_claim(
         client_sig: sanitized_sig,
         credential_id: credential_id.clone(),
         calls: canon.calls,
-        auth3009,
+        auth3009: match rt.fam {
+            FamilyRt::Evm(_) => auth3009,
+            _ => None,
+        },
         starknet: match rt.fam {
             FamilyRt::Starknet(_) => starknet,
             _ => None,
@@ -473,7 +519,7 @@ pub async fn execute_stealth_claim(
         return err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
-    // 7. Enqueue for the worker (Fireblocks co-sign + relay happens there).
+    // 7. Enqueue for the worker (in-TEE co-sign + relay happens there).
     if let Err(e) = state.stealth_tx.try_send(task) {
         return match e {
             mpsc::error::TrySendError::Full(_) => err(

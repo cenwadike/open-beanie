@@ -5,49 +5,53 @@ import {StealthAccount} from "./StealthAccount.sol";
 
 /**
  * @title StealthAccountFactory
- * @notice CREATE2 factory used through ERC-4337 `initCode`:
+ * @notice Immutable CREATE2 factory. No owner, no setters.
  *
+ * The co-signer is a per-account parameter, so any provider (or the client
+ * itself) can run its own co-signer. It is part of the constructor args and
+ * therefore part of the CREATE2 init-code hash: the account address commits to
+ * (entryPoint, client, cosigner, salt), and nobody can deploy a different
+ * co-signer at the same address.
+ *
+ * Usable through ERC-4337 `initCode`:
  *   initCode = factoryAddress (20 bytes)
- *           ++ abi.encodeCall(StealthAccountFactory.createAccount, (client, salt))
+ *           ++ abi.encodeCall(createAccount, (client, cosigner, salt))
  *
- * `entryPoint` and `cosigner` are pinned in the factory, so a client can only
- * choose its own key and salt. Every account this factory makes is therefore
- * bound to TEE/MPC cosigner for this chain. Deploy one factory per
- * chain, with `cosigner` = the address the worker logs at startup
- * ("chain X ready, cosigner 0x...").
+ * Deploy one factory per chain.
  */
 contract StealthAccountFactory {
     address public immutable entryPoint;
-    address public immutable cosigner;
 
     error ZeroAddress();
 
-    constructor(address _entryPoint, address _cosigner) {
-        if (_entryPoint == address(0) || _cosigner == address(0))
-            revert ZeroAddress();
+    constructor(address _entryPoint) {
+        if (_entryPoint == address(0)) revert ZeroAddress();
         entryPoint = _entryPoint;
-        cosigner = _cosigner;
     }
 
     /// @dev Idempotent: returns the existing account if already deployed.
     function createAccount(
         address client,
+        address cosigner,
         bytes32 salt
     ) external returns (address account) {
-        account = getAddress(client, salt);
-        if (account.code.length > 0) return account;
+        address predicted = getAddress(client, cosigner, salt);
+        if (predicted.code.length > 0) return predicted;
         account = address(
-            new StealthAccount{salt: _salt(client, salt)}(
+            new StealthAccount{salt: _salt(client, cosigner, salt)}(
                 entryPoint,
                 client,
                 cosigner
             )
         );
+        assert(account == predicted);
     }
 
-    /// @notice Counterfactual address. The client SDK uses this as `sender`.
+    /// @notice Counterfactual address. Must use the SAME constructor args as
+    ///         the deployment above, including the cosigner.
     function getAddress(
         address client,
+        address cosigner,
         bytes32 salt
     ) public view returns (address) {
         bytes32 initHash = keccak256(
@@ -64,7 +68,7 @@ contract StealthAccountFactory {
                             abi.encodePacked(
                                 bytes1(0xff),
                                 address(this),
-                                _salt(client, salt),
+                                _salt(client, cosigner, salt),
                                 initHash
                             )
                         )
@@ -75,8 +79,9 @@ contract StealthAccountFactory {
 
     function _salt(
         address client,
+        address cosigner,
         bytes32 salt
     ) internal pure returns (bytes32) {
-        return keccak256(abi.encode(client, salt));
+        return keccak256(abi.encode(client, cosigner, salt));
     }
 }

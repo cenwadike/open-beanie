@@ -41,9 +41,9 @@ use crate::models::{Chain, StealthTask, mpsc};
 use crate::payment_routes::receive_payment;
 use crate::payment_workers::run_payment_worker;
 // use crate::rpc_proxy::handle;
-use crate::stealth_routes::execute_stealth_claim;
+use crate::stealth_routes::{execute_stealth_claim, list_cosigners};
 use crate::stealth_workers::{
-    ChainRegistry, FireblocksRest, WorkerCtx, chain_cfgs_from_env, start_stealth_workers,
+    ChainRegistry, WorkerCtx, chain_cfgs_from_env, start_stealth_workers,
 };
 use crate::transfer_workers::{SharedEvmRegistry, SharedSolanaRegistry, SharedStarknetRegistry};
 use crate::{config::Config, models::AppState};
@@ -150,6 +150,9 @@ async fn main() -> anyhow::Result<()> {
         fetch_domain_separator(ethereum_client.clone(), ethereum_cfg.token_address).await?;
     let arbitrum_domain_separator =
         fetch_domain_separator(arbitrum_client.clone(), arbitrum_cfg.token_address).await?;
+    // CHECK: this passes base_cfg.token_address with the Monad client. It is
+    // probably meant to be monad_cfg.token_address (unchanged here because it
+    // is outside the stealth path and I can't see your Monad config).
     let monad_domain_seperator =
         fetch_domain_separator(monad_client.clone(), base_cfg.token_address).await?;
 
@@ -185,13 +188,14 @@ async fn main() -> anyhow::Result<()> {
 
     debug!("[baeanie_api::main]: clients loaded");
 
-    // 3b. Stealth cosigner backend + chain registry. Built BEFORE AppState
-    // because the claim route reads the registry (allowlists, chain family,
-    // enabled_for_claims). Refuses to start if STEALTH_CHAINS_JSON or the
-    // Fireblocks env vars are missing/invalid, if two chains share a vault or
-    // cosigner address, or if an EVM RPC reports the wrong chain id.
-    let fireblocks = Arc::new(FireblocksRest::from_env(reqwest::Client::new())?);
-    let stealth_chains = Arc::new(ChainRegistry::build(chain_cfgs_from_env()?, &fireblocks).await?);
+    // 3b. Stealth chain registry. Built BEFORE AppState because the claim and
+    // cosigners routes read it (allowlists, chain family, enabled_for_claims,
+    // published cosigners). Cosigner keys come from the dstack KMS (or the
+    // dev_env source locally). Refuses to start if STEALTH_CHAINS_JSON is
+    // invalid, if a derived cosigner differs from `expected_cosigner`, if two
+    // chains share a key source or cosigner address, or if an EVM RPC reports
+    // the wrong chain id.
+    let stealth_chains = Arc::new(ChainRegistry::build(chain_cfgs_from_env()?).await?);
 
     // Every EVM-family chain the announce worker can target, each with its
     // own signer client and its own factory address.
@@ -303,9 +307,12 @@ async fn main() -> anyhow::Result<()> {
         (Chain::Monad, monad_registry.clone()),
     ]);
 
+    // Per-chain keeper clients the stealth worker sends through. (Base and
+    // Ethereum were swapped here before: a Base claim would have been sent
+    // through the Ethereum client, and the reverse.)
     let evm_clients: HashMap<Chain, Arc<SignerProvider>> = HashMap::from([
-        (Chain::Base, ethereum_client.clone()),
-        (Chain::Ethereum, base_client.clone()),
+        (Chain::Base, base_client.clone()),
+        (Chain::Ethereum, ethereum_client.clone()),
         (Chain::Arbitrum, arbitrum_client.clone()),
         (Chain::Monad, monad_client.clone()),
     ]);
@@ -341,56 +348,79 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize Upstreams for the RPC Proxy
     let mut upstreams = std::collections::HashMap::new();
+    let stealth_factories: HashMap<String, String> = stealth_chains
+        .public_info()
+        .into_iter()
+        .filter_map(|info| {
+            info.factory
+                .map(|factory| (info.chain.to_ascii_lowercase(), factory))
+        })
+        .collect();
+    let evm_allowed = |chain: &str, receiver_factory: String, token: String| {
+        let mut allowed = vec![receiver_factory, token];
+        if let Some(factory) = stealth_factories.get(chain) {
+            allowed.push(factory.clone());
+        }
+        allowed
+    };
 
     // Base upstream
+    let base_allowed = evm_allowed(
+        "base",
+        base_cfg.factory_address.to_string(),
+        base_cfg.token_address.to_string(),
+    );
     upstreams.insert(
         "base".to_string(),
-        rpc_proxy::Upstream::new(
+        rpc_proxy::Upstream::with_allowed(
             base_cfg.evm_rpc_url.clone(),
             rpc_proxy::Family::Evm,
-            &[
-                &base_cfg.clone().factory_address.to_string(),
-                &base_cfg.clone().token_address.to_string(),
-            ], // Pass actual contract addresses
+            &base_allowed,
         ),
     );
 
     // Ethereum upstream
+    let ethereum_allowed = evm_allowed(
+        "ethereum",
+        ethereum_cfg.factory_address.to_string(),
+        ethereum_cfg.token_address.to_string(),
+    );
     upstreams.insert(
         "ethereum".to_string(),
-        rpc_proxy::Upstream::new(
+        rpc_proxy::Upstream::with_allowed(
             ethereum_cfg.evm_rpc_url.clone(),
             rpc_proxy::Family::Evm,
-            &[
-                &ethereum_cfg.clone().factory_address.to_string(),
-                &ethereum_cfg.clone().token_address.to_string(),
-            ],
+            &ethereum_allowed,
         ),
     );
 
     // Arbitrum upstream
+    let arbitrum_allowed = evm_allowed(
+        "arbitrum",
+        arbitrum_cfg.factory_address.to_string(),
+        arbitrum_cfg.token_address.to_string(),
+    );
     upstreams.insert(
         "arbitrum".to_string(),
-        rpc_proxy::Upstream::new(
+        rpc_proxy::Upstream::with_allowed(
             arbitrum_cfg.evm_rpc_url.clone(),
             rpc_proxy::Family::Evm,
-            &[
-                &arbitrum_cfg.clone().factory_address.to_string(),
-                &arbitrum_cfg.clone().token_address.to_string(),
-            ],
+            &arbitrum_allowed,
         ),
     );
 
     // Monad upstream
+    let monad_allowed = evm_allowed(
+        "monad",
+        monad_cfg.factory_address.to_string(),
+        monad_cfg.token_address.to_string(),
+    );
     upstreams.insert(
         "monad".to_string(),
-        rpc_proxy::Upstream::new(
+        rpc_proxy::Upstream::with_allowed(
             monad_cfg.evm_rpc_url.clone(),
             rpc_proxy::Family::Evm,
-            &[
-                &monad_cfg.clone().factory_address.to_string(),
-                &monad_cfg.clone().token_address.to_string(),
-            ],
+            &monad_allowed,
         ),
     );
 
@@ -433,13 +463,12 @@ async fn main() -> anyhow::Result<()> {
         announce_rx,
     ));
 
-    // Spawn stealth workers (Fireblocks co-sign + gasless relay). The context
-    // carries the chain registry, the cosigner backend, the per-chain EVM
-    // keeper wallets and the Solana RPC/relayer.
+    // Spawn stealth workers (in-TEE co-sign + gasless relay). The context
+    // carries the chain registry (which holds each chain's cosigner key), the
+    // per-chain EVM keeper wallets and the Solana RPC/relayer.
     let stealth_ctx = Arc::new(WorkerCtx {
         state: worker_state,
         chains: stealth_chains,
-        cosigner: fireblocks,
         evm_clients,
         solana_rpc: stealth_solana_rpc_clone,
         solana_keeper: stealth_solana_keeper_clone,
@@ -495,6 +524,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/webauthn/auth/start", post(auth_start))
         .route("/api/v1/webauthn/auth/finish", post(auth_finish))
         .route("/api/v1/stealth/claim", post(execute_stealth_claim))
+        .route("/api/v1/stealth/cosigners", get(list_cosigners))
         .route("/api/v1/create", post(announce_receiver))
         .route("/api/v1/pay", post(receive_payment))
         .route("/health", get(|| async { "ok" }))

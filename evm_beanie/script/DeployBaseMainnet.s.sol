@@ -26,11 +26,6 @@ contract DeployBaseMainnet is Script {
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         address implementation = vm.envAddress("RECEIVER_IMPL");
 
-        address keeper = vm.envAddress("KEEPER_ADDRESS");
-        address multicall3 = vm.envAddress("MULTICALL3_ADDRESS");
-        bytes32 expectedWorkflowId = vm.envBytes32("WORKFLOW_ID");
-        address expectedWorkflowOwner = vm.envAddress("WORKFLOW_OWNER");
-
         require(treasury != address(0), "Treasury address required");
 
         vm.startBroadcast(deployerPrivateKey);

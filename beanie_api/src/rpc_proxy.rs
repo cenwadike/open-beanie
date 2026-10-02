@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 const WINDOW: Duration = Duration::from_secs(60);
-const REQ_PER_WINDOW: u32 = 60;
+const REQ_PER_WINDOW: u32 = 256;
 const MAX_BODY: usize = 8 * 1024;
 const MAX_UPSTREAM_BYTES: usize = 2 * 1024 * 1024;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,6 +57,14 @@ fn norm(s: &str) -> String {
 
 impl Upstream {
     pub fn new(url: String, family: Family, contracts: &[&str]) -> Self {
+        Self {
+            url,
+            family,
+            allowed: contracts.iter().map(|c| norm(c)).collect(),
+        }
+    }
+
+    pub fn with_allowed(url: String, family: Family, contracts: &[String]) -> Self {
         Self {
             url,
             family,

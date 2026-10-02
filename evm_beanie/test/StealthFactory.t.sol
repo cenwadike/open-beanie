@@ -68,7 +68,7 @@ contract StealthAccountFactoryTest is Test {
         client = vm.addr(clientPk);
         cosigner = vm.addr(cosignerPk);
         ep = new MockEntryPoint();
-        factory = new StealthAccountFactory(address(ep), cosigner);
+        factory = new StealthAccountFactory(address(ep));
         token = new MockToken();
     }
 
@@ -79,12 +79,13 @@ contract StealthAccountFactoryTest is Test {
     function _initCode(
         StealthAccountFactory f,
         address c,
+        address cs,
         bytes32 s
     ) internal pure returns (bytes memory) {
         return
             abi.encodePacked(
                 address(f),
-                abi.encodeCall(StealthAccountFactory.createAccount, (c, s))
+                abi.encodeCall(StealthAccountFactory.createAccount, (c, cs, s))
             );
     }
 
@@ -139,15 +140,14 @@ contract StealthAccountFactoryTest is Test {
 
     function test_Constructor_StoresImmutables() public view {
         assertEq(factory.entryPoint(), address(ep));
-        assertEq(factory.cosigner(), cosigner);
     }
 
     function test_Constructor_RevertsOnZeroAddress() public {
         vm.expectRevert(StealthAccountFactory.ZeroAddress.selector);
-        new StealthAccountFactory(address(0), cosigner);
+        new StealthAccountFactory(address(0));
 
-        vm.expectRevert(StealthAccountFactory.ZeroAddress.selector);
-        new StealthAccountFactory(address(ep), address(0));
+        vm.expectRevert(StealthAccount.ZeroAddress.selector);
+        new StealthAccount(address(ep), address(0), cosigner);
     }
 
     // ------------------------------------------------------------------
@@ -155,10 +155,10 @@ contract StealthAccountFactoryTest is Test {
     // ------------------------------------------------------------------
 
     function test_CreateAccount_DeploysAtPredictedAddress() public {
-        address predicted = factory.getAddress(client, SALT);
+        address predicted = factory.getAddress(client, cosigner, SALT);
         assertEq(predicted.code.length, 0);
 
-        address created = factory.createAccount(client, SALT);
+        address created = factory.createAccount(client, cosigner, SALT);
 
         assertEq(created, predicted);
         assertGt(created.code.length, 0);
@@ -166,7 +166,7 @@ contract StealthAccountFactoryTest is Test {
 
     function test_CreateAccount_SetsImmutablesCorrectly() public {
         StealthAccount acct = StealthAccount(
-            payable(factory.createAccount(client, SALT))
+            payable(factory.createAccount(client, cosigner, SALT))
         );
         assertEq(acct.entryPoint(), address(ep));
         assertEq(acct.clientPubkey(), client);
@@ -174,10 +174,10 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_CreateAccount_IsIdempotent() public {
-        address first = factory.createAccount(client, SALT);
+        address first = factory.createAccount(client, cosigner, SALT);
         bytes32 codehash = first.codehash;
 
-        address second = factory.createAccount(client, SALT);
+        address second = factory.createAccount(client, cosigner, SALT);
 
         assertEq(second, first);
         assertEq(second.codehash, codehash);
@@ -188,7 +188,7 @@ contract StealthAccountFactoryTest is Test {
     {
         vm.prank(address(0xBEEF)); // anyone can trigger deployment
         StealthAccount acct = StealthAccount(
-            payable(factory.createAccount(client, SALT))
+            payable(factory.createAccount(client, cosigner, SALT))
         );
 
         assertEq(acct.cosignerPubkey(), cosigner);
@@ -196,39 +196,41 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_GetAddress_IndependentOfCaller() public {
-        address a = factory.getAddress(client, SALT);
+        address a = factory.getAddress(client, cosigner, SALT);
         vm.prank(address(0xBEEF));
-        address b = factory.getAddress(client, SALT);
+        address b = factory.getAddress(client, cosigner, SALT);
         assertEq(a, b);
     }
 
     function test_GetAddress_DiffersPerClientAndSalt() public view {
-        address base = factory.getAddress(client, SALT);
-        assertTrue(base != factory.getAddress(vm.addr(otherPk), SALT));
-        assertTrue(base != factory.getAddress(client, keccak256("salt-2")));
+        address base = factory.getAddress(client, cosigner, SALT);
+        assertTrue(
+            base != factory.getAddress(vm.addr(otherPk), cosigner, SALT)
+        );
+        assertTrue(
+            base != factory.getAddress(client, cosigner, keccak256("salt-2"))
+        );
     }
 
     function test_GetAddress_DiffersPerCosigner() public {
-        StealthAccountFactory other = new StealthAccountFactory(
-            address(ep),
-            vm.addr(otherPk)
-        );
+        StealthAccountFactory other = new StealthAccountFactory(address(ep));
         assertTrue(
-            factory.getAddress(client, SALT) != other.getAddress(client, SALT)
+            factory.getAddress(client, cosigner, SALT) !=
+                other.getAddress(client, cosigner, SALT)
         );
     }
 
     function test_CreateAccount_RevertsForZeroClient() public {
         vm.expectRevert(StealthAccount.ZeroAddress.selector);
-        factory.createAccount(address(0), SALT);
+        factory.createAccount(address(0), cosigner, SALT);
     }
 
     function test_PreDeployFundsSurviveDeployment() public {
-        address predicted = factory.getAddress(client, SALT);
+        address predicted = factory.getAddress(client, cosigner, SALT);
         token.mint(predicted, 1_000e6);
         vm.deal(predicted, 1 ether);
 
-        factory.createAccount(client, SALT);
+        factory.createAccount(client, cosigner, SALT);
 
         assertEq(token.balanceOf(predicted), 1_000e6);
         assertEq(predicted.balance, 1 ether);
@@ -236,11 +238,13 @@ contract StealthAccountFactoryTest is Test {
 
     function testFuzz_GetAddressMatchesCreateAccount(
         address c,
+        address cs,
         bytes32 s
     ) public {
         vm.assume(c != address(0));
-        address predicted = factory.getAddress(c, s);
-        assertEq(factory.createAccount(c, s), predicted);
+        vm.assume(cs != address(0));
+        address predicted = factory.getAddress(c, cs, s);
+        assertEq(factory.createAccount(c, cs, s), predicted);
     }
 
     // ------------------------------------------------------------------
@@ -248,9 +252,9 @@ contract StealthAccountFactoryTest is Test {
     // ------------------------------------------------------------------
 
     function test_InitCode_Layout() public view {
-        bytes memory ic = _initCode(factory, client, SALT);
+        bytes memory ic = _initCode(factory, client, cosigner, SALT);
         assertEq(address(bytes20(ic)), address(factory));
-        assertEq(ic.length, 20 + 4 + 32 + 32); // factory + selector + 2 words
+        assertEq(ic.length, 20 + 4 + 32 * 3); // factory + selector + 3 argument words
     }
 
     // ------------------------------------------------------------------
@@ -258,14 +262,14 @@ contract StealthAccountFactoryTest is Test {
     // ------------------------------------------------------------------
 
     function test_FirstClaim_DeploysAndTransfers() public {
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
         assertEq(sender.code.length, 0);
 
         PackedUserOperation memory op = _op(
             sender,
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(400e6)
         );
         bytes32 h = keccak256("userOpHash-1");
@@ -279,13 +283,13 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_SecondClaim_WithEmptyInitCode_Succeeds() public {
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
 
         PackedUserOperation memory op1 = _op(
             sender,
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(400e6)
         );
         bytes32 h1 = keccak256("userOpHash-1");
@@ -306,14 +310,14 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_InitCodeAfterDeployment_Reverts() public {
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
-        factory.createAccount(client, SALT);
+        factory.createAccount(client, cosigner, SALT);
 
         PackedUserOperation memory op = _op(
             sender,
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(1)
         );
         bytes32 h = keccak256("userOpHash-x");
@@ -324,13 +328,13 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_FirstClaim_WrongCosigner_RevertsAndLeavesNoAccount() public {
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
 
         PackedUserOperation memory op = _op(
             sender,
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(400e6)
         );
         bytes32 h = keccak256("userOpHash-1");
@@ -344,13 +348,13 @@ contract StealthAccountFactoryTest is Test {
     }
 
     function test_FirstClaim_WrongClientKey_Reverts() public {
-        address sender = factory.getAddress(client, SALT);
+        address sender = factory.getAddress(client, cosigner, SALT);
         token.mint(sender, 1_000e6);
 
         PackedUserOperation memory op = _op(
             sender,
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(400e6)
         );
         bytes32 h = keccak256("userOpHash-1");
@@ -365,7 +369,7 @@ contract StealthAccountFactoryTest is Test {
         PackedUserOperation memory op = _op(
             address(0x1234),
             0,
-            _initCode(factory, client, SALT),
+            _initCode(factory, client, cosigner, SALT),
             _transferCall(1)
         );
         bytes32 h = keccak256("userOpHash-1");
@@ -378,17 +382,15 @@ contract StealthAccountFactoryTest is Test {
     /// Why the factory pins the cosigner: an account from a factory with a DIFFERENT
     /// cosigner cannot be driven with OUR cosigner's signature.
     function test_AccountFromForeignFactory_RejectsOurCosignature() public {
-        StealthAccountFactory foreign = new StealthAccountFactory(
-            address(ep),
-            vm.addr(otherPk)
-        );
-        address sender = foreign.getAddress(client, SALT);
+        address foreignCosigner = vm.addr(otherPk);
+        StealthAccountFactory foreign = new StealthAccountFactory(address(ep));
+        address sender = foreign.getAddress(client, foreignCosigner, SALT);
         token.mint(sender, 1_000e6);
 
         PackedUserOperation memory op = _op(
             sender,
             0,
-            _initCode(foreign, client, SALT),
+            _initCode(foreign, client, foreignCosigner, SALT),
             _transferCall(400e6)
         );
         bytes32 h = keccak256("userOpHash-1");

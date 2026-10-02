@@ -112,7 +112,7 @@ curl -X POST https://<host>/api/v1/create \
       }'
 ```
 
-Beanie returns a receiver address for each supported chain. Share the one that matches the customer's chain.
+The API returns `202 Accepted` while receiver announcements are queued; it does not return receiver addresses. The Beanie frontend derives predictable EVM/Starknet receivers locally and discovers the Solana receiver from its on-chain announcement. Share the receiver for the customer's chain once it is available.
 
 ### 2. Accept a payment
 
@@ -136,6 +136,7 @@ Base path: `/api/v1`. Requests and responses are JSON.
 | `POST` | `/create` | Create a payment route and its receivers. |
 | `POST` | `/pay` | Submit a signed gasless payment. |
 | `POST` | `/stealth/claim` | Spend a stealth payment. |
+| `GET` | `/stealth/cosigners` | Discover configured TEE cosigner identities and their attestation commitment. |
 | `POST` | `/webauthn/register/start`, `/register/finish` | Passkey registration. |
 | `POST` | `/webauthn/auth/start`, `/auth/finish` | Passkey authentication. |
 | `GET` | `/health` (no `/api/v1` prefix) | Liveness check, returns `ok`. |
@@ -201,6 +202,38 @@ curl -X POST https://<host>/api/v1/pay \
 | `503 Service Unavailable` | The payment queue is unavailable. Retry. |
 
 Validation binds the signed authorization to the request. The payer, receiver, amount and expiry must all match what was signed, and the keeper must be the relayer or fee payer. A mismatch is rejected before submission.
+
+### Stealth lanes and claims
+
+A private lane derives one client signing key from the lane's passkey PRF. Its payout address is bound to that client and the chain's pinned TEE cosigner:
+
+| Family | Account and claim authorization |
+|---|---|
+| EVM | The configured `StealthAccountFactory` derives the account from `(client, cosigner, salt)`. A claim signs a USDC EIP-3009 `TransferWithAuthorization`: `tx_hash` is its EIP-712 digest `D`, and the client signs EIP-191(`D`). The worker co-signs, creates the account if needed, then submits the authorization atomically. This claim path uses ERC-1271 and does not use ERC-4337, an EntryPoint, or a paymaster. |
+| Starknet | The account address is derived from the class hash, deployment salt, client STARK public key, and pinned Ethereum cosigner address. A claim contains an allowlisted USDC `transfer` call and a native INVOKE V3 hash signed by the client; the worker co-signs and deploys via the UDC if needed. |
+| Solana | The client key and pinned Ed25519 cosigner determine a seeded SPL multisig account. A claim is one USDC `TransferChecked` message signed by the client; the worker adds the cosigner signature and keeper fee-payer signature. |
+
+Before creating a private lane, the frontend calls `GET /api/v1/stealth/cosigners` and compares the response with locally pinned values. Treat this endpoint as discovery and monitoring, not as a trust root: pin the expected cosigner out of band. The response contains `cosigners` (`chain`, `algo`, `cosigner`, and EVM `factory`) plus `report_data`, a commitment intended for TEE quote verification.
+
+The browser builds each family-specific claim, checks it locally, and asks for a second passkey assertion bound to `claim:{chain}:{derived_address}:{tx_hash}` before submission. The API recomputes the hash and validates the request before enqueueing it. Claims sweep the full lane balance to one destination. The API response echoes the signing hash as `transaction_hash`; it is not the relayed chain transaction hash. There is no claim-status endpoint, so the frontend checks the lane balance after enqueueing.
+
+EVM claim prechecks require a nonzero value, an unused authorization nonce, a destination different from the account, a valid time window (at least 120 seconds remaining and within the configured maximum), and a token domain separator matching the token. Starknet calls and fee bounds are allowlisted and capped by `max_fee_fri`. Solana claims are limited to one canonical legacy message containing one allowlisted-mint `TransferChecked`, with the keeper as fee payer and the expected client/cosigner signers.
+
+### `GET /api/v1/stealth/cosigners`
+
+Returns the configured public cosigner identity for each chain and the `report_data` commitment. It contains no private key and does not prove the API's response is trustworthy on its own. Compare every returned cosigner (and EVM factory) to values pinned in the client or deployment documentation.
+
+### `POST /api/v1/stealth/claim`
+
+All requests include `chain`, `tx_hash`, `derived_address`, `client_sig`, and `verified_token`. Optional family fields are:
+
+| Family | Required payload | Signing hash |
+|---|---|---|
+| EVM | `auth3009` with `client`, `to`, `value`, `valid_after`, `valid_before`, `nonce`, and `salt`; send `calls: []`. `client_sig` is `{ "r1", "s1", "v?" }`. | EIP-712 EIP-3009 digest; client signature is over EIP-191(digest). |
+| Starknet | `calls` (1..20) and `starknet` with `client_pubkey`, `deploy_salt`, `nonce`, `tip`, `l1_gas`, `l2_gas`, and `l1_data_gas`. `client_sig` is `{ "r1", "s1" }` using the client STARK key. | Native INVOKE V3 transaction hash. |
+| Solana | `calls: []` and `message_bytes`, hex-encoded canonical legacy `Message` (maximum 1232 bytes). `client_sig` is `{ "sig_hex" }`. | `sha256(message_bytes)`. |
+
+Starknet `calls` contain `contract_address`, `entrypoint`, and `calldata`. The API returns `202` when the validated claim is queued. `400` means precheck rejected the claim, `401` means the passkey token is missing/expired/mismatched, `429` is rate limiting, and `503` means claims are disabled or the queue is full. A queued response does not guarantee the worker later confirms the transaction.
 
 ---
 
@@ -336,7 +369,7 @@ The worker takes `(merchant, route)` from the receiver's announce record. It nev
 
 ### Stealth payments (optional)
 
-A counterfactual 2-of-2 account requires a client passkey signature and a co-signature from a TEE. Payment indices are derived client-side and recovered by scanning events, so the backend keeps no state about them. Claims are relayed gaslessly through `POST /api/v1/stealth/claim`.
+Private lanes keep the payout account and signing key out of the merchant's ordinary payment address. The passkey PRF derives the client key locally; a per-chain TEE cosigner is fixed into each account or multisig address. The server stores neither the lane secret nor the client private key. The browser stores public lane metadata and a derivation snapshot so imported lanes can be checked against their original parameters.
 
 ---
 
